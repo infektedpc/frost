@@ -1,0 +1,130 @@
+diff --git a/components/script/dom/event/keyboardevent.rs b/components/script/dom/event/keyboardevent.rs
+index 2040df8..10c0bef 100644
+--- a/components/script/dom/event/keyboardevent.rs
++++ b/components/script/dom/event/keyboardevent.rs
+@@ -79,6 +79,24 @@ impl KeyboardEvent {
+         keyboard_event: &keyboard_types::KeyboardEvent,
+     ) -> DomRoot<KeyboardEvent> {
+         let keycode = legacy_keycode_for_keyboard_event(keyboard_event);
++        // WayServo round 12/15 fix: char_code was hardcoded to 0 for every
++        // platform keyboard event, so every keypress reached the page
++        // with charCode 0. Pages that take characters through the
++        // keypress path — notably xterm.js, which defers A-Z and Space
++        // to keypress (its keydown path drops Space, keyCode 32 < 48,
++        // and skips A-Z for a macOS IME workaround) — never saw the
++        // character and dropped it. Per UI Events, keydown/keyup carry
++        // charCode 0 but keypress carries the produced character
++        // (13 for Enter).
++        let char_code = if event_type == atom!("keypress") {
++            match &keyboard_event.key {
++                Key::Character(s) => s.chars().next().map(|c| c as u32).unwrap_or(0),
++                Key::Named(NamedKey::Enter) => 13,
++                _ => 0,
++            }
++        } else {
++            0
++        };
+         Self::new_with_proto(
+             cx,
+             window,
+@@ -95,7 +113,7 @@ impl KeyboardEvent {
+             keyboard_event.repeat,
+             keyboard_event.is_composing,
+             keyboard_event.modifiers,
+-            0, /* char_code */
++            char_code,
+             keycode,
+         )
+     }
+diff --git a/components/script/dom/html/form_controls/htmlinputelement.rs b/components/script/dom/html/form_controls/htmlinputelement.rs
+index f429aea..932985a 100644
+--- a/components/script/dom/html/form_controls/htmlinputelement.rs
++++ b/components/script/dom/html/form_controls/htmlinputelement.rs
+@@ -1126,7 +1126,10 @@ impl TextControlElement for HTMLInputElement {
+                 self.implicit_submission(cx);
+             },
+             KeyReaction::DispatchInput(text, input_type) => {
+-                self.queue_input_event(text, input_type);
++                // Fire synchronously (see fire_input_event in
++                // text_control.rs): the queued version landed after
++                // the keyup and doubled characters in xterm.js.
++                self.fire_input_event(cx, text, input_type);
+                 self.value_dirty.set(true);
+                 self.update_placeholder_shown_state(cx.no_gc());
+                 self.upcast::<Node>().dirty(cx.no_gc(), NodeDamage::Other);
+diff --git a/components/script/dom/html/form_controls/htmltextareaelement.rs b/components/script/dom/html/form_controls/htmltextareaelement.rs
+index e055f47..142502f 100644
+--- a/components/script/dom/html/form_controls/htmltextareaelement.rs
++++ b/components/script/dom/html/form_controls/htmltextareaelement.rs
+@@ -336,7 +336,10 @@ impl TextControlElement for HTMLTextAreaElement {
+         match action {
+             KeyReaction::TriggerDefaultAction => (),
+             KeyReaction::DispatchInput(text, input_type) => {
+-                self.queue_input_event(text, input_type);
++                // Fire synchronously (see fire_input_event in
++                // text_control.rs): the queued version landed after
++                // the keyup and doubled characters in xterm.js.
++                self.fire_input_event(cx, text, input_type);
+                 self.value_dirty.set(true);
+                 self.handle_text_content_changed(cx);
+                 self.maybe_update_shared_selection();
+diff --git a/components/script/dom/html/form_controls/text_control.rs b/components/script/dom/html/form_controls/text_control.rs
+index 5597715..6b4492d 100644
+--- a/components/script/dom/html/form_controls/text_control.rs
++++ b/components/script/dom/html/form_controls/text_control.rs
+@@ -175,6 +175,55 @@ pub(crate) trait TextControlElement {
+             }));
+     }
+ 
++    /// Fire an `input` event immediately, instead of queueing it.
++    ///
++    /// WayServo round 12/15 fix: for text typed at a keyboard, real
++    /// browsers dispatch the `input` event synchronously as part of
++    /// the keydown default action — before the keyup. Servo queued
++    /// it as a task, so it landed after the keyup, and pages that
++    /// guard on the keydown/keypress (notably xterm.js, which ignores
++    /// a composed `input` while a keydown is outstanding, and ignores
++    /// it after a keypress only while `_keyPressHandled` is still set
++    /// — a flag its keyup handler clears) either dropped the
++    /// character or delivered it twice. Firing it here, from the
++    /// key-reaction path, restores the browser ordering. Cut/paste
++    /// keep the queued version (`queue_input_event`).
++    ///
++    /// 0.8.0 note: this is the round-12 method adapted to the 0.8.0
++    /// API — `InputEvent::new` takes `InputEventFlags` (no separate
++    /// bubbles/cancelable bools, no `is_composing` argument; composing
++    /// is derived from `input_type.is_composing()`), and
++    /// `queue_input_event` / `KeyReaction::DispatchInput` no longer
++    /// carry an `IsComposing` parameter.
++    fn fire_input_event(
++        &self,
++        cx: &mut JSContext,
++        data: Option<String>,
++        input_type: InputEventType,
++    ) {
++        let target = self.as_element().upcast::<EventTarget>();
++        let global = target.global();
++        let window = global.as_window();
++        let mut flags = InputEventFlags::BUBBLES;
++        if input_type.is_composing() {
++            flags |= InputEventFlags::COMPOSING;
++        }
++        let event = InputEvent::new(
++            cx,
++            window,
++            None,
++            atom!("input"),
++            flags,
++            Some(window),
++            0,
++            data.map(DOMString::from),
++            input_type.as_str().into(),
++        );
++        let event = event.upcast::<Event>();
++        event.set_composed(true);
++        event.fire(cx, target);
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#dom-textarea/input-select>
+     fn dom_select(&self, cx: &mut JSContext) {
+         // Step 1: If this element is an input element, and either select() does not apply

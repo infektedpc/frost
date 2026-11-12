@@ -1,0 +1,53 @@
+diff --git a/components/shared/paint/rendering_context.rs b/components/shared/paint/rendering_context.rs
+index ef7265929..be0b80f5c 100644
+--- a/components/shared/paint/rendering_context.rs
++++ b/components/shared/paint/rendering_context.rs
+@@ -19,7 +19,7 @@ use image::RgbaImage;
+ use log::{debug, trace, warn};
+ use raw_window_handle::{DisplayHandle, WindowHandle};
+ pub use surfman::Error;
+-use surfman::chains::{PreserveBuffer, SwapChain};
++use surfman::chains::{PreserveBuffer, SwapChain, SwapChainAPI};
+ use surfman::{
+     Adapter, Connection, Context, ContextAttributeFlags, ContextAttributes, Device, GLApi,
+     GLVersion, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceTexture, SurfaceType,
+@@ -75,6 +75,24 @@ pub trait RenderingContext {
+     fn destroy_texture(&self, _surface_texture: SurfaceTexture) -> Option<Surface> {
+         None
+     }
++    /// Take the surface that [`RenderingContext::present`] most recently
++    /// moved into the swap chain's pending (front) slot, if this
++    /// context has a swap chain. The caller owns the surface until it
++    /// is returned via [`RenderingContext::recycle_surface`]; while it
++    /// is taken, the swap chain will not paint into it again, so its
++    /// pixels stay stable — which is what makes it safe to export as a
++    /// dma-buf and hand to a compositor. Default to `None` (no swap
++    /// chain, e.g. window contexts).
++    fn take_pending_surface(&self) -> Option<Surface> {
++        None
++    }
++    /// Return a surface previously taken with
++    /// [`RenderingContext::take_pending_surface`] to the swap chain's
++    /// recycled pool, so the next swap can paint into it again. The
++    /// caller must only recycle a surface after every consumer of its
++    /// pixels (e.g. a compositor holding an exported dma-buf of it)
++    /// has released it. Default to a no-op.
++    fn recycle_surface(&self, _surface: Surface) {}
+     /// The connection to the display server for WebGL. Default to `None`.
+     fn connection(&self) -> Option<Connection> {
+         None
+@@ -390,6 +408,14 @@ impl RenderingContext for SoftwareRenderingContext {
+         self.surfman_rendering_info.destroy_texture(surface_texture)
+     }
+ 
++    fn take_pending_surface(&self) -> Option<Surface> {
++        self.swap_chain.take_pending_surface()
++    }
++
++    fn recycle_surface(&self, surface: Surface) {
++        self.swap_chain.recycle_surface(surface);
++    }
++
+     fn connection(&self) -> Option<Connection> {
+         self.surfman_rendering_info.connection()
+     }

@@ -1,0 +1,35 @@
+[package]
+name = "frost-engine"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+# Servo fork, one directory up: ../.. is the frost repo root, servo/ is the
+# nested fork (see FORK.md). Feature set mirrors the proven servo-de
+# embedder: the same features servoshell enables MINUS webgl / webxr /
+# media-gstreamer, which the sandbox cannot build (no libclang for
+# mozangle's bindgen, no gstreamer-1.0.pc). Round 1 needs no WebGL, no
+# video, no XR. `subtlecrypto` is the 0.8.0 name for the old `webcrypto`.
+servo = { path = "../../servo/components/servo", default-features = false, features = [
+    "background_hang_monitor",
+    "bluetooth",
+    "testbinding",
+    "bundled",
+    "brotli-compression-stream",
+    "clipboard",
+    "subtlecrypto",
+    "default_tooling",
+    "js_jit",
+    "multiprocess",
+    "gamepad",
+    "webgpu",
+    "devtools",
+] }
+dpi = "0.1"
+keyboard-types = "0.8"
+url = "2"
+
+[dev-dependencies]
+# The smoke example writes a PNG screenshot.
+png = "0.17"

@@ -1,0 +1,18 @@
+[package]
+name = "frost"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+default = []
+# The libcosmic window. Off by default: libcosmic is a git dependency and
+# needs system libraries the sandbox may not have (see README.md). The
+# engine proof (frost-engine smoke test) does not depend on it.
+ui-libcosmic = ["dep:libcosmic"]
+
+[dependencies]
+frost-engine = { path = "../frost-engine" }
+# libcosmic is NOT on crates.io — it ships from git (pop-os/libcosmic).
+# Pinned to the v0.12 tag; the frost README records the exact rev.
+libcosmic = { git = "https://github.com/pop-os/libcosmic", tag = "v0.12", default-features = false, features = ["winit", "tokio"], optional = true }

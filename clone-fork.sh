@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# clone-fork.sh — recreate the Frost Servo fork from scratch.
+#
+# What it does:
+#   1. Shallow-clones servo/servo at tag v0.8.0 into ./servo/
+#   2. Applies the three proven 0.8.0 engine patches from ./patches/,
+#      one commit per patch.
+#
+# Usage (from the frost repo root):
+#   ./clone-fork.sh
+#
+# Requirements: git, network access to github.com. No remote is added;
+# the fork is yours — point it at your own GitHub repo when you are ready
+# (see README.md, "Pushing to GitHub").
+#
+# Notes:
+# * The fork is a NESTED repo (its own .git). It is gitignored by the
+#   frost repo and never committed into it.
+# * The clone is shallow (--depth 1). Full history later with:
+#     git -C servo fetch --unshallow
+# * If the initial checkout ever fails with an empty index (seen once in
+#   the sandbox: clone reported "unable to checkout working tree"), the
+#   script recovers with `git read-tree HEAD && git checkout -- .`.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FORK_DIR="$ROOT/servo"
+PATCHES_DIR="$ROOT/patches"
+
+if [ -d "$FORK_DIR/.git" ]; then
+    echo "servo/ already exists — refusing to overwrite. Delete it first if you want a fresh fork."
+    exit 1
+fi
+
+echo "Cloning servo/servo at v0.8.0 (shallow)..."
+git clone --depth 1 --branch v0.8.0 https://github.com/servo/servo "$FORK_DIR" || true
+
+cd "$FORK_DIR"
+
+# Recovery for the rare failed-checkout case: rebuild the index and check out.
+if [ "$(git ls-files | wc -l)" -eq 0 ]; then
+    echo "Checkout looks empty — recovering with read-tree + checkout..."
+    git read-tree HEAD
+    git checkout -- .
+fi
+
+git config user.name "Joel Horrell"
+git config user.email "infektedpc@gmail.com"
+
+echo "Fork point: $(git rev-parse HEAD) ($(git log --oneline -1))"
+
+for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8; do
+    echo "Applying $patch..."
+    git apply --check "$PATCHES_DIR/$patch.patch"
+    git apply "$PATCHES_DIR/$patch.patch"
+    git add -A
+    case "$patch" in
+        servo-keypress-charcode-0.8)
+            git commit -qm "fork: apply keypress charcode patch (0.8)"
+            ;;
+        servo-damage-rects-0.8)
+            git commit -qm "fork: apply damage-rects patch (0.8)"
+            ;;
+        servo-dmabuf-0.8)
+            git commit -qm "fork: apply dmabuf patch (0.8)"
+            ;;
+    esac
+done
+
+echo "Fork ready:"
+git log --oneline | head -5
+echo "Full history later with: git -C servo fetch --unshallow"

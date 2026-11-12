@@ -1,0 +1,155 @@
+diff --git a/components/paint/paint.rs b/components/paint/paint.rs
+index 5151256..49b18a8 100644
+--- a/components/paint/paint.rs
++++ b/components/paint/paint.rs
+@@ -50,7 +50,7 @@ use webgl::webgl_thread::WebGLContextBusyMap;
+ #[cfg(feature = "webgpu")]
+ use webgpu::canvas_context::WebGpuExternalImageMap;
+ use webrender::{CaptureBits, MemoryReport};
+-use webrender_api::units::{DevicePixel, DevicePoint};
++use webrender_api::units::{DeviceIntRect, DevicePixel, DevicePoint};
+ use webrender_api::{FontInstanceKey, FontKey, ImageKey};
+ #[cfg(feature = "webxr")]
+ use webxr::WebXrRegistry;
+@@ -754,6 +754,16 @@ impl Paint {
+             .render(&self.time_profiler_chan);
+     }
+ 
++    /// The device dirty rects reported by WebRender for the most recent
++    /// [`Paint::render`] of the given [`WebView`]. `None` if no frame has
++    /// been painted yet; an empty list means WebRender changed nothing
++    /// in that frame. (Round 17, WayServo: only populated when the
++    /// partial-present engine patch is active.)
++    pub fn last_dirty_rects(&self, webview_id: WebViewId) -> Option<Vec<DeviceIntRect>> {
++        self.maybe_painter(webview_id.into())
++            .and_then(|painter| painter.last_dirty_rects())
++    }
++
+     /// Get the message receiver for this [`Paint`].
+     pub fn receiver(&self) -> &RoutedReceiver<PaintMessage> {
+         &self.paint_receiver
+diff --git a/components/paint/painter.rs b/components/paint/painter.rs
+index 48da94c..a3be65b 100644
+--- a/components/paint/painter.rs
++++ b/components/paint/painter.rs
+@@ -41,11 +41,12 @@ use servo_geometry::DeviceIndependentPixel;
+ use smallvec::SmallVec;
+ use style_traits::CSSPixel;
+ use webrender::{
+-    MemoryReport, ONE_TIME_USAGE_HINT, RenderApi, RenderBackendHooks, SceneBuilderHooks,
+-    ShaderPrecacheFlags, Transaction, UploadMethod,
++    CompositorConfig, MemoryReport, ONE_TIME_USAGE_HINT, RenderApi, RenderBackendHooks,
++    SceneBuilderHooks, ShaderPrecacheFlags, Transaction, UploadMethod,
+ };
+ use webrender_api::units::{
+-    DevicePixel, DevicePoint, LayoutPoint, LayoutRect, LayoutSize, LayoutVector2D, WorldPoint,
++    DeviceIntRect, DevicePixel, DevicePoint, LayoutPoint, LayoutRect, LayoutSize, LayoutVector2D,
++    WorldPoint,
+ };
+ use webrender_api::{
+     self, BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, DirtyRect, DisplayListPayload,
+@@ -107,6 +108,15 @@ pub(crate) struct Painter {
+     /// The webrender renderer.
+     pub(crate) webrender_renderer: Option<webrender::Renderer>,
+ 
++    /// The device dirty rects reported by WebRender for the most recent
++    /// `render()` call (`RenderResults::dirty_rects`). `None` until the
++    /// first frame has been rendered; an empty list means WebRender
++    /// changed nothing in that frame. Only populated when partial
++    /// present is enabled (see `WebRenderOptions::compositor_config`
++    /// in [`Painter::new`]); with the default full-present config
++    /// this stays `None`.
++    last_dirty_rects: Option<Vec<DeviceIntRect>>,
++
+     /// The GL bindings for webrender
+     webrender_gl: Rc<dyn gleam::gl::Gl>,
+ 
+@@ -261,6 +271,23 @@ impl Painter {
+                 render_backend_hooks: Some(Box::new(BoostWebRenderThread)),
+                 scene_builder_hooks: Some(Box::new(BoostWebRenderThread)),
+                 shared_font_namespace: Some(painter_id.into()),
++                // Round 17 (WayServo): enable partial present so
++                // WebRender reports the device dirty rects for each
++                // frame in `RenderResults::dirty_rects` instead of
++                // redrawing the whole framebuffer every time. With
++                // `max_partial_present_rects: 1` the renderer returns
++                // a single combined dirty rect (or none at all when
++                // nothing changed, which the embedder uses as a signal
++                // to skip presenting). `draw_previous_partial_present_regions`
++                // is false: the embedder keeps its own full-frame
++                // backing buffers, so it only needs this frame's delta.
++                // `partial_present` is None: no backbuffer-age queries;
++                // `buffer_age` is always 0 at the `render()` call site.
++                compositor_config: CompositorConfig::Draw {
++                    max_partial_present_rects: 1,
++                    draw_previous_partial_present_regions: false,
++                    partial_present: None,
++                },
+                 ..Default::default()
+             },
+             None,
+@@ -287,6 +314,7 @@ impl Painter {
+             refresh_driver,
+             animation_refresh_driver_observer,
+             webrender_renderer: Some(webrender_renderer),
++            last_dirty_rects: None,
+             webrender_api,
+             webrender_document,
+             webrender_gl,
+@@ -434,7 +462,20 @@ impl Painter {
+                 self.clear_background();
+                 if let Some(renderer) = self.webrender_renderer.as_mut() {
+                     let size = self.rendering_context.size2d().to_i32();
+-                    renderer.render(size, 0 /* buffer_age */).ok();
++                    // Round 17 (WayServo): keep the dirty rects WebRender
++                    // reports for this frame, so the embedder can learn
++                    // what changed instead of diffing whole frames. On a
++                    // render error the framebuffer is in an unknown state,
++                    // so report the whole frame as damaged.
++                    match renderer.render(size, 0 /* buffer_age */) {
++                        Ok(results) => {
++                            self.last_dirty_rects = Some(results.dirty_rects);
++                        },
++                        Err(_) => {
++                            self.last_dirty_rects =
++                                Some(vec![DeviceIntRect::from_size(size)]);
++                        },
++                    }
+                 }
+             }
+         );
+@@ -447,6 +488,13 @@ impl Painter {
+         self.send_pending_paint_metrics_messages_after_composite();
+     }
+ 
++    /// The device dirty rects reported by WebRender for the most recent
++    /// `render()` call, or `None` if no frame has been rendered yet.
++    /// An empty list means WebRender changed nothing in that frame.
++    pub(crate) fn last_dirty_rects(&self) -> Option<Vec<DeviceIntRect>> {
++        self.last_dirty_rects.clone()
++    }
++
+     fn clear_background(&self) {
+         self.assert_gl_framebuffer_complete();
+ 
+diff --git a/components/servo/webview.rs b/components/servo/webview.rs
+index 8ac2eaa..caf9969 100644
+--- a/components/servo/webview.rs
++++ b/components/servo/webview.rs
+@@ -731,6 +731,16 @@ impl WebView {
+         self.servo().paint().render(self.id());
+     }
+ 
++    /// The device dirty rects for the most recent [`WebView::paint`] call,
++    /// as reported by WebRender. `None` if no frame has been painted yet;
++    /// an empty list means WebRender changed nothing in that frame, so the
++    /// embedder can skip presenting entirely. (Round 17, WayServo: only
++    /// populated when the partial-present engine patch is active; without
++    /// it the renderer reports the whole frame as damaged.)
++    pub fn last_damage_rects(&self) -> Option<Vec<DeviceIntRect>> {
++        self.servo().paint().last_dirty_rects(self.id())
++    }
++
+     /// Get the [`UserContentManager`] associated with this [`WebView`].
+     pub fn user_content_manager(&self) -> Option<Rc<UserContentManager>> {
+         self.inner().user_content_manager.clone()

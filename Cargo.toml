@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/frost",
+    "crates/frost-engine",
+    "crates/frost-extensions",
+    "crates/frost-inspector",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Mirror the servo workspace's per-package dev-profile overrides so unit
+# fingerprints match the already-built artifacts where possible (copied
+# from the proven servo-de embedder Cargo.toml).
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+
+[profile.dev.package.servo-script]
+codegen-units = 16
+
+[profile.dev.package.sha1]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
