@@ -14,5 +14,9 @@ ui-libcosmic = ["dep:libcosmic"]
 [dependencies]
 frost-engine = { path = "../frost-engine" }
 # libcosmic is NOT on crates.io — it ships from git (pop-os/libcosmic).
-# Pinned to the v0.12 tag; the frost README records the exact rev.
-libcosmic = { git = "https://github.com/pop-os/libcosmic", tag = "v0.12", default-features = false, features = ["winit", "tokio"], optional = true }
+# Pinned to HEAD rev ecc5fe4 (2026-11-12): the v0.12 tag FAILED to
+# resolve — its wgpu git pin requires a `web-sys` feature
+# (`GpuImageCopyBuffer`) that no published web-sys has. HEAD resolves.
+# API note: the app skeleton in src/main.rs was written against the v0.12
+# example; if HEAD changed the Application API, the check will say so.
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "ecc5fe4164e1c9024b932382d24ea41f24147e75", default-features = false, features = ["winit", "tokio"], optional = true }
