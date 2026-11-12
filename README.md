@@ -100,19 +100,36 @@ git -C servo push -u origin HEAD:main
 
 ## Round 1 — what is proven, what is not
 
-Proven (sandbox, 2026-11-12):
+Proven (sandbox, 2026-11-12, Rust 1.99.1):
 
-- The fork clones shallow at v0.8.0 and all three patches apply clean.
-- `cargo check --workspace` passes (engine, extensions, inspector, app stub).
-- The smoke test loads a live page and writes a non-blank PNG.
+- The fork clones shallow at v0.8.0 (`4e136d8e…`) and all three patches
+  apply clean (one commit each).
+- `cargo check --workspace --all-targets` green; `cargo check -p frost
+  --features ui-libcosmic` green (libcosmic HEAD `ecc5fe4` — the v0.12
+  tag could NOT resolve: its wgpu git pin needs a `web-sys` feature,
+  `GpuImageCopyBuffer`, that no published web-sys has).
+- Unit tests: 13/13 pass (`cargo test -p frost-engine -p
+  frost-extensions -p frost-inspector --lib`).
+- The smoke test loads live `https://example.org` and writes
+  `smoke.png` — 1280×800 RGBA PNG, 1248 distinct colors, verified
+  visually as a real rendered page (multilingual text, link, icon).
+  SHA-256: `d382c2ce9896375b7ad24c040d369448785b463a6a9a2d2916bf8137cd5d49ad`.
+- The engine drives the paint itself (`make_current` + `webview.paint()`
+  + `read_to_image` + `present()`); without `paint()` every frame came
+  back a single solid color — caught by the smoke gate, fixed, re-proven.
 
 Not proven:
 
 - Anything on Joel's box (Debian 13, Mesa GL) — the smoke test and the
-  window both need his run.
-- The libcosmic window — see the libcosmic note above.
+  window both need his run. The window was never *launched* in the
+  sandbox (no display); it only *compiles*.
 - `stop()`: Servo 0.8.0 has no `WebView::stop`; `FrostWebView::stop()`
   returns `EngineError::Unsupported` until fork patch F-001 lands.
+  (0.8.0 did add `LoadStatus::Stopped`, surfaced as
+  `EngineEvent::LoadStopped`.)
 - Real pages beyond example.org; media/WebGL are off in this feature set
   (same cuts as the proven servo-de embedder: no webgl/webxr/
   media-gstreamer in the sandbox build).
+- `uv` is not installed in the sandbox; Servo's script-bindings build
+  script warns about it and falls back to system python. The build
+  works, but installing `uv` would silence the warning.

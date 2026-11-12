@@ -18,10 +18,10 @@
 
 #[cfg(feature = "ui-libcosmic")]
 mod app {
-    use cosmic::app::{Command, Core, Settings};
-    use cosmic::iced_core::Size;
+    use cosmic::app::{Core, Settings, Task};
+    use cosmic::iced::Size;
     use cosmic::widget::{self, button, container, text, text_input};
-    use cosmic::{executor, iced, ApplicationExt, Element};
+    use cosmic::{executor, iced, Element};
 
     /// Every control in the chrome maps to one of these. Round 2 turns the
     /// navigation ones into real `frost-engine` calls; the menu ones open
@@ -67,7 +67,7 @@ mod app {
             &mut self.core
         }
 
-        fn init(core: Core, _flags: ()) -> (Self, Command<Message>) {
+        fn init(core: Core, _flags: ()) -> (Self, Task<Message>) {
             (
                 Self {
                     core,
@@ -75,11 +75,11 @@ mod app {
                     status: "Ready — engine wiring lands in Round 2.".to_string(),
                     menu_open: false,
                 },
-                Command::none(),
+                Task::none(),
             )
         }
 
-        fn update(&mut self, message: Message) -> Command<Message> {
+        fn update(&mut self, message: Message) -> Task<Message> {
             match message {
                 Message::Back => self.status = "Back (Round 2: engine.go_back)".into(),
                 Message::Forward => self.status = "Forward (Round 2: engine.go_forward)".into(),
@@ -107,10 +107,10 @@ mod app {
                 }
                 Message::Exit => std::process::exit(0),
             }
-            Command::none()
+            Task::none()
         }
 
-        fn view(&self) -> Element<Message> {
+        fn view(&self) -> Element<'_, Message> {
             // Toolbar: back / forward / reload / stop, address bar, menu.
             let toolbar = widget::row::with_children(vec![
                 button::standard("‹").on_press(Message::Back).into(),
@@ -120,7 +120,7 @@ mod app {
                 button::standard("✕").on_press(Message::Stop).into(),
                 text_input("Address", &self.address)
                     .on_input(Message::AddressChanged)
-                    .on_submit(Message::AddressSubmitted)
+                    .on_submit(|_| Message::AddressSubmitted)
                     .width(iced::Length::Fill)
                     .into(),
                 button::standard("☰").on_press(Message::ToggleMenu).into(),
