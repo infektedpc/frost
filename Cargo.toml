@@ -6,6 +6,14 @@ members = [
     "crates/frost-extensions",
     "crates/frost-inspector",
 ]
+# CRITICAL: servo/ is a nested workspace (its own Cargo.toml with
+# [workspace]). Cargo resolves a path dependency nested inside a
+# workspace directory against the OUTER workspace root unless the inner
+# one is excluded — without this, `components/servo` inherits
+# rust-version/edition/license from THIS root (wrong: edition 2021
+# instead of 2024, no rust-version) and manifest loading fails.
+# Excluding it makes cargo treat servo/ as its own workspace.
+exclude = ["servo"]
 
 [workspace.package]
 version = "0.1.0"

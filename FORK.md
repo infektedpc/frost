@@ -6,6 +6,15 @@ lives at `servo/` inside this repo (a **nested git repo** — it has its own
 The fork exists so Frost can move on its own schedule: engine fixes land as
 fork commits instead of a permanent pile of `git apply` diffs.
 
+> **Cargo gotcha (2026-11-12):** `servo/` is also a nested *workspace*.
+> Cargo resolves a path dependency nested inside a workspace directory
+> against the OUTER workspace root unless the inner one is excluded — so
+> without `exclude = ["servo"]` in the frost root `Cargo.toml`,
+> `components/servo` inherits `rust-version`/`edition`/`license` from the
+> frost root (wrong: edition 2021 instead of 2024, no `rust-version`) and
+> manifest loading fails with "`workspace.package.rust-version` was not
+> defined". The `exclude` line is load-bearing; do not remove it.
+
 ## Fork point
 
 | | |
