@@ -34,9 +34,9 @@ use dpi::PhysicalSize;
 use servo::{
     Code, DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePoint, EventLoopWaker, InputEvent,
     Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, PrefValue, Servo, ServoBuilder,
-    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
-    WheelMode,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, PrefValue, RenderingContext,
+    Servo, ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
+    WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 
@@ -101,6 +101,8 @@ pub enum EngineEvent {
     UrlChanged(Url),
     LoadStarted,
     LoadFinished,
+    /// The load was stopped before completing (0.8.0's `LoadStatus::Stopped`).
+    LoadStopped,
     FrameReady,
     Crashed(String),
 }
@@ -218,8 +220,12 @@ impl WebViewDelegate for FrostDelegate {
         let event = match status {
             LoadStatus::Started => EngineEvent::LoadStarted,
             LoadStatus::Complete => EngineEvent::LoadFinished,
+            // 0.8.0 added Stopped (the load ended early, e.g. via
+            // window.stop() inside the page). Surfaced as its own event
+            // so the UI can tell "stopped" from "finished".
+            LoadStatus::Stopped => EngineEvent::LoadStopped,
             // HeadParsed is not surfaced: the UI only cares about
-            // started/finished.
+            // started/finished/stopped.
             LoadStatus::HeadParsed => return,
         };
         let _ = self.tx.send(event);
@@ -274,7 +280,7 @@ impl Engine {
         };
         let webview = WebViewBuilder::new(&self.servo, ctx.clone())
             .url(url)
-            .delegate(delegate)
+            .delegate(Rc::new(delegate))
             .build();
         webview.set_focused(true);
         Ok(FrostWebView {
@@ -359,18 +365,30 @@ impl FrostWebView {
     /// Read the latest painted frame as RGBA pixels, or `None` if nothing
     /// has painted yet. The caller owns the pixels; the UI uploads them
     /// into a texture each frame (Round 2).
+    ///
+    /// The embedder drives the paint itself, servoshell-style:
+    /// `notify_new_frame_ready` only signals that a paint is *wanted*.
+    /// Without `paint()` here the context keeps its cleared buffer and
+    /// every frame comes back a single solid color. The read happens
+    /// before `present()` on purpose: the trait documents that
+    /// `read_to_image` reads the back buffer, so a post-`present` read
+    /// would see the swapped (empty) buffer.
     pub fn render(&self) -> Option<Frame> {
+        let _ = self.ctx.make_current();
+        self.inner.paint();
         let rect = DeviceIntRect::from_origin_and_size(
             DeviceIntPoint::new(0, 0),
             DeviceIntSize::new(self.width as i32, self.height as i32),
         );
         let img = self.ctx.read_to_image(rect)?;
         let (w, h) = (img.width(), img.height());
-        Some(Frame {
+        let frame = Frame {
             width: w,
             height: h,
             rgba: img.into_raw(),
-        })
+        };
+        self.ctx.present();
+        Some(frame)
     }
 
     /// Forward a UI input event into the page.
@@ -402,6 +420,7 @@ impl FrostWebView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use servo::NamedKey;
 
     #[test]
     fn frame_solid_color_detection() {
@@ -435,7 +454,7 @@ mod tests {
         .into();
         assert!(matches!(ev, InputEvent::Wheel(_)));
         let ev: InputEvent = FrostInputEvent::Key {
-            state: KeyState::Pressed,
+            state: KeyState::Down,
             key: Key::Named(NamedKey::Enter),
             code: Code::Enter,
         }

@@ -239,6 +239,9 @@ mod tests {
     fn sample_tree() -> DomNode {
         let mut root = DomNode::new(0, "#document");
         let mut html = DomNode::new(1, "html");
+        // Every rendered element has a box in real snapshots; the fixture
+        // must too, or the picker cannot descend past it.
+        html.box_model = Some(BoxModel::new(0.0, 0.0, 800.0, 600.0));
         let mut body = DomNode::new(2, "body");
         body.box_model = Some(BoxModel::new(0.0, 0.0, 800.0, 600.0));
         let mut div = DomNode::new(3, "div");

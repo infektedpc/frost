@@ -46,7 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine.spin();
         while let Some(event) = engine.try_recv_event() {
             eprintln!("[smoke] event: {event:?}");
-            if matches!(event, EngineEvent::LoadFinished) {
+            if matches!(
+                event,
+                EngineEvent::LoadFinished | EngineEvent::LoadStopped
+            ) {
                 finished = true;
             }
         }
