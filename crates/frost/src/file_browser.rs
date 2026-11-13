@@ -1,12 +1,19 @@
-//! File-browser page for the Open menu entry (Round 2).
+//! File-browser page for the Open menu entry (Round 2; Round 3 serves
+//! it through the loopback server instead of a `data:` page).
 //!
 //! Open is a real working file browser, not a placeholder. The app
-//! generates a directory listing as HTML and loads it through the
-//! engine as a `data:` page, the same way the other menu pages load.
-//! Folder clicks navigate the webview to `frost://open?path=<url-encoded
-//! path>`; the app intercepts that navigation (see `parse_open_url`)
-//! and re-lists the folder. File clicks are plain `file://` URLs, which
-//! Servo loads natively, so clicking a file opens it in the browser.
+//! generates a directory listing as HTML and the internal server serves
+//! it at `{base}/open?path=...` (Round 3), so the address bar shows
+//! `frost://open?path=...`. Folder clicks navigate to another
+//! `{base}/open` URL, which the server lists directly — no app
+//! interception needed for the listing itself. The app still intercepts
+//! `frost://open` navigations (typed in the bar, or reached through
+//! history) and translates them to the loopback form; see
+//! `parse_open_url`.
+//!
+//! File clicks are plain `file://` URLs, which Servo loads natively,
+//! except `.md` files: those link to `{base}/md?path=...` and the
+//! server renders them as formatted HTML (`render_markdown`).
 //!
 //! The listing starts at the home directory. Hidden entries (names
 //! starting with `.`) are skipped — a home listing with every dotfile
@@ -17,9 +24,10 @@ use std::path::{Path, PathBuf};
 
 use url::Url;
 
-/// Scheme of the listing's folder links.
+/// Scheme of the `frost://open` form (typed in the address bar, or
+/// reached through history).
 pub const OPEN_SCHEME: &str = "frost";
-/// Host of the listing's folder links.
+/// Host of the `frost://open` form.
 pub const OPEN_HOST: &str = "open";
 
 /// The directory the browser starts in: `$HOME`, or `/` if unset.
@@ -27,22 +35,34 @@ pub fn home_dir() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
 }
 
-/// The URL a folder link points at: `frost://open?path=<url-encoded path>`.
-pub fn listing_url(path: &Path) -> String {
+/// The URL a folder link points at: `{base}/open?path=<url-encoded
+/// path>`, where `base` is the internal server's base URL
+/// (`http://127.0.0.1:PORT`).
+pub fn listing_url(path: &Path, base: &str) -> String {
     let encoded: String =
         url::form_urlencoded::byte_serialize(path.as_os_str().as_encoded_bytes()).collect();
-    format!("{OPEN_SCHEME}://{OPEN_HOST}?path={encoded}")
+    format!("{base}/open?path={encoded}")
 }
 
-/// If `url` is a `frost://open` folder navigation, return the directory
+/// If `url` is a folder navigation — either the `frost://open` form or
+/// the loopback `/open` form the server serves — return the directory
 /// it names. Anything else returns `None`.
 pub fn parse_open_url(url: &Url) -> Option<PathBuf> {
-    if url.scheme() != OPEN_SCHEME || url.host_str() != Some(OPEN_HOST) {
+    let is_open = (url.scheme() == OPEN_SCHEME && url.host_str() == Some(OPEN_HOST))
+        || (matches!(url.scheme(), "http" | "https") && url.path() == "/open");
+    if !is_open {
         return None;
     }
     url.query_pairs()
         .find(|(key, _)| key == "path")
         .map(|(_, value)| PathBuf::from(value.into_owned()))
+}
+
+/// The URL a Markdown file link points at: the server renders it.
+fn markdown_url(path: &Path, base: &str) -> String {
+    let encoded: String =
+        url::form_urlencoded::byte_serialize(path.as_os_str().as_encoded_bytes()).collect();
+    format!("{base}/md?path={encoded}")
 }
 
 /// Escape text for insertion into the listing's HTML (names and paths
@@ -72,9 +92,11 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-/// `(title, body_html)` for the listing of `dir`. The title is already
-/// HTML-escaped (it is inserted verbatim into the page shell).
-pub fn listing_page(dir: &Path) -> (String, String) {
+/// `(title, body_html)` for the listing of `dir`. `base` is the
+/// internal server's base URL; folder and Markdown links are built
+/// from it. The title is already HTML-escaped (it is inserted verbatim
+/// into the page shell).
+pub fn listing_page(dir: &Path, base: &str) -> (String, String) {
     let dir_display = dir.display().to_string();
     let title = format!("Files — {}", html_escape(&dir_display));
     let mut body = String::new();
@@ -84,7 +106,7 @@ pub fn listing_page(dir: &Path) -> (String, String) {
     if let Some(parent) = dir.parent() {
         body.push_str(&format!(
             "<p><a href=\"{}\">↑ Up to {}</a></p>",
-            listing_url(parent),
+            listing_url(parent, base),
             html_escape(&parent.display().to_string()),
         ));
     }
@@ -120,8 +142,18 @@ pub fn listing_page(dir: &Path) -> (String, String) {
                     if is_dir {
                         body.push_str(&format!(
                             "<li>[dir] <a href=\"{}\">{}/</a></li>",
-                            listing_url(&path),
+                            listing_url(&path, base),
                             html_escape(&name),
+                        ));
+                    } else if path.extension().is_some_and(|ext| ext == "md") {
+                        // Markdown renders as formatted HTML through the
+                        // server (Round 3 decision: render, don't show
+                        // Servo's "Unknown content type" page).
+                        body.push_str(&format!(
+                            "<li><a href=\"{}\">{}</a> ({})</li>",
+                            markdown_url(&path, base),
+                            html_escape(&name),
+                            human_size(size),
                         ));
                     } else {
                         let file_url = Url::from_file_path(&path)
@@ -148,6 +180,33 @@ pub fn listing_page(dir: &Path) -> (String, String) {
     (title, body)
 }
 
+/// Render a Markdown file as formatted HTML (Round 3). Returns
+/// `(title, body_html)`, or `None` when the file cannot be read.
+/// The body links back to the parent folder and to the raw file.
+pub fn render_markdown(path: &Path, base: &str) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let parser = pulldown_cmark::Parser::new_ext(&text, pulldown_cmark::Options::all());
+    let mut rendered = String::new();
+    pulldown_cmark::html::push_html(&mut rendered, parser);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file.md".to_string());
+    let title = format!("Markdown — {}", html_escape(&name));
+    let raw_url = Url::from_file_path(path).map(|u| u.to_string()).unwrap_or_default();
+    let parent = path.parent().map(|p| p.to_path_buf());
+    let mut body = format!(
+        "<p><a href=\"{}\">← Back to folder</a> · <a href=\"{}\">Raw file</a></p>",
+        parent
+            .as_ref()
+            .map(|p| listing_url(p, base))
+            .unwrap_or_else(|| format!("{base}/open")),
+        raw_url,
+    );
+    body.push_str(&rendered);
+    Some((title, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,8 +214,12 @@ mod tests {
     #[test]
     fn open_url_round_trips() {
         let dir = Path::new("/home/someone/My Docs");
-        let url = Url::parse(&listing_url(dir)).unwrap();
+        let base = "http://127.0.0.1:54321";
+        let url = Url::parse(&listing_url(dir, base)).unwrap();
         assert_eq!(parse_open_url(&url).unwrap(), dir);
+        // The frost:// form parses too (typed in the bar / history).
+        let frost_url = Url::parse("frost://open?path=%2Fhome%2Fsomeone%2FMy%20Docs").unwrap();
+        assert_eq!(parse_open_url(&frost_url).unwrap(), dir);
     }
 
     #[test]
@@ -164,6 +227,8 @@ mod tests {
         assert!(parse_open_url(&Url::parse("https://example.org/").unwrap()).is_none());
         assert!(parse_open_url(&Url::parse("frost://settings").unwrap()).is_none());
         assert!(parse_open_url(&Url::parse("frost://open").unwrap()).is_none());
+        assert!(parse_open_url(&Url::parse("http://127.0.0.1:54321/settings").unwrap())
+            .is_none());
     }
 
     #[test]
@@ -174,10 +239,28 @@ mod tests {
         std::fs::create_dir(dir.join("visible-dir")).unwrap();
         std::fs::write(dir.join("visible.txt"), b"hello").unwrap();
         std::fs::write(dir.join(".hidden"), b"nope").unwrap();
-        let (_, body) = listing_page(&dir);
+        let (_, body) = listing_page(&dir, "http://127.0.0.1:54321");
         assert!(body.contains("visible-dir/"), "{body}");
         assert!(body.contains("visible.txt"), "{body}");
         assert!(!body.contains(".hidden"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn markdown_renders_to_html() {
+        let dir = std::env::temp_dir().join("frost-markdown-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+        std::fs::write(&path, "# Hello\n\nSome **bold** text.\n").unwrap();
+        let (title, body) = render_markdown(&path, "http://127.0.0.1:54321").unwrap();
+        assert!(title.contains("note.md"), "{title}");
+        assert!(body.contains("<h1>Hello</h1>"), "{body}");
+        assert!(body.contains("<strong>bold</strong>"), "{body}");
+        assert!(render_markdown(&dir.join("missing.md"), "http://127.0.0.1:54321").is_none());
+        // A listing links .md files to the render route, not file://.
+        let (_, listing) = listing_page(&dir, "http://127.0.0.1:54321");
+        assert!(listing.contains("/md?path="), "{listing}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

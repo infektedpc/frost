@@ -7,24 +7,39 @@
 //! * The toolbar navigates for real: back / forward (disabled when the
 //!   engine says there is nothing to go to), reload, stop (live since fork
 //!   patch F-001), address bar (Enter navigates; bare hostnames get
-//!   `https://`).
+//!   `https://`, anything else is a search with the default engine).
 //! * Input forwards into the page: the app listens to all iced events and
 //!   translates the ones landing in the content area into
 //!   [`frost_engine::FrostInputEvent`]s. Keyboard goes to the page only
 //!   while the content area has focus (a click in the content, or Enter in
 //!   the address bar); typing in the address bar stays in the bar.
-//! * The hamburger menu opens as a dropdown; Settings / Print load
-//!   placeholder pages through the engine (real `frost://` pages are
-//!   Round 3); Open is a real file browser — the listing is generated
-//!   app-side, folder clicks re-list, file clicks open the file in the
-//!   browser; Exit quits the process.
+//! * The hamburger menu opens as a dropdown; Settings / Print / Exit /
+//!   Open load `frost://` internal pages served by the app's own
+//!   loopback server (Round 3, `server.rs`) — the address bar shows
+//!   `frost://settings`, never a raw `data:` URL. Open is a real file
+//!   browser — the listing is generated app-side and served by the
+//!   server, folder clicks re-list, file clicks open the file in the
+//!   browser, `.md` files render as formatted HTML; Exit quits the
+//!   process (via the confirmation page when enabled).
+//! * Settings (`settings.rs`) are a working page: theme (light/dark,
+//!   applied live to Frost's own chrome and to the pages), homepage
+//!   (next launch), default search engine, exit confirmation. Settings
+//!   persist as JSON under the config dir.
+//! * Extension host v1 (`frost-extensions`): extensions load from
+//!   directories (manifest + content script), the host matches content
+//!   scripts against page URLs, and the engine evaluates them in the
+//!   page. A bad manifest is logged and skipped, never a crash.
 //! * Frost draws its own titlebar (the built-in libcosmic headerbar is
 //!   hidden — it renders the title but no window-control buttons on this
 //!   setup): "Frost — <page title>" with real minimize, maximize/restore,
 //!   and close buttons (text glyphs, real iced window commands).
+//! * The Round 2 resize "jiggle" is gone: after a load the app calls
+//!   fork patch F-005 (`WebView::refresh_viewport`), which re-sends the
+//!   current viewport and rebuilds the root display list without ever
+//!   changing the size.
 //!
 //! Chrome geometry is fixed by construction (Frost titlebar 40, toolbar
-//! 48, menu 136 when open, status 28), so the webview size and the click
+//! 48, menu 148 when open, status 28), so the webview size and the click
 //! mapping are exact: the content area is the window minus the chrome,
 //! and mouse coordinates translate 1:1 into page coordinates.
 //!
@@ -41,8 +56,15 @@ mod file_browser;
 mod keymap;
 
 #[cfg(feature = "ui-libcosmic")]
+mod server;
+
+#[cfg(feature = "ui-libcosmic")]
+mod settings;
+
+#[cfg(feature = "ui-libcosmic")]
 mod app {
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use cosmic::app::{Core, Settings, Task};
@@ -56,13 +78,16 @@ mod app {
     use cosmic::widget::{self, button, container, text, text_input};
     use cosmic::{executor, iced, ApplicationExt, Element};
     use frost_engine::{
-        data_url_page, Engine, EngineEvent, FrostCode, FrostInputEvent, FrostKeyState,
+        Engine, EngineEvent, FrostCode, FrostInputEvent, FrostKeyState,
         FrostMouseButtonAction, FrostWebView,
     };
+    use frost_extensions::{ExtensionHost, ExtensionManifest, StubHost};
     use url::Url;
 
     use crate::file_browser;
     use crate::keymap::{map_button, map_code, map_key, map_location, map_modifiers};
+    use crate::server::{InternalServer, Shared};
+    use crate::settings::{ChromeColors, Settings as FrostSettings};
 
     /// Chrome geometry, fixed by construction (see the module docs).
     /// Frost draws its OWN titlebar above the toolbar (40 px): the
@@ -74,7 +99,10 @@ mod app {
     const TITLEBAR_HEIGHT: f32 = 40.0;
     const TOOLBAR_HEIGHT: f32 = 48.0;
     const STATUS_HEIGHT: f32 = 28.0;
-    const MENU_HEIGHT: f32 = 136.0;
+    /// Height of the hamburger menu (4 entries). Round 2 used 136 and
+    /// the 4th entry (Exit) was clipped ~4 px at the bottom edge; 148
+    /// fits all four fully.
+    const MENU_HEIGHT: f32 = 148.0;
     const INITIAL_WINDOW: (f32, f32) = (1280.0, 800.0);
     const HOME_URL: &str = "https://example.org";
     /// Engine pump rate. The tick spins Servo, drains its events, and
@@ -108,15 +136,17 @@ mod app {
         TitlebarDoubleClick,
     }
 
-    /// Phase of the post-load forced repaint (see `start_repaint_jiggle`).
+    /// Phase of the post-load forced repaint (see
+    /// `start_repaint_refresh`). Round 3: the Round 2 two-phase resize
+    /// jiggle is gone — fork patch F-005 (`WebView::refresh_viewport`)
+    /// re-sends the current viewport and rebuilds the root display
+    /// list without changing the size, so there is only one wait.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum RepaintPhase {
         /// No forced repaint in flight.
         Idle,
-        /// Resized 1 px wider; waiting for the frame that resize produces.
-        WaitFirstFrame,
-        /// Resized back to the content size; waiting for that frame.
-        WaitSecondFrame,
+        /// Viewport refresh sent; waiting for the repaired frame.
+        WaitRefresh,
     }
 
     pub struct Frost {
@@ -177,6 +207,22 @@ mod app {
         /// Ticks waited for the current repaint step's frame; bounds the
         /// wait so a missing FrameReady can never wedge the display.
         repaint_wait_ticks: u32,
+        /// Current settings (theme, homepage, search engine, exit
+        /// confirmation). Loaded at startup; the Tick polls the shared
+        /// version for changes made through the settings page.
+        settings: FrostSettings,
+        /// Settings version last applied to the app (see
+        /// `Shared::settings_version`).
+        settings_version: u64,
+        /// The internal-page loopback server (owns the shared state).
+        server: InternalServer,
+        /// Content-script host (StubHost: in-memory, real disk loading
+        /// + real injection through the engine — see
+        /// `inject_content_scripts`).
+        host: StubHost,
+        /// URL content scripts were last injected for; a new navigation
+        /// clears it so the new page gets its scripts.
+        injected_for: Option<String>,
     }
 
     impl Frost {
@@ -206,13 +252,7 @@ mod app {
         }
 
         /// Resize the webview to the content area, if it changed.
-        /// While a forced repaint is running the jiggle owns the webview
-        /// size, so a window resize during it is deferred (the jiggle's
-        /// resize-back uses the current content size anyway).
         fn resize_webview(&mut self) {
-            if self.repaint_pending {
-                return;
-            }
             let (w, h) = self.content_size();
             if self.webview.size() != (w, h) {
                 self.webview.resize(w, h);
@@ -220,57 +260,42 @@ mod app {
             }
         }
 
-        /// Force a full repaint after a load (two-phase resize jiggle).
+        /// Force a full repaint after a load (Round 3, fork patch F-005).
         ///
         /// A load's first paint is partial — only a ~1024x512 region of
         /// a 1280x684 frame — and no later paint repairs it, even a
         /// render after LoadFinished (the load gate alone does not fix
-        /// it). What DOES repair it is a real resize to a different
-        /// size: maximizing to 1600x900 painted the whole 1600x784
-        /// frame, restoring to 1280x800 painted the whole 1280x684
-        /// frame, and even a 1 px window resize paints fully. So the
-        /// webview itself must be resized: a same-size resize is a
-        /// no-op in Servo (the painter dedupes it). This jiggle
-        /// therefore does it in two steps, one per timed wait: resize
-        /// 1 px wider, wait ~0.25 s, resize back to the content size,
-        /// wait ~0.25 s, then upload. The intermediate size is never
-        /// uploaded, so the user never sees it. The waits are timed,
-        /// not FrameReady-driven: advancing on a FrameReady resized
-        /// straight back on a stale (pre-resize) event, coalescing the
-        /// two resizes into a net no-op. This works around a
-        /// damage/initialization gap in the engine (same family as the
-        /// WayServo ghost finding that dirty rects under-report); a
-        /// proper full-repaint trigger in the fork is the follow-up.
-        fn start_repaint_jiggle(&mut self) {
-            let (w, h) = self.content_size();
-            self.webview.resize(w + 1, h);
-            self.repaint_phase = RepaintPhase::WaitFirstFrame;
+        /// it). What DOES repair it is re-sending the current viewport
+        /// to the constellation and rebuilding the root display list:
+        /// a real resize to a different size did that (maximizing to
+        /// 1600x900 painted the whole 1600x784 frame; a 1 px window
+        /// resize painted fully), which is why Round 2 used a two-step
+        /// resize "jiggle". F-005 exposes exactly the repair half of the
+        /// resize path as `WebView::refresh_viewport()` — same viewport
+        /// re-send and display-list rebuild, no size change, no
+        /// intermediate frame, no timed size dance. This method sends
+        /// the refresh and waits ~0.25 s (15 ticks) for the repaired
+        /// frame before uploading. The wait is timed, not FrameReady-
+        /// driven: a FrameReady arriving during it may be stale (queued
+        /// before the refresh), so it must not end the wait early.
+        fn start_repaint_refresh(&mut self) {
+            self.webview.refresh_viewport();
+            self.repaint_phase = RepaintPhase::WaitRefresh;
             self.repaint_pending = true;
             self.repaint_wait_ticks = 0;
-            // Discard any pre-jiggle frame flag: the frame it names is
+            // Discard any pre-refresh frame flag: the frame it names is
             // the stale partial one.
             self.frame_dirty = false;
         }
 
-        /// Advance the forced repaint one step (called by the Tick
-        /// once the current step's timed wait has elapsed). The Tick's
-        /// render gate uploads the final frame once the jiggle
-        /// completes.
-        fn advance_repaint_jiggle(&mut self) {
+        /// Complete the forced repaint (called by the Tick once the
+        /// timed wait has elapsed). The Tick's render gate uploads the
+        /// repaired frame once this completes.
+        fn advance_repaint_refresh(&mut self) {
             match self.repaint_phase {
-                RepaintPhase::WaitFirstFrame => {
-                    // The wider frame arrived: resize back to the
-                    // content size (which may have changed if the
-                    // window was resized mid-jiggle) and wait for it.
-                    let (w, h) = self.content_size();
-                    self.webview.resize(w, h);
-                    self.repaint_phase = RepaintPhase::WaitSecondFrame;
-                    self.repaint_wait_ticks = 0;
-                    self.frame_dirty = false;
-                },
-                RepaintPhase::WaitSecondFrame => {
-                    // The back-to-size frame arrived: the jiggle is
-                    // done; the Tick uploads it.
+                RepaintPhase::WaitRefresh => {
+                    // The refreshed frame arrived: the repaint is done;
+                    // the Tick uploads it.
                     self.repaint_phase = RepaintPhase::Idle;
                     self.repaint_pending = false;
                     self.frame_dirty = true;
@@ -311,7 +336,7 @@ mod app {
         fn handle_engine_event(&mut self, event: EngineEvent) {
             match event {
                 EngineEvent::TitleChanged(title) => {
-                    self.title = title;
+                    self.title = title.clone();
                     self.title_dirty = true;
                     if !self.loading {
                         self.status = self
@@ -319,25 +344,52 @@ mod app {
                             .clone()
                             .unwrap_or_else(|| "Untitled page".to_string());
                     }
+                    if let Ok(mut shared) = self.server.shared.lock() {
+                        shared.current_page_title = title.unwrap_or_default();
+                    }
                 },
                 EngineEvent::UrlChanged(url) => {
+                    // The engine sees the loopback URL for internal
+                    // pages; the address bar shows the `frost://` form.
+                    let display = crate::server::loopback_url_to_frost(
+                        &url.to_string(),
+                        &self.server.base_url,
+                    )
+                    .unwrap_or_else(|| url.to_string());
                     if !self.address_editing {
-                        self.address = url.to_string();
+                        self.address = display.clone();
                     }
                     self.title_dirty = true;
                     self.can_back = self.webview.can_go_back();
                     self.can_forward = self.webview.can_go_forward();
+                    // The exit page's Quit link lands here: quitting is
+                    // the action, not a page to show.
+                    if display == "frost://exit/confirm" {
+                        std::process::exit(0);
+                    }
+                    // Track the live page for the print/exit pages.
+                    if let Ok(mut shared) = self.server.shared.lock() {
+                        shared.current_page_url = display.clone();
+                        if !display.starts_with("frost://") {
+                            shared.last_external_url = Some(display.clone());
+                        }
+                    }
                     // A folder click in the file browser navigates to
-                    // frost://open?path=... — re-list that folder instead
-                    // of leaving the engine on an unloadable URL.
+                    // `frost://open?path=...` (or the loopback form) —
+                    // re-list that folder instead of leaving the engine
+                    // on an unloadable URL. Guarded by last_open_path
+                    // so one navigation is intercepted exactly once.
                     if let Some(path) = file_browser::parse_open_url(&url) {
-                        self.open_file_browser(&path);
+                        if self.last_open_path.as_ref() != Some(&path) {
+                            self.open_file_browser(&path);
+                        }
                     }
                 },
                 EngineEvent::LoadStarted => {
                     self.loading = true;
                     self.awaiting_load = true;
                     self.loading_since = Some(std::time::Instant::now());
+                    self.injected_for = None;
                     self.status = format!("Loading {} …", self.address);
                 },
                 EngineEvent::LoadFinished => {
@@ -346,16 +398,17 @@ mod app {
                     self.loading_since = None;
                     self.address_editing = false;
                     self.status = self.title.clone().unwrap_or_else(|| "Done".to_string());
+                    self.inject_content_scripts();
                     // The load's first paint is partial; force a full
                     // repaint before any frame is uploaded.
-                    self.start_repaint_jiggle();
+                    self.start_repaint_refresh();
                 },
                 EngineEvent::LoadStopped => {
                     self.loading = false;
                     self.awaiting_load = false;
                     self.loading_since = None;
                     self.status = "Stopped.".to_string();
-                    self.start_repaint_jiggle();
+                    self.start_repaint_refresh();
                 },
                 EngineEvent::FrameReady => {
                     if self.repaint_pending {
@@ -490,47 +543,76 @@ mod app {
             });
         }
 
-        /// Load a placeholder page for a menu entry (Settings / Print;
-        /// Round 3 replaces these with the real `frost://` internal
-        /// pages. Open is a real file browser — see `open_file_browser`).
-        fn open_placeholder(&mut self, title: &str, body_html: &str) {
-            self.menu_open = false;
-            self.resize_webview();
-            let url = data_url_page(title, body_html);
-            match self.webview.load(&url) {
+        /// Load a loopback URL for an internal page, showing
+        /// `display_url` (the `frost://` form) in the address bar.
+        fn load_loopback(&mut self, loopback_url: &str, display_url: &str) {
+            match self.webview.load(loopback_url) {
                 Ok(()) => {
                     self.awaiting_load = true;
                     self.loading_since = Some(std::time::Instant::now());
+                    self.address = display_url.to_string();
                     self.address_editing = false;
                     self.content_focused = true;
-                    self.status = format!("{title} (placeholder — real page lands in Round 3)");
+                    self.status = format!("Loading {display_url} …");
                 },
-                Err(e) => self.status = format!("Cannot open {title}: {e}"),
+                Err(e) => self.status = format!("Cannot open {display_url}: {e}"),
             }
         }
 
-        /// Load the file-browser listing for `path` through the engine
-        /// (Round 2: the listing is generated app-side by
-        /// `file_browser::listing_page` and loaded as a data: page.
-        /// Folder clicks come back as `frost://open` navigations,
-        /// intercepted in `handle_engine_event` and the Tick's URL
-        /// poll; file clicks are plain `file://` URLs, which Servo
-        /// loads natively).
+        /// Load an internal page by its `frost://` URL (menu entries,
+        /// address bar). The engine cannot load the `frost:` scheme,
+        /// so the URL is translated to the loopback server's address
+        /// before loading; the address bar keeps the `frost://` form.
+        fn open_internal(&mut self, frost_url: &str) {
+            self.menu_open = false;
+            self.resize_webview();
+            match crate::server::frost_url_to_loopback(frost_url, &self.server.base_url) {
+                Some(loopback) => self.load_loopback(&loopback, frost_url),
+                None => self.status = format!("Cannot open {frost_url}: unknown internal page"),
+            }
+        }
+
+        /// Load the file-browser listing for `path` through the
+        /// internal server (Round 3: the listing is served at
+        /// `{base}/open?path=...`, so the address bar shows
+        /// `frost://open?path=...`. Folder clicks are plain server
+        /// navigations; file clicks are `file://` URLs, which Servo
+        /// loads natively; `.md` files render as HTML).
         fn open_file_browser(&mut self, path: &Path) {
             self.menu_open = false;
             self.resize_webview();
             self.last_open_path = Some(path.to_path_buf());
-            let (title, body) = file_browser::listing_page(path);
-            let url = data_url_page(&title, &body);
-            match self.webview.load(&url) {
-                Ok(()) => {
-                    self.awaiting_load = true;
-                    self.loading_since = Some(std::time::Instant::now());
-                    self.address_editing = false;
-                    self.content_focused = true;
-                    self.status = format!("Files: {}", path.display());
-                },
-                Err(e) => self.status = format!("Cannot open {}: {e}", path.display()),
+            let loopback = file_browser::listing_url(path, &self.server.base_url);
+            let display = crate::server::loopback_url_to_frost(&loopback, &self.server.base_url)
+                .unwrap_or(loopback.clone());
+            self.load_loopback(&loopback, &display);
+            self.status = format!("Files: {}", path.display());
+        }
+
+        /// Inject the content scripts that match the current page URL.
+        /// Runs once per URL, on LoadFinished (and on the 15 s safety
+        /// net, for history traversals that never fire LoadFinished).
+        /// Internal pages (`frost://` / loopback) never get scripts —
+        /// they are Frost's own UI. `DocumentStart` scripts cannot run
+        /// at document start (no navigation hook in the engine yet), so
+        /// v1 runs every script at load finish; the sample extension
+        /// uses `DocumentIdle` and is unaffected.
+        fn inject_content_scripts(&mut self) {
+            let Some(url) = self.webview.url().map(|u| u.to_string()) else {
+                return;
+            };
+            if self.injected_for.as_deref() == Some(url.as_str()) {
+                return;
+            }
+            self.injected_for = Some(url.clone());
+            if url.starts_with("frost://")
+                || crate::server::is_loopback_url(&url, &self.server.base_url)
+            {
+                return;
+            }
+            let scripts = self.host.content_scripts_for(&url);
+            for (_, script) in scripts {
+                self.webview.evaluate_javascript(&script.js);
             }
         }
     }
@@ -556,13 +638,50 @@ mod app {
             // window-control buttons on this setup, so it is hidden
             // rather than left as an empty strip.
             core.window.show_headerbar = false;
+
+            // Settings first: they decide the homepage and the theme.
+            let settings = FrostSettings::load();
+            let homepage = if crate::server::is_loadable_homepage(&settings.homepage) {
+                settings.homepage.clone()
+            } else {
+                eprintln!(
+                    "frost: homepage {:?} is not a loadable URL; using {HOME_URL}",
+                    settings.homepage
+                );
+                HOME_URL.to_string()
+            };
+
+            // The internal-page server (frost:// settings/print/exit/
+            // open/extensions). The bind is on an ephemeral loopback
+            // port and cannot realistically fail; if it does, the
+            // browser cannot serve its own pages, so fail loudly.
+            let shared = Arc::new(Mutex::new(Shared::new(settings.clone())));
+            let server = InternalServer::start(
+                Arc::clone(&shared),
+                FrostSettings::config_path(),
+            )
+            .expect("frost: could not start the internal-page server");
+            if let Ok(mut shared) = shared.lock() {
+                shared.base_url = server.base_url.clone();
+            }
+
+            // Extensions: load from every candidate directory, log and
+            // skip the bad ones (never crash on a bad manifest), and
+            // publish the snapshot for the frost://extensions page.
+            let (host, loaded, failed) = load_extensions();
+            if let Ok(mut shared) = shared.lock() {
+                shared.extensions = loaded;
+                shared.failed_extensions = failed;
+            }
+
             let engine = Engine::new().expect("frost: could not create the Servo engine");
             let window_size = Size::new(INITIAL_WINDOW.0, INITIAL_WINDOW.1);
             let content_height =
                 INITIAL_WINDOW.1 - TITLEBAR_HEIGHT - TOOLBAR_HEIGHT - STATUS_HEIGHT;
             let webview = engine
-                .spawn_webview(HOME_URL, INITIAL_WINDOW.0 as u32, content_height as u32)
+                .spawn_webview(&homepage, INITIAL_WINDOW.0 as u32, content_height as u32)
                 .expect("frost: could not spawn the first webview");
+            webview.set_theme(settings.theme.is_dark());
             (
                 Self {
                     core,
@@ -571,9 +690,9 @@ mod app {
                     frame: None,
                     frame_dirty: false,
                     loading: true,
-                    address: HOME_URL.to_string(),
+                    address: homepage.clone(),
                     address_editing: false,
-                    status: format!("Loading {HOME_URL} …"),
+                    status: format!("Loading {homepage} …"),
                     title: None,
                     menu_open: false,
                     last_open_path: None,
@@ -588,6 +707,11 @@ mod app {
                     repaint_pending: false,
                     repaint_phase: RepaintPhase::Idle,
                     repaint_wait_ticks: 0,
+                    settings,
+                    settings_version: 0,
+                    server,
+                    host,
+                    injected_for: None,
                 },
                 Task::none(),
             )
@@ -611,6 +735,26 @@ mod app {
                     self.engine.spin();
                     while let Some(event) = self.engine.try_recv_event() {
                         self.handle_engine_event(event);
+                    }
+                    // Settings changed through the settings page (the
+                    // server bumps the shared version): apply them.
+                    // Theme and search engine apply live; the homepage
+                    // applies on next launch (the page says so).
+                    let (new_settings, new_version) = {
+                        match self.server.shared.lock() {
+                            Ok(shared) => {
+                                (shared.settings.clone(), shared.settings_version)
+                            },
+                            Err(e) => (e.into_inner().settings.clone(), self.settings_version),
+                        }
+                    };
+                    if new_version != self.settings_version {
+                        let theme_changed = new_settings.theme != self.settings.theme;
+                        self.settings = new_settings;
+                        self.settings_version = new_version;
+                        if theme_changed {
+                            self.webview.set_theme(self.settings.theme.is_dark());
+                        }
                     }
                     // Poll the webview URL for a frost://open folder
                     // navigation: if the engine did not emit a
@@ -648,31 +792,31 @@ mod app {
                                     .clone()
                                     .unwrap_or_else(|| "Done".to_string());
                                 self.frame_dirty = true;
+                                // The traversal's page still gets its
+                                // content scripts (no LoadFinished fired).
+                                self.inject_content_scripts();
                             }
                         }
                     }
                     // The forced repaint is time-driven, not event-driven:
-                    // a FrameReady arriving during the jiggle may be stale
-                    // (queued before the jiggle's resize — advancing on it
-                    // resized straight back before the constellation had
-                    // processed the wider resize, coalescing the two into
-                    // a net no-op, which is why the event-driven jiggle
-                    // still left partial frames). Each step therefore
-                    // waits ~15 ticks (~0.25 s, far more than the 1–2
-                    // spins the constellation needs to process a resize)
-                    // before advancing, so the resize is certainly
-                    // processed before the next step.
+                    // a FrameReady arriving during the refresh may be stale
+                    // (queued before the refresh — advancing on it would
+                    // upload the stale partial frame). The refresh
+                    // therefore waits ~15 ticks (~0.25 s, far more than
+                    // the 1–2 spins the constellation needs to process
+                    // a viewport re-send) before completing, so the
+                    // viewport is certainly processed before the frame
+                    // is uploaded.
                     if self.repaint_pending {
                         self.repaint_wait_ticks += 1;
                         if self.repaint_wait_ticks >= 15 {
-                            self.advance_repaint_jiggle();
+                            self.advance_repaint_refresh();
                         }
                     }
                     // Render ONLY when the engine flagged a new frame AND
                     // no load is in flight (see awaiting_load) AND no
-                    // forced repaint is running: the jiggle's intermediate
-                    // size must never be uploaded, and a pre-jiggle
-                    // partial frame must never reach the screen.
+                    // forced repaint is running: a pre-refresh partial
+                    // frame must never reach the screen.
                     if self.frame_dirty && !self.awaiting_load && !self.repaint_pending {
                         if let Some(frame) = self.webview.render() {
                             self.frame = Some(Handle::from_rgba(
@@ -731,16 +875,24 @@ mod app {
                     Task::none()
                 },
                 Message::AddressSubmitted => {
-                    let url = normalize_url(&self.address, HOME_URL);
-                    match self.webview.load(&url) {
-                        Ok(()) => {
-                            self.awaiting_load = true;
-                            self.loading_since = Some(std::time::Instant::now());
-                            self.address = url;
-                            self.address_editing = false;
-                            self.content_focused = true;
-                        },
-                        Err(e) => self.status = format!("Cannot load {url}: {e}"),
+                    let url = resolve_address(&self.address, &self.settings);
+                    // A frost:// URL goes through the internal server.
+                    if let Some(loopback) = url
+                        .strip_prefix("frost://")
+                        .and_then(|_| crate::server::frost_url_to_loopback(&url, &self.server.base_url))
+                    {
+                        self.load_loopback(&loopback, &url);
+                    } else {
+                        match self.webview.load(&url) {
+                            Ok(()) => {
+                                self.awaiting_load = true;
+                                self.loading_since = Some(std::time::Instant::now());
+                                self.address = url;
+                                self.address_editing = false;
+                                self.content_focused = true;
+                            },
+                            Err(e) => self.status = format!("Cannot load {url}: {e}"),
+                        }
                     }
                     Task::none()
                 },
@@ -750,26 +902,25 @@ mod app {
                     Task::none()
                 },
                 Message::OpenSettings => {
-                    self.open_placeholder(
-                        "Settings",
-                        "<p>Settings arrive in Round 3 — theme, homepage, search engine, privacy.</p>\
-                         <p><a href=\"https://example.org\">Back to example.org</a></p>",
-                    );
+                    self.open_internal("frost://settings");
                     Task::none()
                 },
                 Message::OpenPrint => {
-                    self.open_placeholder(
-                        "Print page",
-                        "<p>Print preview arrives in Round 3 (fork patch F-003 or paginated-image export).</p>\
-                         <p><a href=\"https://example.org\">Back to example.org</a></p>",
-                    );
+                    self.open_internal("frost://print");
                     Task::none()
                 },
                 Message::OpenFile => {
                     self.open_file_browser(&file_browser::home_dir());
                     Task::none()
                 },
-                Message::Exit => std::process::exit(0),
+                Message::Exit => {
+                    if self.settings.confirm_exit {
+                        self.open_internal("frost://exit");
+                    } else {
+                        std::process::exit(0);
+                    }
+                    Task::none()
+                },
                 // Titlebar window controls: real iced window commands,
                 // never decoration. Minimize / maximize / close are the
                 // same commands libcosmic's own headerbar issues.
@@ -798,6 +949,13 @@ mod app {
         }
 
         fn view(&self) -> Element<'_, Message> {
+            // Frost's own chrome is styled explicitly from the settings
+            // theme (see `chrome_container_style`): libcosmic's global
+            // theme is not settable at runtime, so the titlebar /
+            // toolbar / menu / status carry the theme colors themselves.
+            // The buttons and the text field keep the global (dark)
+            // styling in both modes — readable on either chrome.
+            let colors = self.settings.theme.chrome_colors();
             // Titlebar (Frost's own — the built-in libcosmic headerbar
             // is hidden): browser name + current site title, and real
             // minimize / maximize-restores / close buttons. Text glyphs,
@@ -814,7 +972,7 @@ mod app {
             )
             .on_press(Message::TitlebarDrag)
             .on_double_press(Message::TitlebarDoubleClick);
-            let titlebar = widget::row::with_children(vec![
+            let titlebar_row = widget::row::with_children(vec![
                 // Left spacer, as wide as the button group, so the title
                 // stays centered in the remaining space.
                 widget::Space::new()
@@ -837,6 +995,10 @@ mod app {
             .spacing(4)
             .padding([0, 4, 0, 4])
             .height(Length::Fixed(TITLEBAR_HEIGHT));
+            let titlebar = container(titlebar_row)
+                .style(move |_| chrome_container_style(colors))
+                .width(Length::Fill)
+                .height(Length::Fixed(TITLEBAR_HEIGHT));
 
             // Toolbar: back / forward / reload / stop, address bar, menu.
             // Back/forward/stop only get an on_press when they can act —
@@ -866,7 +1028,7 @@ mod app {
                     b
                 }
             };
-            let toolbar = widget::row::with_children(vec![
+            let toolbar_row = widget::row::with_children(vec![
                 back.into(),
                 forward.into(),
                 button::standard("⟳").on_press(Message::Reload).into(),
@@ -881,6 +1043,10 @@ mod app {
             .spacing(8)
             .padding(8)
             .height(Length::Fixed(TOOLBAR_HEIGHT));
+            let toolbar = container(toolbar_row)
+                .style(move |_| chrome_container_style(colors))
+                .width(Length::Fill)
+                .height(Length::Fixed(TOOLBAR_HEIGHT));
 
             // Hamburger menu: fixed height when open so the content area
             // below it has an exact, known rectangle.
@@ -894,6 +1060,7 @@ mod app {
                     ])
                     .spacing(4),
                 )
+                .style(move |_| chrome_container_style(colors))
                 .padding(8)
                 .width(Length::Fill)
                 .height(Length::Fixed(MENU_HEIGHT))
@@ -911,6 +1078,7 @@ mod app {
                     .content_fit(ContentFit::Fill)
                     .into(),
                 None => container(text("Loading…").size(16))
+                    .style(move |_| chrome_container_style(colors))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .center_x(Length::Fill)
@@ -919,35 +1087,174 @@ mod app {
             };
 
             let status = container(text(&self.status).size(13))
+                .style(move |_| chrome_container_style(colors))
                 .width(Length::Fill)
                 .height(Length::Fixed(STATUS_HEIGHT))
                 .padding(6);
 
-            widget::column::with_children(vec![
-                titlebar.into(),
-                toolbar.into(),
-                menu,
-                content,
-                status.into(),
-            ])
+            container(
+                widget::column::with_children(vec![
+                    titlebar.into(),
+                    toolbar.into(),
+                    menu,
+                    content,
+                    status.into(),
+                ]),
+            )
+            .style(move |_| chrome_container_style(colors))
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into()
         }
     }
 
-    /// Address-bar normalization: a URL with a loadable scheme is used
-    /// as-is; anything else is treated as a bare hostname and gets
-    /// `https://`. An empty bar keeps the current page.
-    fn normalize_url(input: &str, fallback: &str) -> String {
+    /// Explicit chrome styling for one theme (see `ThemeChoice` in
+    /// `settings.rs`: libcosmic's global theme is not settable at
+    /// runtime, so Frost styles its own titlebar / toolbar / menu /
+    /// status containers with the theme's background and text color;
+    /// text inside a container inherits the container's text color).
+    fn chrome_container_style(colors: ChromeColors) -> cosmic::iced::widget::container::Style {
+        cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(cosmic::iced::Color::from_rgb8(
+                colors.background[0],
+                colors.background[1],
+                colors.background[2],
+            ))),
+            text_color: Some(cosmic::iced::Color::from_rgb8(
+                colors.text[0],
+                colors.text[1],
+                colors.text[2],
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Address-bar resolution: a URL with a loadable scheme is used
+    /// as-is; a bare hostname (no spaces, has a dot) gets `https://`;
+    /// anything else is a search query with the default search engine.
+    /// An empty bar loads the homepage.
+    fn resolve_address(input: &str, settings: &FrostSettings) -> String {
         let trimmed = input.trim();
         if trimmed.is_empty() {
-            return fallback.to_string();
+            return settings.homepage.clone();
         }
         if let Ok(url) = Url::parse(trimmed) {
             if matches!(url.scheme(), "http" | "https" | "data" | "file" | "frost") {
                 return url.to_string();
             }
         }
-        format!("https://{trimmed}")
+        if !trimmed.contains(' ') && trimmed.contains('.') {
+            return format!("https://{trimmed}");
+        }
+        settings.search_engine.search_url(trimmed)
+    }
+
+    /// Load extensions from every candidate directory, in order:
+    /// `$FROST_EXTENSIONS_DIR` (colon-separated), then each
+    /// subdirectory of `~/.config/frost/extensions/`, then each
+    /// subdirectory of `./extensions/` (the repo ships a sample there).
+    /// Returns the host plus the (name, version, enabled) snapshot and
+    /// the (directory, error) failures, for the `frost://extensions`
+    /// page. A bad manifest is logged and skipped — it never stops the
+    /// browser or the other extensions.
+    fn load_extensions() -> (
+        StubHost,
+        Vec<(String, String, bool)>,
+        Vec<(String, String)>,
+    ) {
+        let mut host = StubHost::new();
+        let mut loaded = Vec::new();
+        let mut failed = Vec::new();
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(env_dirs) = std::env::var("FROST_EXTENSIONS_DIR") {
+            for dir in env_dirs.split(':') {
+                if !dir.is_empty() {
+                    dirs.push(std::path::PathBuf::from(dir));
+                }
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let config_dir =
+                std::path::PathBuf::from(home).join(".config/frost/extensions");
+            if let Ok(entries) = std::fs::read_dir(&config_dir) {
+                for entry in entries.flatten() {
+                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        dirs.push(entry.path());
+                    }
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir("extensions") {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+        for dir in dirs {
+            match ExtensionManifest::load_from_dir(&dir) {
+                Ok(manifest) => {
+                    let name = manifest.name.clone();
+                    let version = manifest.version.clone();
+                    match host.load(manifest) {
+                        Ok(_) => {
+                            eprintln!(
+                                "frost: loaded extension {name} {version} from {}",
+                                dir.display()
+                            );
+                            loaded.push((name, version, true));
+                        },
+                        Err(e) => {
+                            eprintln!("frost: skipping {}: {e}", dir.display());
+                            failed.push((dir.display().to_string(), e.to_string()));
+                        },
+                    }
+                },
+                Err(e) => {
+                    eprintln!("frost: skipping {}: {e}", dir.display());
+                    failed.push((dir.display().to_string(), e.to_string()));
+                },
+            }
+        }
+        (host, loaded, failed)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::settings::SearchEngine;
+
+        #[test]
+        fn resolve_address_keeps_urls_and_searches_the_rest() {
+            let settings = FrostSettings::default();
+            assert_eq!(
+                resolve_address("https://example.org", &settings),
+                "https://example.org/"
+            );
+            assert_eq!(
+                resolve_address("frost://settings", &settings),
+                "frost://settings"
+            );
+            assert_eq!(
+                resolve_address("example.org", &settings),
+                "https://example.org"
+            );
+            assert_eq!(
+                resolve_address("hello world", &settings),
+                "https://duckduckgo.com/?q=hello%20world"
+            );
+            assert_eq!(
+                resolve_address("rust", &settings),
+                "https://duckduckgo.com/?q=rust"
+            );
+            assert_eq!(resolve_address("", &settings), "https://example.org");
+            let mut google = FrostSettings::default();
+            google.search_engine = SearchEngine::Google;
+            assert_eq!(
+                resolve_address("hello world", &google),
+                "https://www.google.com/search?q=hello%20world"
+            );
+        }
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {

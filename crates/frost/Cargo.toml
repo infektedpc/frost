@@ -21,7 +21,13 @@ ui-libcosmic = ["dep:libcosmic", "libcosmic/wgpu"]
 
 [dependencies]
 frost-engine = { path = "../frost-engine" }
+frost-extensions = { path = "../frost-extensions" }
 url = "2"
+# Round 3: settings persistence (serde_json), internal-page Markdown
+# rendering (pulldown-cmark 0.13 — cached in the registry).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pulldown-cmark = "0.13"
 # libcosmic is NOT on crates.io — it ships from git (pop-os/libcosmic).
 # Pinned to HEAD rev ecc5fe4 (2026-11-12): the v0.12 tag FAILED to
 # resolve — its wgpu git pin requires a `web-sys` feature
