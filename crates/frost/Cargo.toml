@@ -5,14 +5,23 @@ edition.workspace = true
 publish = false
 
 [features]
-default = []
-# The libcosmic window. Off by default: libcosmic is a git dependency and
-# needs system libraries the sandbox may not have (see README.md). The
-# engine proof (frost-engine smoke test) does not depend on it.
-ui-libcosmic = ["dep:libcosmic"]
+# The libcosmic window is the default now (Round 2): `cargo run -p frost`
+# launches the browser. The engine proof (frost-engine smoke test) never
+# depends on it.
+default = ["ui-libcosmic"]
+# `libcosmic/wgpu` switches iced to its fallback renderer (wgpu first,
+# tiny-skia software second). It is REQUIRED, not optional: libcosmic
+# defaults to transparent windows, and on X11 winit then picks a depth-32
+# TrueColor visual — which softbuffer (tiny-skia's surface) rejects, since
+# it only supports depth-24 visuals. Xvfb always offers depth-32 visuals,
+# so without wgpu the window cannot open in the sandbox at all (panic in
+# iced_tiny_skia's compositor). On a real desktop the fallback still
+# protects the app: if wgpu surface creation fails, tiny-skia takes over.
+ui-libcosmic = ["dep:libcosmic", "libcosmic/wgpu"]
 
 [dependencies]
 frost-engine = { path = "../frost-engine" }
+url = "2"
 # libcosmic is NOT on crates.io — it ships from git (pop-os/libcosmic).
 # Pinned to HEAD rev ecc5fe4 (2026-11-12): the v0.12 tag FAILED to
 # resolve — its wgpu git pin requires a `web-sys` feature
