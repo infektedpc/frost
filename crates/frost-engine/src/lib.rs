@@ -33,8 +33,8 @@ use servo::{
     Code, DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePoint, EventLoopWaker, InputEvent,
     Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, PrefValue, RenderingContext,
-    Servo, ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
-    WheelDelta, WheelEvent, WheelMode,
+    Servo, ServoBuilder, SoftwareRenderingContext, Theme, WebView, WebViewBuilder,
+    WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 
@@ -363,6 +363,31 @@ impl FrostWebView {
     pub fn stop(&self) -> Result<(), EngineError> {
         self.inner.stop();
         Ok(())
+    }
+
+    /// Evaluate a JavaScript snippet in the page (Round 3: content
+    /// scripts). The fork already exposes `WebView::evaluate_javascript`,
+    /// so no fork patch was needed — this is a thin wrapper. The result
+    /// is discarded (content scripts are fire-and-forget); evaluation
+    /// errors surface only in the engine log, never as a crash.
+    pub fn evaluate_javascript(&self, script: &str) {
+        self.inner.evaluate_javascript(script.to_string(), |_| {});
+    }
+
+    /// Re-send the current viewport and rebuild the root display list,
+    /// without resizing (Round 3, fork patch F-005). This is the proper
+    /// full-repaint trigger: it replaces the Round 2 resize jiggle (see
+    /// the app's `start_repaint_refresh`).
+    pub fn refresh_viewport(&self) {
+        self.inner.refresh_viewport();
+    }
+
+    /// Tell the page the system theme changed (Round 3: the settings
+    /// theme). Servo maps this onto `prefers-color-scheme`, so themed
+    /// pages (including Frost's own internal pages) restyle.
+    pub fn set_theme(&self, dark: bool) {
+        self.inner
+            .notify_theme_change(if dark { Theme::Dark } else { Theme::Light });
     }
 
     /// Resize the viewport. Follows the servo-de Round 8 finding: in

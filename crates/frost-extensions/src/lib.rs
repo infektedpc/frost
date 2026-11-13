@@ -60,7 +60,8 @@ impl ExtensionManifest {
     }
 
     /// Minimal validation: name/version present, every content script has at
-    /// least one match pattern and non-empty JS.
+    /// least one match pattern and non-empty JS (inline `js`, or a `js_file`
+    /// that `load_from_dir` already resolved into `js`).
     pub fn validate(&self) -> Result<(), ExtensionError> {
         if self.name.trim().is_empty() {
             return Err(ExtensionError::InvalidManifest(
@@ -78,13 +79,45 @@ impl ExtensionManifest {
                     "content script {i} has no match patterns"
                 )));
             }
-            if script.js.trim().is_empty() {
+            if script.js.trim().is_empty() && script.js_file.is_none() {
                 return Err(ExtensionError::InvalidManifest(format!(
-                    "content script {i} has empty JS"
+                    "content script {i} has empty JS and no js_file"
                 )));
             }
         }
         Ok(())
+    }
+
+    /// Load an extension from a directory: read `manifest.json`, resolve
+    /// every content script's `js_file` (relative to the directory) into
+    /// its `js` field, then validate. Any failure is an
+    /// `InvalidManifest` — the caller logs it and skips the extension;
+    /// a bad extension must never crash the browser (Round 3 gate).
+    pub fn load_from_dir(dir: &std::path::Path) -> Result<Self, ExtensionError> {
+        let manifest_path = dir.join("manifest.json");
+        let json = std::fs::read_to_string(&manifest_path).map_err(|e| {
+            ExtensionError::InvalidManifest(format!(
+                "cannot read {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        let mut manifest = Self::from_json(&json)?;
+        for (i, script) in manifest.content_scripts.iter_mut().enumerate() {
+            if script.js.trim().is_empty() {
+                let Some(js_file) = script.js_file.clone() else {
+                    continue;
+                };
+                let js_path = dir.join(&js_file);
+                script.js = std::fs::read_to_string(&js_path).map_err(|e| {
+                    ExtensionError::InvalidManifest(format!(
+                        "content script {i}: cannot read {}: {e}",
+                        js_path.display()
+                    ))
+                })?;
+            }
+        }
+        manifest.validate()?;
+        Ok(manifest)
     }
 }
 
@@ -111,9 +144,16 @@ pub enum Permission {
 pub struct ContentScript {
     /// Chrome-style match patterns.
     pub matches: Vec<String>,
-    /// The JS source to inject. Round 1 stores source inline; a later round
-    /// may allow `"js_file": "content.js"` referencing a packaged file.
+    /// The JS source to inject. Round 3: may be empty when `js_file`
+    /// is set — `ExtensionManifest::load_from_dir` fills `js` from the
+    /// packaged file before validation.
+    #[serde(default)]
     pub js: String,
+    /// Optional packaged JS file, relative to the extension directory
+    /// (e.g. `"content.js"`). Takes effect only when the extension is
+    /// loaded from a directory; inline `js` wins when both are set.
+    #[serde(default)]
+    pub js_file: Option<String>,
     pub run_at: RunAt,
     #[serde(default)]
     pub all_frames: bool,
@@ -381,6 +421,7 @@ mod tests {
             content_scripts: vec![ContentScript {
                 matches: vec!["*://*.example.com/*".into()],
                 js: "document.title = 'frost';".into(),
+                js_file: None,
                 run_at: RunAt::DocumentIdle,
                 all_frames: false,
             }],
@@ -454,5 +495,63 @@ mod tests {
         assert_eq!(api.storage_get(ExtensionId(1), "k").as_deref(), Some("v1"));
         assert_eq!(api.storage_get(ExtensionId(2), "k").as_deref(), Some("v2"));
         assert_eq!(api.tabs_create("https://example.org"), 0);
+    }
+
+    fn write_manifest_dir(
+        dir: &std::path::Path,
+        manifest_json: &str,
+        js_files: &[(&str, &str)],
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), manifest_json).unwrap();
+        for (name, contents) in js_files {
+            std::fs::write(dir.join(name), contents).unwrap();
+        }
+    }
+
+    #[test]
+    fn load_from_dir_resolves_js_file() {
+        let dir = std::env::temp_dir().join("frost-ext-test-good");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_manifest_dir(
+            &dir,
+            r#"{"name":"File Script","version":"1.0","content_scripts":[{"matches":["*://example.org/*"],"js_file":"content.js","run_at":"DocumentIdle"}]}"#,
+            &[("content.js", "document.body.style.background='red';")],
+        );
+        let m = ExtensionManifest::load_from_dir(&dir).unwrap();
+        assert_eq!(m.name, "File Script");
+        assert_eq!(
+            m.content_scripts[0].js,
+            "document.body.style.background='red';"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_dir_fails_cleanly_on_bad_manifest_and_missing_js() {
+        // Not JSON at all.
+        let dir = std::env::temp_dir().join("frost-ext-test-bad-json");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_manifest_dir(&dir, "{not json", &[]);
+        assert!(ExtensionManifest::load_from_dir(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // js_file points at a file that does not exist.
+        let dir = std::env::temp_dir().join("frost-ext-test-missing-js");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_manifest_dir(
+            &dir,
+            r#"{"name":"Missing JS","version":"1.0","content_scripts":[{"matches":["*://example.org/*"],"js_file":"nope.js","run_at":"DocumentIdle"}]}"#,
+            &[],
+        );
+        assert!(ExtensionManifest::load_from_dir(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // No manifest.json at all.
+        let dir = std::env::temp_dir().join("frost-ext-test-no-manifest");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(ExtensionManifest::load_from_dir(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
