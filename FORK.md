@@ -32,20 +32,24 @@ git -C servo fetch --unshallow
 
 ## Patches applied as fork commits
 
-All three were proven earlier in the servo-de embedder against Servo 0.8.0.
-Each was verified with `git apply --check` against this fork point before
-applying, one commit per patch. The patch files are vendored in `patches/`
-so the fork is reproducible from this repo alone (`./clone-fork.sh`).
+The first three were proven earlier in the servo-de embedder against
+Servo 0.8.0; the fourth is Frost's own F-001 (Round 2). Each was
+verified with `git apply --check` against this fork point before
+applying, one commit per patch. The patch files are vendored in
+`patches/` so the fork is reproducible from this repo alone
+(`./clone-fork.sh`).
 
 | Commit | Patch | What it does |
 |---|---|---|
 | `deaae1393` | `patches/servo-keypress-charcode-0.8.patch` | Derive legacy `charCode` from `KeyboardEvent`, so pages that rely on keypress charCode (terminal-style input) work. |
 | `feca6e10b` | `patches/servo-damage-rects-0.8.patch` | Expose `WebView::last_damage_rects()` so the embedder can present only damaged regions instead of full frames. |
 | `3200e8754` | `patches/servo-dmabuf-0.8.patch` | Export DMA-BUF handles from the rendering context so the embedder can present frames zero-copy. |
+| `3d65856d5` | `patches/servo-stop-0.8.patch` | F-001: add `WebView::stop()` — `EmbedderToConstellationMessage::Stop` → constellation `handle_stop_msg` → `ScriptThreadMessage::Stop` → script-thread `handle_stop` calling `Window::Stop`. |
 
 Fork log:
 
 ```
+3d65856d5 fork: F-001 — add WebView::stop() (Round 2)
 3200e8754 fork: apply dmabuf patch (0.8)
 feca6e10b fork: apply damage-rects patch (0.8)
 deaae1393 fork: apply keypress charcode patch (0.8)

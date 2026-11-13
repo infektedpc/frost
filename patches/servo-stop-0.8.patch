@@ -1,0 +1,142 @@
+diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
+index 3467aa0a0..fc171c3e4 100644
+--- a/components/constellation/constellation.rs
++++ b/components/constellation/constellation.rs
+@@ -1380,6 +1380,9 @@ where
+             EmbedderToConstellationMessage::Reload(webview_id) => {
+                 self.handle_reload_msg(webview_id);
+             },
++            EmbedderToConstellationMessage::Stop(webview_id) => {
++                self.handle_stop_msg(webview_id);
++            },
+             EmbedderToConstellationMessage::LogEntry(event_loop_id, thread_name, entry) => {
+                 self.handle_log_entry(event_loop_id, thread_name, entry);
+             },
+@@ -4955,6 +4958,23 @@ where
+         );
+     }
+ 
++    /// Frost F-001: forward an embedder stop request to the script thread
++    /// of the webview's active pipeline, mirroring [`Self::handle_reload_msg`].
++    fn handle_stop_msg(&mut self, webview_id: WebViewId) {
++        let browsing_context_id = BrowsingContextId::from(webview_id);
++        let pipeline_id = match self.browsing_contexts.get(&browsing_context_id) {
++            Some(browsing_context) => browsing_context.pipeline_id,
++            None => {
++                return warn!("{}: Got stop event after closure", browsing_context_id);
++            },
++        };
++        self.send_message_to_pipeline(
++            pipeline_id,
++            ScriptThreadMessage::Stop(pipeline_id),
++            "Got stop event after closure",
++        );
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#window-post-message-steps>
+     #[servo_tracing::instrument(skip_all)]
+     fn handle_post_message_msg(
+diff --git a/components/constellation/tracing.rs b/components/constellation/tracing.rs
+index 0f1031c12..ee01f2125 100644
+--- a/components/constellation/tracing.rs
++++ b/components/constellation/tracing.rs
+@@ -58,6 +58,7 @@ mod from_embedder {
+                 Self::TickAnimation(..) => target!("TickAnimation"),
+                 Self::WebDriverCommand(..) => target!("WebDriverCommand"),
+                 Self::Reload(..) => target!("Reload"),
++                Self::Stop(..) => target!("Stop"),
+                 Self::LogEntry(..) => target!("LogEntry"),
+                 Self::NewWebView(..) => target!("NewWebView"),
+                 Self::CloseWebView(..) => target!("CloseWebView"),
+diff --git a/components/script/event_loop/script_thread.rs b/components/script/event_loop/script_thread.rs
+index 0519cea75..7fe463960 100644
+--- a/components/script/event_loop/script_thread.rs
++++ b/components/script/event_loop/script_thread.rs
+@@ -1907,6 +1907,7 @@ impl ScriptThread {
+                 self.handle_css_error_reporting(pipeline_id, filename, line, column, msg)
+             },
+             ScriptThreadMessage::Reload(pipeline_id) => self.handle_reload(cx, pipeline_id),
++            ScriptThreadMessage::Stop(pipeline_id) => self.handle_stop(cx, pipeline_id),
+             ScriptThreadMessage::Resize(id, size, size_type) => {
+                 self.handle_resize_message(id, size, size_type);
+             },
+@@ -4537,6 +4538,16 @@ impl ScriptThread {
+         }
+     }
+ 
++    /// Frost F-001: stop the active document's load, mirroring
++    /// [`Self::handle_reload`]. `Window::Stop` is the `window.stop()`
++    /// path: it aborts the document and reports `LoadStatus::Stopped`.
++    fn handle_stop(&self, cx: &mut JSContext, pipeline_id: PipelineId) {
++        let window = self.documents.borrow().find_window(pipeline_id);
++        if let Some(window) = window {
++            window.Stop(cx);
++        }
++    }
++
+     fn handle_paint_metric(
+         &self,
+         cx: &mut JSContext,
+diff --git a/components/script/messaging.rs b/components/script/messaging.rs
+index c33b978c3..4a0fac604 100644
+--- a/components/script/messaging.rs
++++ b/components/script/messaging.rs
+@@ -97,6 +97,7 @@ impl MixedMessage {
+                 #[cfg(feature = "devtools")]
+                 ScriptThreadMessage::ReportCSSError(id, ..) => Some(*id),
+                 ScriptThreadMessage::Reload(id, ..) => Some(*id),
++                ScriptThreadMessage::Stop(id, ..) => Some(*id),
+                 ScriptThreadMessage::PaintMetric(id, ..) => Some(*id),
+                 ScriptThreadMessage::ExitFullScreen(id, ..) => Some(*id),
+                 ScriptThreadMessage::MediaSessionAction(..) => None,
+diff --git a/components/servo/webview.rs b/components/servo/webview.rs
+index caf996975..51c82ad1b 100644
+--- a/components/servo/webview.rs
++++ b/components/servo/webview.rs
+@@ -555,6 +555,19 @@ impl WebView {
+             .send(EmbedderToConstellationMessage::Reload(self.id()))
+     }
+ 
++    /// Stop loading the currently loading page in this [`WebView`], if any.
++    ///
++    /// Frost F-001: sends a stop request to the script thread of the
++    /// active pipeline, which aborts the document load (the same path as
++    /// `window.stop()` inside the page). The embedder is notified with
++    /// [`LoadStatus::Stopped`] when the load actually stops. A no-op when
++    /// nothing is loading.
++    pub fn stop(&self) {
++        self.servo()
++            .constellation_proxy()
++            .send(EmbedderToConstellationMessage::Stop(self.id()))
++    }
++
+     /// Whether or not this [`WebView`] can go backward in its navigation history.
+     ///
+     /// This is `false` if the currently active page is the oldest entry in the
+diff --git a/components/shared/constellation/lib.rs b/components/shared/constellation/lib.rs
+index 49167e72c..4d635d3c3 100644
+--- a/components/shared/constellation/lib.rs
++++ b/components/shared/constellation/lib.rs
+@@ -69,6 +69,9 @@ pub enum EmbedderToConstellationMessage {
+     WebDriverCommand(WebDriverCommandMsg),
+     /// Reload a top-level browsing context.
+     Reload(WebViewId),
++    /// Request that the given top-level browsing context stop loading.
++    /// (Frost F-001: the embedder's Stop button.)
++    Stop(WebViewId),
+     /// A log entry, with the top-level browsing context id and thread name
+     LogEntry(Option<ScriptEventLoopId>, Option<String>, LogEntry),
+     /// Create a new top level browsing context.
+diff --git a/components/shared/script/lib.rs b/components/shared/script/lib.rs
+index 3520ca762..33fe08095 100644
+--- a/components/shared/script/lib.rs
++++ b/components/shared/script/lib.rs
+@@ -303,6 +303,8 @@ pub enum ScriptThreadMessage {
+     ReportCSSError(PipelineId, String, u32, u32, String),
+     /// Reload the given page.
+     Reload(PipelineId),
++    /// Stop loading the given page (the embedder's Stop button, Frost F-001).
++    Stop(PipelineId),
+     /// Notifies the script thread about a new recorded paint metric.
+     PaintMetric(PipelineId, PaintMetricEvent),
+     /// Notifies the media session about a user requested media session action.
