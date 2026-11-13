@@ -1,0 +1,1 @@
+{"content_scripts":[{"js_file":"content.js","matches":["*://example.org/*","*://*.example.org/*"],"run_at":"DocumentIdle"}],"description":"Round 3 sample content-script extension: adds a banner to example.org so the extension host gate can see it work.","name":"Frost Sample Banner","version":"0.1.0"}
