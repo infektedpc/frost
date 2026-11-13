@@ -5,9 +5,10 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 1 — prove the loop.** The engine wrapper compiles against
-a Servo fork, loads a page headlessly, and screenshots it. The libcosmic
-window is a skeleton. See [ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 2 — the window is live.** The libcosmic window launches
+under Xvfb, shows the toolbar + address bar + a rendered page, navigates,
+goes back/forward, reloads, stops (F-001), resizes, and opens a real file
+browser from the menu. See [ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -56,12 +57,14 @@ cargo check --workspace --all-targets
 cargo run -p frost-engine --example smoke
 # writes smoke.png (1280x800) — must be a real page, not a solid color
 
-# 4. The window (needs libcosmic's system libraries; see below)
-cargo run -p frost --features ui-libcosmic
+# 4. The window (needs libcosmic's system libraries; see below).
+#    `ui-libcosmic` is the default feature since Round 2.
+cargo run -p frost
 ```
 
-Without `--features ui-libcosmic` the `frost` binary prints a status note
-and exits — the workspace always compiles even where libcosmic cannot.
+Without the `ui-libcosmic` feature (`cargo run -p frost --no-default-features`)
+the `frost` binary prints a status note and exits — the workspace always
+compiles even where libcosmic cannot.
 
 ### Toolchain
 
@@ -72,12 +75,25 @@ not installed yet.
 ### libcosmic
 
 libcosmic is **not on crates.io** — it comes from git
-(`pop-os/libcosmic`, tag `v0.12`). It is an **optional** dependency
-behind the `ui-libcosmic` feature, so the engine proof never depends on
-it. Building the window needs the system libraries libcosmic/iced link
-against (Wayland client, libxkbcommon, fontconfig, and friends). If the
-build fails on a missing system library, that is a Round 1 known limit:
-the engine is the gate, the window follows once the libraries are there.
+(`pop-os/libcosmic`). The v0.12 tag could NOT resolve (its wgpu git pin
+needs a `web-sys` feature, `GpuImageCopyBuffer`, that no published
+web-sys has), so the workspace pins libcosmic to HEAD rev `ecc5fe4`
+(see `crates/frost/Cargo.toml`). It is an **optional** dependency
+behind the `ui-libcosmic` feature (the default since Round 2), so the
+engine proof never depends on it. Building the window needs the system
+libraries libcosmic/iced link against (Wayland client, libxkbcommon,
+fontconfig, and friends). If the build fails on a missing system library,
+that is a Round 1 known limit: the engine is the gate, the window follows
+once the libraries are there.
+
+libcosmic defaults to transparent windows, which makes X11 hand the app
+a depth-32 TrueColor visual — and iced's tiny-skia/softbuffer renderer
+only accepts depth-24 visuals, so the window panics at startup
+(`Visual 0xab does not use softbuffer's pixel format`). The fix is the
+`libcosmic/wgpu` feature (added to `ui-libcosmic` in Round 2): iced
+falls back to its wgpu renderer first, which accepts the visual. Proven
+on Joel's box 2026-11-12 (the Round 1 window launched with the patch)
+and in the sandbox under Xvfb.
 
 ## Pushing to GitHub
 
@@ -120,16 +136,58 @@ Proven (sandbox, 2026-11-12, Rust 1.99.1):
 
 Not proven:
 
-- Anything on Joel's box (Debian 13, Mesa GL) — the smoke test and the
-  window both need his run. The window was never *launched* in the
-  sandbox (no display); it only *compiles*.
-- `stop()`: Servo 0.8.0 has no `WebView::stop`; `FrostWebView::stop()`
-  returns `EngineError::Unsupported` until fork patch F-001 lands.
-  (0.8.0 did add `LoadStatus::Stopped`, surfaced as
-  `EngineEvent::LoadStopped`.)
-- Real pages beyond example.org; media/WebGL are off in this feature set
-  (same cuts as the proven servo-de embedder: no webgl/webxr/
-  media-gstreamer in the sandbox build).
+- Anything on Joel's box (Debian 13, Mesa GL) beyond the Round 1 window
+  launch — the Round 2 gates ran under Xvfb in the sandbox; his run of
+  the Round 2 zip is the verdict on real hardware, real mouse/keyboard,
+  and the wgpu adapter his Haswell picks.
+- Real pages beyond example.org / example.com / iana.org; media/WebGL
+  are off in this feature set (same cuts as the proven servo-de
+  embedder: no webgl/webxr/ media-gstreamer in the sandbox build).
 - `uv` is not installed in the sandbox; Servo's script-bindings build
   script warns about it and falls back to system python. The build
   works, but installing `uv` would silence the warning.
+
+## Round 2 — what is proven, what is not
+
+Proven (sandbox, 2026-11-13, under Xvfb + software GL):
+
+- The window launches (`cargo run -p frost`) and shows Frost's own
+  titlebar ("Frost — Example Domain", real minimize / maximize /
+  close buttons, text glyphs), the toolbar (Back / Forward / Reload /
+  Stop / address bar / hamburger), and a fully rendered example.org.
+- Address-bar navigation: typed `example.com`, Enter — the page
+  changed to `https://example.com/` (address bar + network log).
+- Back/forward: example.org → example.com → Back → example.org →
+  Forward → example.com, proven by URL events. (History traversals
+  restore from cache and never fire `LoadFinished`; the 15 s timeout
+  safety net now also clears the loading state and status line.)
+- Reload: a frame event follows reload and the repaint is full.
+- Menu: the hamburger opens a dropdown; Settings / Print load their
+  placeholder pages; Open is a real file browser (home listing,
+  folder navigation, file opens in the browser); Exit quits.
+- Resize: 1280×800 → 1000×600 re-renders at 1000×484; back to
+  1280×800 re-renders at 1280×684, full both ways.
+- Input: clicking example.org's "Learn more" link navigates to
+  iana.org; keyboard scrolling (End) works; typing in the address bar
+  works (needs X input focus under bare Xvfb — the harness uses
+  `xfocus` for that).
+- Stop is live: fork patch F-001 adds a real `WebView::stop()`; the
+  Stop button is enabled while loading.
+- The partial first paint is fixed by the two-phase resize jiggle
+  (see ARCHITECTURE.md): the first launch paints the full 1280×684
+  frame, and a reload repaints fully too.
+- `cargo check --workspace --all-targets` green; unit tests green
+  (see `cargo test`).
+
+Not proven:
+
+- Mouse-wheel scrolling under Xvfb: synthetic wheel events (XSendEvent
+  button 4/5) do not scroll the page in the sandbox. Keyboard scrolling
+  works, so the engine side is proven; whether the wheel path is a
+  harness artifact or a real gap needs a real mouse — Joel's box is the
+  verdict.
+- Stop on a navigation stuck at the constellation: F-001 aborts the
+  document via `window.stop()` but does not send an `AbortLoadUrl` —
+  that is the noted TODO in the fork.
+- A proper full-repaint trigger in the fork: the jiggle is a workaround
+  for a damage/initialization gap in the engine (see ARCHITECTURE.md).
