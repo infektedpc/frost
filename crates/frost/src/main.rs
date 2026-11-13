@@ -86,7 +86,7 @@ mod app {
     use url::Url;
 
     use crate::file_browser;
-    use crate::keymap::{map_button, map_code, map_key, map_location, map_modifiers};
+    use crate::keymap::{map_button, map_code, map_key_with_text, map_location, map_modifiers};
     use crate::server::{InternalServer, Shared};
     use crate::settings::{ChromeColors, Settings as FrostSettings};
 
@@ -524,11 +524,20 @@ mod app {
                     physical_key,
                     location,
                     modifiers,
+                    text,
                     repeat,
                     ..
                 }) => {
                     if self.content_focused {
-                        self.send_key(FrostKeyState::Down, &key, physical_key, location, modifiers, repeat);
+                        self.send_key(
+                            FrostKeyState::Down,
+                            &key,
+                            physical_key,
+                            location,
+                            modifiers,
+                            repeat,
+                            text.as_deref(),
+                        );
                     }
                 },
                 iced::Event::Keyboard(keyboard::Event::KeyReleased {
@@ -546,6 +555,7 @@ mod app {
                             location,
                             modifiers,
                             false,
+                            None,
                         );
                     }
                 },
@@ -561,6 +571,7 @@ mod app {
             location: keyboard::Location,
             modifiers: keyboard::Modifiers,
             repeat: bool,
+            text: Option<&str>,
         ) {
             let code = match physical_key {
                 keyboard::key::Physical::Code(code) => map_code(code),
@@ -568,7 +579,9 @@ mod app {
             };
             self.webview.send_input(FrostInputEvent::Key {
                 state,
-                key: map_key(key),
+                // `text` is the character the keypress actually
+                // produced; see `map_key_with_text`.
+                key: map_key_with_text(key, text),
                 code,
                 location: map_location(location),
                 modifiers: map_modifiers(modifiers),

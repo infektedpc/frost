@@ -33,10 +33,10 @@ git -C servo fetch --unshallow
 ## Patches applied as fork commits
 
 The first three were proven earlier in the servo-de embedder against
-Servo 0.8.0; the fourth is Frost's own F-001 (Round 2). Each was
-verified with `git apply --check` against this fork point before
-applying, one commit per patch. The patch files are vendored in
-`patches/` so the fork is reproducible from this repo alone
+Servo 0.8.0; the fourth is Frost's own F-001 (Round 2) and the fifth is
+F-005 (Round 3). Each was verified with `git apply --check` against this
+fork point before applying, one commit per patch. The patch files are
+vendored in `patches/` so the fork is reproducible from this repo alone
 (`./clone-fork.sh`).
 
 | Commit | Patch | What it does |
@@ -45,10 +45,12 @@ applying, one commit per patch. The patch files are vendored in
 | `feca6e10b` | `patches/servo-damage-rects-0.8.patch` | Expose `WebView::last_damage_rects()` so the embedder can present only damaged regions instead of full frames. |
 | `3200e8754` | `patches/servo-dmabuf-0.8.patch` | Export DMA-BUF handles from the rendering context so the embedder can present frames zero-copy. |
 | `3d65856d5` | `patches/servo-stop-0.8.patch` | F-001: add `WebView::stop()` — `EmbedderToConstellationMessage::Stop` → constellation `handle_stop_msg` → `ScriptThreadMessage::Stop` → script-thread `handle_stop` calling `Window::Stop`. |
+| `7357f4ebc` | `patches/servo-refresh-viewport-0.8.patch` | F-005: add `WebView::refresh_viewport()` — re-send the current viewport and rebuild the root display list without resizing. **Landed Round 3 but PROVED INSUFFICIENT as the full-repaint repair on its own** (finish-pass gate: 2 of 3 first loads still painted partial and stayed partial — an unchanged viewport does not force layout to reflow the pipeline's display list). The app keeps the Round 2 resize jiggle as the reliable repair; F-005 stays in the fork as a harmless viewport re-send. |
 
 Fork log:
 
 ```
+7357f4ebc fork: F-005 — add WebView::refresh_viewport() (Round 3)
 3d65856d5 fork: F-001 — add WebView::stop() (Round 2)
 3200e8754 fork: apply dmabuf patch (0.8)
 feca6e10b fork: apply damage-rects patch (0.8)
@@ -79,6 +81,9 @@ before it is needed. Each gets its own commit when built.
 | **F-002** | No DOM snapshot API — the inspector needs one and Servo ships no inspector. | Add a constellation request that serializes a DOM subtree (tag, attributes, computed style, box) for `frost-inspector`. |
 | **F-003** | Limited print support (no print-to-PDF path an embedder can drive). | Investigate Servo's print pipeline; if it cannot be driven headlessly, add a fork hook that renders a page to paginated images for `frost://print`. |
 | **F-004** | No spellcheck API. | Later round; likely a fork-side hook into the text-input path, or a pure-Rust spellcheck in the UI layer. |
+| **F-005** | ~~A load's first paint is partial and no same-size repaint repairs it~~ — **LANDED 2026-11-13 (Round 3) as `WebView::refresh_viewport()`, commit `7357f4ebc`, BUT PROVED INSUFFICIENT on its own**: re-sending an unchanged viewport rebuilds the root display list but does not force layout to reflow the pipeline's display list, so 2 of 3 first loads in the finish-pass gate stayed partial. The app keeps the Round 2 resize jiggle as the reliable repair. | F-005 as built (viewport re-send + root display-list rebuild). The real fix is F-007. |
+| **F-006** | `WebView::reload()` never notifies the embedder: it sets `load_status` by direct field assignment instead of `set_load_status`, so no `LoadStarted` fires on reload (found 2026-11-13: content scripts never re-ran after a reload, and Stop stayed disabled while reloading). Worked around app-side in Round 3 (the `Reload` message clears the injection guard and marks loading). | Make `reload()` go through `set_load_status(LoadStatus::Started)` so the delegate contract holds for every load. |
+| **F-007** | No way to force a layout reflow at an unchanged viewport (the real full-repaint trigger; F-005 only re-sends the viewport). | Add a fork hook that forces the constellation to reflow the pipeline at the current viewport, so the jiggle can finally retire. |
 
 ## Updating the fork
 

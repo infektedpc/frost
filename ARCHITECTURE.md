@@ -63,7 +63,7 @@ and load state.
    Wayland seat input (evdev keycodes) and does NOT apply here — Frost
    keys come from winit/libcosmic.
 
-### The partial first paint and the resize jiggle (Round 2)
+### The partial first paint and the resize jiggle (Round 2, still the repair in Round 3)
 
 A load's first paint covers only a ~1024×512 region of a 1280×684
 frame, and no later paint repairs it — not a render after
@@ -78,10 +78,22 @@ back on a stale (pre-resize) event, coalescing the two resizes into a
 net no-op. The intermediate size is never uploaded, so the user never
 sees it. This works around a damage/initialization gap in the engine
 (same family as the WayServo ghost finding that dirty rects
-under-report); a proper full-repaint trigger in the fork is the
-follow-up. History traversals (back/forward) restore from cache and
+under-report). History traversals (back/forward) restore from cache and
 never fire `LoadFinished` — the 15 s load-timeout safety net clears
 the stuck loading state instead.
+
+Round 3 tried to retire the jiggle with fork patch F-005
+(`WebView::refresh_viewport`: re-send the current viewport without
+resizing). The finish pass PROVED it insufficient: 2 of 3 first loads
+still painted partial and stayed partial for minutes. The mechanism:
+WebRender repaints fully every render (`buffer_age` 0), so the partial
+frame means the pipeline's *display list* is partial — and re-sending
+an unchanged viewport does not force layout to reflow that list.
+Only a real size change (the jiggle) or a fresh document load (which
+is why reloads paint fully) reflows it. F-005 stays in the fork as a
+harmless viewport re-send; the jiggle stays as the reliable repair. A
+fork patch that forces a reflow at an unchanged viewport is the real
+follow-up (FORK.md, candidate F-007).
 
 Later rounds may switch the context to a GPU path (the dmabuf fork patch
 exists for exactly this), but the `render() -> Frame` contract does not

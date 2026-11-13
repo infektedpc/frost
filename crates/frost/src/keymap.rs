@@ -573,6 +573,29 @@ pub fn map_key(key: &IcedKey) -> FrostKey {
     }
 }
 
+/// Logical key with the key event's produced text: iced -> Servo.
+///
+/// winit's logical key is the UNSHIFTED character for shifted
+/// punctuation on X11: Shift+; arrives as `Key::Character(";")`, while
+/// the event's `text` is the character actually produced (`":"`). The
+/// native iced text input uses `text` (so the address bar types `:`),
+/// but the webview was fed only the logical key — page text inputs got
+/// `;` instead of `:`, so no `http(s)` URL could ever be typed into a
+/// page (found 2026-11-13: the settings homepage kept submitting
+/// `https;//example.com` and the server rightly rejected it).
+///
+/// Prefer `text` for printable (`Character`) keys only. Named keys keep
+/// their logical key: `text` for Enter is `"\r"`, which Servo must not
+/// see as typed text (form submission and shortcuts need the named key).
+pub fn map_key_with_text(key: &IcedKey, text: Option<&str>) -> FrostKey {
+    match (key, text) {
+        (IcedKey::Character(_), Some(t)) if !t.is_empty() => {
+            FrostKey::Character(t.to_string())
+        },
+        _ => map_key(key),
+    }
+}
+
 /// Mouse button: iced -> Servo.
 pub fn map_button(button: IcedButton) -> FrostMouseButton {
     match button {
@@ -584,5 +607,49 @@ pub fn map_button(button: IcedButton) -> FrostMouseButton {
         // Extra buttons (X1/X2/…) have no Servo counterpart; Auxiliary is
         // the least surprising mapping.
         IcedButton::Other(_) => FrostMouseButton::Auxiliary,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::keyboard::key::Named as IcedNamedKey;
+
+    #[test]
+    fn shifted_punctuation_prefers_text() {
+        // Shift+; on X11: logical key ";" but produced text ":".
+        let key = IcedKey::Character(";".into());
+        assert_eq!(
+            map_key_with_text(&key, Some(":")),
+            FrostKey::Character(":".to_string())
+        );
+    }
+
+    #[test]
+    fn unshifted_character_keeps_text() {
+        let key = IcedKey::Character("a".into());
+        assert_eq!(
+            map_key_with_text(&key, Some("a")),
+            FrostKey::Character("a".to_string())
+        );
+    }
+
+    #[test]
+    fn named_keys_ignore_text() {
+        // Enter's text is "\r" — it must stay the named key.
+        let key = IcedKey::Named(IcedNamedKey::Enter);
+        assert_eq!(
+            map_key_with_text(&key, Some("\r")),
+            FrostKey::Named(FrostNamedKey::Enter)
+        );
+    }
+
+    #[test]
+    fn no_text_falls_back_to_logical_key() {
+        let key = IcedKey::Character(";".into());
+        assert_eq!(
+            map_key_with_text(&key, None),
+            FrostKey::Character(";".to_string())
+        );
     }
 }
