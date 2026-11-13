@@ -5,7 +5,7 @@
   if (document.getElementById("frost-sample-banner")) return;
   var banner = document.createElement("div");
   banner.id = "frost-sample-banner";
-  banner.textContent = "❄ Frost sample extension — content scripts are live";
+  banner.textContent = "❄ Frost sample extension is live";
   banner.style.cssText =
     "background:#7ec8ff;color:#00233d;font:bold 16px sans-serif;" +
     "text-align:center;padding:10px 12px;border-bottom:3px solid #0057d9;";
