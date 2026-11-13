@@ -3,9 +3,11 @@
 #
 # What it does:
 #   1. Shallow-clones servo/servo at tag v0.8.0 into ./servo/
-#   2. Applies the four proven 0.8.0 engine patches from ./patches/,
+#   2. Applies the five proven 0.8.0 engine patches from ./patches/,
 #      one commit per patch (the three servo-de patches + Frost's own
-#      F-001 stop patch, which the engine's stop() depends on).
+#      F-001 stop patch, which the engine's stop() depends on, and the
+#      F-005 viewport-refresh patch, which the engine's refresh_viewport()
+#      depends on).
 #
 # Usage (from the frost repo root):
 #   ./clone-fork.sh
@@ -51,7 +53,7 @@ git config user.email "infektedpc@gmail.com"
 
 echo "Fork point: $(git rev-parse HEAD) ($(git log --oneline -1))"
 
-for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8 servo-stop-0.8; do
+for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8 servo-stop-0.8 servo-refresh-viewport-0.8; do
     echo "Applying $patch..."
     git apply --check "$PATCHES_DIR/$patch.patch"
     git apply "$PATCHES_DIR/$patch.patch"
@@ -68,6 +70,9 @@ for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8
             ;;
         servo-stop-0.8)
             git commit -qm "fork: F-001 — add WebView::stop() (Round 2)"
+            ;;
+        servo-refresh-viewport-0.8)
+            git commit -qm "fork: F-005 — add WebView::refresh_viewport() (Round 3)"
             ;;
     esac
 done

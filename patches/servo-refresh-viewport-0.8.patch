@@ -1,0 +1,95 @@
+From 7357f4ebc73f1464a3c64fae745e7d6effb7886f Mon Sep 17 00:00:00 2001
+From: Joel Horrell <infektedpc@gmail.com>
+Date: Fri, 13 Nov 2026 11:41:59 +0000
+Subject: [PATCH] =?UTF-8?q?fork:=20F-005=20=E2=80=94=20add=20WebView::refr?=
+ =?UTF-8?q?esh=5Fviewport()=20(Round=203)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ components/paint/paint.rs   |  9 +++++++++
+ components/paint/painter.rs | 27 +++++++++++++++++++++++++++
+ components/servo/webview.rs |  8 ++++++++
+ 3 files changed, 44 insertions(+)
+
+diff --git a/components/paint/paint.rs b/components/paint/paint.rs
+index 49b18a86f..bd3121d30 100644
+--- a/components/paint/paint.rs
++++ b/components/paint/paint.rs
+@@ -728,6 +728,15 @@ impl Paint {
+             .resize_rendering_context(new_size);
+     }
+ 
++    /// Re-send the current viewport without resizing (see
++    /// `Painter::refresh_viewport`). Repairs a partial first paint.
++    pub fn refresh_viewport(&self, webview_id: WebViewId) {
++        if self.shutdown_state() != ShutdownState::NotShuttingDown {
++            return;
++        }
++        self.painter_mut(webview_id.into()).refresh_viewport();
++    }
++
+     pub fn set_screen_size(&self, webview_id: WebViewId, new_size: Size2D<f32, DevicePixel>) {
+         if self.shutdown_state() != ShutdownState::NotShuttingDown {
+             return;
+diff --git a/components/paint/painter.rs b/components/paint/painter.rs
+index a3be65b7c..5e9cc0e90 100644
+--- a/components/paint/painter.rs
++++ b/components/paint/painter.rs
+@@ -1457,6 +1457,33 @@ impl Painter {
+         self.set_needs_repaint(RepaintReason::Resize);
+     }
+ 
++    /// Re-send the current viewport to the constellation and rebuild the
++    /// root display list, without changing the rendering context size.
++    ///
++    /// This is the repair half of `resize_rendering_context`: a load's
++    /// first paint can cover only part of the frame (the root display list
++    /// was built for a stale viewport), and re-sending the current
++    /// viewport repairs it — the same repair a 1 px resize performs, but
++    /// without ever changing the size (no intermediate frame, no timed
++    /// size dance). Frost (Round 3, F-005) uses this after every load
++    /// instead of the Round 2 resize jiggle.
++    pub(crate) fn refresh_viewport(&mut self) {
++        let new_size = self.rendering_context.size();
++        let new_size = Size2D::new(new_size.width as f32, new_size.height as f32);
++        let new_viewport_rect = Rect::from(new_size).to_box2d();
++        for webview_renderer in self.webview_renderers.values_mut() {
++            webview_renderer.set_rect(new_viewport_rect);
++            webview_renderer.webview.notify_viewport_updated();
++        }
++
++        let mut transaction = Transaction::new();
++        transaction.set_document_view(new_viewport_rect.to_i32());
++        self.send_transaction(transaction);
++
++        self.send_root_pipeline_display_list();
++        self.set_needs_repaint(RepaintReason::Resize);
++    }
++
+     pub(crate) fn set_page_zoom(&mut self, webview_id: WebViewId, new_zoom: f32) {
+         if let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) &&
+             webview_renderer.set_page_zoom(Scale::new(new_zoom))
+diff --git a/components/servo/webview.rs b/components/servo/webview.rs
+index 51c82ad1b..b7237f36b 100644
+--- a/components/servo/webview.rs
++++ b/components/servo/webview.rs
+@@ -472,6 +472,14 @@ impl WebView {
+             .resize_rendering_context(self.id(), new_size);
+     }
+ 
++    /// Re-send the current viewport to the constellation and rebuild the
++    /// root display list, without resizing. Repairs a partial first paint
++    /// (see `Paint::refresh_viewport`); Frost calls this after every load
++    /// instead of the Round 2 resize jiggle.
++    pub fn refresh_viewport(&self) {
++        self.servo().paint().refresh_viewport(self.id());
++    }
++
+     /// Get the HiDPI scale factor for this [`WebView`].
+     pub fn hidpi_scale_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel> {
+         self.inner().hidpi_scale_factor
+-- 
+2.43.0
+
