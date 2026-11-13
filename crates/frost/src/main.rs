@@ -33,10 +33,11 @@
 //!   hidden — it renders the title but no window-control buttons on this
 //!   setup): "Frost — <page title>" with real minimize, maximize/restore,
 //!   and close buttons (text glyphs, real iced window commands).
-//! * The Round 2 resize "jiggle" is gone: after a load the app calls
-//!   fork patch F-005 (`WebView::refresh_viewport`), which re-sends the
-//!   current viewport and rebuilds the root display list without ever
-//!   changing the size.
+//! * The Round 2 resize "jiggle" is the full-repaint repair after a
+//!   load: fork patch F-005 (`WebView::refresh_viewport`) was tried in
+//!   Round 3 and proved insufficient on its own (an unchanged viewport
+//!   does not force layout to reflow the pipeline's display list), so
+//!   the jiggle stays — see `start_repaint_jiggle`.
 //!
 //! Chrome geometry is fixed by construction (Frost titlebar 40, toolbar
 //! 48, menu 148 when open, status 28), so the webview size and the click
@@ -136,17 +137,15 @@ mod app {
         TitlebarDoubleClick,
     }
 
-    /// Phase of the post-load forced repaint (see
-    /// `start_repaint_refresh`). Round 3: the Round 2 two-phase resize
-    /// jiggle is gone — fork patch F-005 (`WebView::refresh_viewport`)
-    /// re-sends the current viewport and rebuilds the root display
-    /// list without changing the size, so there is only one wait.
+    /// Phase of the post-load forced repaint (see `start_repaint_jiggle`).
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum RepaintPhase {
         /// No forced repaint in flight.
         Idle,
-        /// Viewport refresh sent; waiting for the repaired frame.
-        WaitRefresh,
+        /// Resized 1 px wider; waiting for the frame that resize produces.
+        WaitFirstFrame,
+        /// Resized back to the content size; waiting for that frame.
+        WaitSecondFrame,
     }
 
     pub struct Frost {
@@ -252,7 +251,13 @@ mod app {
         }
 
         /// Resize the webview to the content area, if it changed.
+        /// While a forced repaint is running the jiggle owns the webview
+        /// size, so a window resize during it is deferred (the jiggle's
+        /// resize-back uses the current content size anyway).
         fn resize_webview(&mut self) {
+            if self.repaint_pending {
+                return;
+            }
             let (w, h) = self.content_size();
             if self.webview.size() != (w, h) {
                 self.webview.resize(w, h);
@@ -260,42 +265,70 @@ mod app {
             }
         }
 
-        /// Force a full repaint after a load (Round 3, fork patch F-005).
+        /// Force a full repaint after a load (two-phase resize jiggle).
         ///
         /// A load's first paint is partial — only a ~1024x512 region of
         /// a 1280x684 frame — and no later paint repairs it, even a
         /// render after LoadFinished (the load gate alone does not fix
-        /// it). What DOES repair it is re-sending the current viewport
-        /// to the constellation and rebuilding the root display list:
-        /// a real resize to a different size did that (maximizing to
-        /// 1600x900 painted the whole 1600x784 frame; a 1 px window
-        /// resize painted fully), which is why Round 2 used a two-step
-        /// resize "jiggle". F-005 exposes exactly the repair half of the
-        /// resize path as `WebView::refresh_viewport()` — same viewport
-        /// re-send and display-list rebuild, no size change, no
-        /// intermediate frame, no timed size dance. This method sends
-        /// the refresh and waits ~0.25 s (15 ticks) for the repaired
-        /// frame before uploading. The wait is timed, not FrameReady-
-        /// driven: a FrameReady arriving during it may be stale (queued
-        /// before the refresh), so it must not end the wait early.
-        fn start_repaint_refresh(&mut self) {
-            self.webview.refresh_viewport();
-            self.repaint_phase = RepaintPhase::WaitRefresh;
+        /// it). What DOES repair it is a real resize to a different
+        /// size: maximizing to 1600x900 painted the whole 1600x784
+        /// frame, restoring to 1280x800 painted the whole 1280x684
+        /// frame, and even a 1 px window resize paints fully. So the
+        /// webview itself must be resized: a same-size resize is a
+        /// no-op in Servo (the painter dedupes it). This jiggle
+        /// therefore does it in two steps, one per timed wait: resize
+        /// 1 px wider, wait ~0.25 s, resize back to the content size,
+        /// wait ~0.25 s, then upload. The intermediate size is never
+        /// uploaded, so the user never sees it. The waits are timed,
+        /// not FrameReady-driven: advancing on a FrameReady resized
+        /// straight back on a stale (pre-resize) event, coalescing the
+        /// two resizes into a net no-op. This works around a
+        /// damage/initialization gap in the engine (same family as the
+        /// WayServo ghost finding that dirty rects under-report).
+        ///
+        /// Round 3 tried to retire the jiggle with fork patch F-005
+        /// (`WebView::refresh_viewport`, re-send the viewport without
+        /// resizing). The finish pass PROVED that insufficient: 2 of 3
+        /// first loads painted partial (~1024x512, white bottom-right)
+        /// and stayed partial for minutes, because re-sending an
+        /// unchanged viewport does not force layout to reflow the
+        /// pipeline's display list — only a real size change (or a
+        /// fresh document load, which is why reloads paint fully)
+        /// reflows it. F-005 stays in the fork (harmless, and the
+        /// viewport re-send is still useful), but the jiggle is the
+        /// reliable repair and stays. A fork patch that forces a
+        /// reflow at an unchanged viewport is the real follow-up
+        /// (FORK.md, candidate F-007).
+        fn start_repaint_jiggle(&mut self) {
+            let (w, h) = self.content_size();
+            self.webview.resize(w + 1, h);
+            self.repaint_phase = RepaintPhase::WaitFirstFrame;
             self.repaint_pending = true;
             self.repaint_wait_ticks = 0;
-            // Discard any pre-refresh frame flag: the frame it names is
+            // Discard any pre-jiggle frame flag: the frame it names is
             // the stale partial one.
             self.frame_dirty = false;
         }
 
-        /// Complete the forced repaint (called by the Tick once the
-        /// timed wait has elapsed). The Tick's render gate uploads the
-        /// repaired frame once this completes.
-        fn advance_repaint_refresh(&mut self) {
+        /// Advance the forced repaint one step (called by the Tick
+        /// once the current step's timed wait has elapsed). The Tick's
+        /// render gate uploads the final frame once the jiggle
+        /// completes.
+        fn advance_repaint_jiggle(&mut self) {
             match self.repaint_phase {
-                RepaintPhase::WaitRefresh => {
-                    // The refreshed frame arrived: the repaint is done;
-                    // the Tick uploads it.
+                RepaintPhase::WaitFirstFrame => {
+                    // The wider frame arrived: resize back to the
+                    // content size (which may have changed if the
+                    // window was resized mid-jiggle) and wait for it.
+                    let (w, h) = self.content_size();
+                    self.webview.resize(w, h);
+                    self.repaint_phase = RepaintPhase::WaitSecondFrame;
+                    self.repaint_wait_ticks = 0;
+                    self.frame_dirty = false;
+                },
+                RepaintPhase::WaitSecondFrame => {
+                    // The back-to-size frame arrived: the jiggle is
+                    // done; the Tick uploads it.
                     self.repaint_phase = RepaintPhase::Idle;
                     self.repaint_pending = false;
                     self.frame_dirty = true;
@@ -401,14 +434,14 @@ mod app {
                     self.inject_content_scripts();
                     // The load's first paint is partial; force a full
                     // repaint before any frame is uploaded.
-                    self.start_repaint_refresh();
+                    self.start_repaint_jiggle();
                 },
                 EngineEvent::LoadStopped => {
                     self.loading = false;
                     self.awaiting_load = false;
                     self.loading_since = None;
                     self.status = "Stopped.".to_string();
-                    self.start_repaint_refresh();
+                    self.start_repaint_jiggle();
                 },
                 EngineEvent::FrameReady => {
                     if self.repaint_pending {
@@ -799,23 +832,23 @@ mod app {
                         }
                     }
                     // The forced repaint is time-driven, not event-driven:
-                    // a FrameReady arriving during the refresh may be stale
-                    // (queued before the refresh — advancing on it would
-                    // upload the stale partial frame). The refresh
-                    // therefore waits ~15 ticks (~0.25 s, far more than
-                    // the 1–2 spins the constellation needs to process
-                    // a viewport re-send) before completing, so the
-                    // viewport is certainly processed before the frame
-                    // is uploaded.
+                    // a FrameReady arriving during the jiggle may be stale
+                    // (queued before the jiggle's resize — advancing on it
+                    // would resize straight back and coalesce the two
+                    // resizes into a net no-op). Each phase therefore
+                    // waits ~15 ticks (~0.25 s, far more than the 1–2
+                    // spins the constellation needs to process a resize)
+                    // before advancing, so the resize is certainly
+                    // processed before the frame is uploaded.
                     if self.repaint_pending {
                         self.repaint_wait_ticks += 1;
                         if self.repaint_wait_ticks >= 15 {
-                            self.advance_repaint_refresh();
+                            self.advance_repaint_jiggle();
                         }
                     }
                     // Render ONLY when the engine flagged a new frame AND
                     // no load is in flight (see awaiting_load) AND no
-                    // forced repaint is running: a pre-refresh partial
+                    // forced repaint is running: a pre-jiggle partial
                     // frame must never reach the screen.
                     if self.frame_dirty && !self.awaiting_load && !self.repaint_pending {
                         if let Some(frame) = self.webview.render() {
@@ -856,6 +889,19 @@ mod app {
                 Message::Reload => {
                     self.awaiting_load = true;
                     self.loading_since = Some(std::time::Instant::now());
+                    // Servo 0.8.0's `WebView::reload()` sets
+                    // `load_status` by direct field assignment instead
+                    // of `set_load_status`, so the delegate is never
+                    // notified and the engine reports no `LoadStarted`
+                    // for a reload. The app therefore clears the
+                    // content-script guard and marks loading here, or
+                    // content scripts never re-run after a reload (the
+                    // banner was gone after every reload) and Stop stays
+                    // disabled while reloading. (The fork-level fix —
+                    // `reload()` via `set_load_status` — is recorded in
+                    // FORK.md as candidate F-006.)
+                    self.injected_for = None;
+                    self.loading = true;
                     self.webview.reload();
                     self.status = "Reloading…".to_string();
                     Task::none()
