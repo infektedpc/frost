@@ -4,10 +4,10 @@
 //! timeout), waits for a painted frame, and writes it as a PNG.
 //!
 //! Usage:
-//!   cargo run -p frost-engine --example smoke -- [URL] [OUT.png]
+//!   cargo run -p frost-engine --example smoke -- [URL] [OUT.png] [W] [H]
 //!
-//! Defaults: `https://example.org`, `smoke.png` in the current directory.
-//! Exit code 0 means a non-blank PNG was written; anything else is a
+//! Defaults: `https://example.org`, `smoke.png` in the current directory,
+//! 1280x800. Exit code 0 means a non-blank PNG was written; anything else is a
 //! failure. The PNG is the gate: it must exist, be a valid PNG, and not be
 //! a single solid color.
 
@@ -33,11 +33,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "smoke.png".to_string());
+    let width: u32 = std::env::args()
+        .nth(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1280);
+    let height: u32 = std::env::args()
+        .nth(4)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(800);
 
     eprintln!("[smoke] creating engine");
     let engine = Engine::new()?;
-    let webview = engine.spawn_webview(&url, 1280, 800)?;
-    eprintln!("[smoke] loading {url}");
+    let webview = engine.spawn_webview(&url, width, height)?;
+    eprintln!("[smoke] loading {url} at {width}x{height}");
 
     // Spin until LoadFinished or the load timeout.
     let load_deadline = Instant::now() + Duration::from_secs(120);

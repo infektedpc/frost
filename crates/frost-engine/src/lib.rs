@@ -16,11 +16,9 @@
 //!   [`KeyboardEvent::new_without_event`], which needs the `+8` evdev
 //!   adjustment only for Wayland seat input — Frost keys come from
 //!   winit/libcosmic, so that fix does not apply here.
-//! * No `stop()`: Servo 0.8.0 exposes no `WebView::stop` in its public API
-//!   (verified against the fork; the engine has `window.stop()` internally
-//!   but no embedder-facing trigger). [`FrostWebView::stop`] therefore
-//!   returns [`EngineError::Unsupported`] until fork patch F-001 lands
-//!   (see `FORK.md`). The UI must keep the Stop button disabled until then.
+//! * `stop()` landed in Round 2 as fork patch F-001 (see `FORK.md`):
+//!   [`FrostWebView::stop`] sends the stop request to the script thread
+//!   of the active pipeline.
 //!
 //! Threading: everything here runs on ONE thread (the thread that creates
 //! the [`Engine`]). Servo's embedder API expects `spin_event_loop` on the
@@ -132,6 +130,9 @@ pub enum FrostInputEvent {
         state: KeyState,
         key: Key,
         code: Code,
+        location: Location,
+        modifiers: Modifiers,
+        repeat: bool,
     },
 }
 
@@ -160,24 +161,26 @@ impl From<FrostInputEvent> for InputEvent {
                 },
                 DevicePoint::new(x, y).into(),
             )),
-            FrostInputEvent::Key { state, key, code } => InputEvent::Keyboard(
-                KeyboardEvent::new_without_event(
-                    state,
-                    key,
-                    code,
-                    Location::Standard,
-                    Modifiers::empty(),
-                    false,
-                    false,
-                ),
-            ),
+            FrostInputEvent::Key {
+                state,
+                key,
+                code,
+                location,
+                modifiers,
+                repeat,
+            } => InputEvent::Keyboard(KeyboardEvent::new_without_event(
+                state, key, code, location, modifiers, repeat, false,
+            )),
         }
     }
 }
 
 // Re-export the input types the UI needs to build `FrostInputEvent`s,
 // so Round 2 does not have to depend on the `servo` crate directly.
-pub use servo::{Code as FrostCode, Key as FrostKey, KeyState as FrostKeyState};
+pub use servo::{
+    Code as FrostCode, Key as FrostKey, KeyState as FrostKeyState,
+    Location as FrostLocation, Modifiers as FrostModifiers, NamedKey as FrostNamedKey,
+};
 pub use servo::{MouseButton as FrostMouseButton, MouseButtonAction as FrostMouseButtonAction};
 
 /// Minimal [`EventLoopWaker`]: Servo calls `wake()` when it wants the
@@ -325,6 +328,16 @@ impl FrostWebView {
         Ok(())
     }
 
+    /// Whether the webview has history to go back to.
+    pub fn can_go_back(&self) -> bool {
+        self.inner.can_go_back()
+    }
+
+    /// Whether the webview has history to go forward to.
+    pub fn can_go_forward(&self) -> bool {
+        self.inner.can_go_forward()
+    }
+
     /// Navigate back one history entry.
     pub fn go_back(&self) {
         self.inner.go_back(1);
@@ -342,15 +355,14 @@ impl FrostWebView {
 
     /// Stop the current load.
     ///
-    /// NOT IMPLEMENTED in Round 1: Servo 0.8.0 exposes no `WebView::stop`
-    /// (the engine has `window.stop()` internally, but no embedder-facing
-    /// trigger). Returns [`EngineError::Unsupported`] until fork patch
-    /// F-001 lands — the UI must keep Stop disabled until then.
+    /// Round 2: live, via fork patch F-001 (`WebView::stop` in the fork,
+    /// which asks the script thread of the active pipeline to abort the
+    /// document load — the same path as `window.stop()` in the page).
+    /// The engine reports [`EngineEvent::LoadStopped`] when the load
+    /// actually stops. A no-op when nothing is loading.
     pub fn stop(&self) -> Result<(), EngineError> {
-        Err(EngineError::Unsupported(
-            "stop: Servo 0.8.0 exposes no WebView::stop; planned as fork patch F-001 (see FORK.md)"
-                .into(),
-        ))
+        self.inner.stop();
+        Ok(())
     }
 
     /// Resize the viewport. Follows the servo-de Round 8 finding: in
@@ -417,6 +429,29 @@ impl FrostWebView {
     }
 }
 
+/// Build a `data:` URL for a small placeholder page (Round 2 menu entries:
+/// Settings / Print / Open load these through the engine until the real
+/// `frost://` internal pages land in Round 3). The HTML is percent-encoded
+/// so the URL is valid as-is.
+pub fn data_url_page(title: &str, body_html: &str) -> String {
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title>\
+         <style>body{{background:#1e1e2e;color:#e8e8f0;font-family:sans-serif;margin:48px}}\
+         h1{{font-size:28px}}p{{font-size:16px;line-height:1.5;color:#b8b8cc}}\
+         a{{color:#7aa2ff}}</style></head><body><h1>{title}</h1>{body_html}</body></html>"
+    );
+    let mut out = String::from("data:text/html;charset=utf-8,");
+    for byte in html.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            },
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +477,30 @@ mod tests {
     }
 
     #[test]
+    fn data_url_page_is_a_valid_data_url() {
+        let url = data_url_page("Settings", "<p>hello world</p>");
+        assert!(url.starts_with("data:text/html;charset=utf-8,"));
+        assert!(url.contains("Settings"));
+        // No raw characters that would break a URL.
+        assert!(!url.contains('<'));
+        assert!(!url.contains(' '));
+        assert!(!url.contains('"'));
+        // The body survives percent-decoding.
+        let encoded = url.trim_start_matches("data:text/html;charset=utf-8,");
+        let mut decoded = String::new();
+        let mut chars = encoded.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                let hex: String = chars.by_ref().take(2).collect();
+                decoded.push(u8::from_str_radix(&hex, 16).unwrap() as char);
+            } else {
+                decoded.push(c);
+            }
+        }
+        assert!(decoded.contains("<p>hello world</p>"));
+    }
+
+    #[test]
     fn input_event_conversion_compiles_and_maps() {
         let ev: InputEvent = FrostInputEvent::MouseMove { x: 10.0, y: 20.0 }.into();
         assert!(matches!(ev, InputEvent::MouseMove(_)));
@@ -457,6 +516,9 @@ mod tests {
             state: KeyState::Down,
             key: Key::Named(NamedKey::Enter),
             code: Code::Enter,
+            location: Location::Standard,
+            modifiers: Modifiers::empty(),
+            repeat: false,
         }
         .into();
         assert!(matches!(ev, InputEvent::Keyboard(_)));
