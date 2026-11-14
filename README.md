@@ -5,14 +5,15 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 4 — the Round 3 leftovers are finished.** F-007 fixed
-the partial paint at its root (full present instead of partial
-present — the resize jiggle is retired); F-006 notifies the delegate
-on reload (the app-side workaround is retired); F-003 ships a real
-print preview (viewport screenshot + Save as PNG — Servo 0.8.0 has no
-print pipeline, so paginated print/PDF is genuinely unbuildable);
-Ctrl+A select-all works in page text inputs; F-008 lets Stop abort a
-navigation stuck at the constellation. See [ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 5 — Inspector v1.** A working HTML inspector: open it
+from the hamburger menu (or F12) and Frost captures the current page's
+DOM with an in-page walker script — no fork patch, because the fork's
+`WebView::evaluate_javascript` already returns values — then shows the
+snapshot at `frost://inspector` (expandable tree, click a node for its
+attributes/text/computed style/box, "Back to the page", "Re-capture").
+The three Round 4 warts are fixed in the same round: the file-browser
+history quirk, the print-save `~/Downloads` gap, and the "Not found"
+flash after Save. See [ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -306,6 +307,111 @@ Not proven / known limits:
 - Mouse-wheel scrolling still unproven under Xvfb (carried from
   Round 2). wgpu adapter on Haswell, real mouse/keyboard, and drag
   latency are Joel's-box verdicts.
+
+## Round 5 — Inspector v1 (what is proven, what is not)
+
+Proven (sandbox, 2026-11-14, under Xvfb + software GL; gates run live
+against the shipped tree; `cargo test --workspace` **49/49 green** —
+frost bin 29, frost-engine 4, frost-extensions 8, frost-inspector 8):
+
+- Inspector opens from the menu and with F12 on example.org; the
+  header reads "Snapshot of https://example.org/, captured <time>, 35
+  nodes — this is a snapshot, not a live view", with "Back to the page"
+  and "Re-capture" links (r5-03-inspector.jpg, r5-17-f12-focused.jpg,
+  r5-18-recapture.jpg). The tree is the real current DOM (no `<h1>` on
+  the live page anymore); clicking a node fills the details pane (tag,
+  attributes, computed style, box — r5-04-node-details.jpg), and the
+  head "−" toggle collapses its children (r5-05-collapsed.jpg).
+- "Back to the page" returns to example.org with the banner live
+  (r5-06-back-to-page.jpg). Opening `frost://inspector` with no
+  snapshot shows the honest "No page inspected yet" page, not a fake
+  tree (r5-40-no-snapshot.jpg).
+- File-browser Back/Forward move across folder clicks
+  (r5-24-back.jpg / r5-25-back-wait.jpg, r5-30-forward2.jpg).
+- Print Save works with `~/Downloads` deleted first: the dir is
+  recreated and `frost-print-1794672243.png` (141 KB) written
+  (r5-34-after-save.jpg). No "Not found" flash — and the header keeps
+  naming the printed page after Save (the frozen-identity fix above;
+  re-gated on the fixed binary, r5-45-after-save2.jpg).
+- Regression: settings persist across relaunch (homepage example.com
+  loads on launch, r5-39-homepage-persisted.jpg), banner on
+  example.org, back/forward on normal pages (r5-41/42/43), all five
+  menu entries (r5-02-menu.jpg, r5-19-menu2.jpg).
+
+- **Approach: script injection, NOT a fork patch.** The investigation
+  found the fork already exposes everything the inspector needs:
+  `WebView::evaluate_javascript(script, callback)` returns
+  `Result<JSValue, JavaScriptEvaluationError>` (the callback fires on
+  the app thread during `Engine::spin`), and `JSValue::String` carries
+  the result back. So the inspector is a DOM walker script
+  (`crates/frost-inspector/src/walk.js`, injected via the engine's new
+  `evaluate_javascript_string`, same mpsc-channel pattern as the
+  print-preview screenshot) that serializes the live DOM to JSON
+  (tag, all attributes, direct text, computed style, viewport box,
+  capped at 8000 nodes / 64 deep, whitespace-only text nodes skipped).
+  The planned fork patch F-002 (a constellation DOM snapshot hook) is
+  NOT needed — it would touch constellation/script-thread internals
+  for the same data at much higher risk. A devtools server
+  (`components/devtools` exists in the fork) is a multi-round job, not
+  v1. The `frost-inspector` crate owns the walker script and the JSON
+  parsing (`snapshot_from_json`); the engine only ferries the string.
+- **Snapshot model (the single-webview answer).** Frost has one
+  webview: navigating to `frost://inspector` would replace the page
+  being inspected. So the menu entry / F12 captures the DOM FIRST
+  (walker runs in the current page), stores the snapshot in the
+  loopback server's shared state, and only then opens
+  `frost://inspector`, which renders the snapshot — labeled "Snapshot
+  of <url>, captured <time>, N nodes — not a live view", with "Back to
+  the page" and "Re-capture" (re-capture sends the webview back to the
+  inspected page, then captures again once it loads). Opening
+  `frost://inspector` directly with no snapshot shows an honest
+  "No page inspected yet" page instead of a fake tree. A failed
+  capture leaves the current page up and says so in the status line.
+- **The tree is real.** The inspector page fetches
+  `/inspector/snapshot.json` and renders the snapshot as an
+  expandable/collapsible tree (JS toggles, not `<details>` — the
+  toggle is Frost's own code, not engine behavior); clicking a node
+  fills the details pane (tag, full attributes, text, computed style,
+  box with margin/padding/border). Gate page is example.org — the live
+  page has no `<h1>` anymore (verified 2026-11-14): the inspector shows
+  the real current DOM, `html > head (meta, link, meta, title, style)
+  > body (div#frost-sample-banner [extension-injected], style, svg, p
+  ×5)`, 35 nodes.
+- **Wart fixes (Round 4 leftovers, in this round).**
+  - File-browser history: only the `frost://open` form is intercepted
+    now (`needs_open_intercept`); the loopback `/open` form loads fine
+    on its own, and re-loading it had created a duplicate history
+    entry — which is why Back across folder clicks stayed on the same
+    folder. Back/Forward now move across folder navigation.
+  - Print save: the save is a real server route (`/print/save`) that
+    creates `~/Downloads` first (`create_dir_all`) and 303-redirects
+    to `/print` — which also kills the "Page: Not found" flash (the
+    old app-side save ran on the UrlChanged event while the webview
+    itself loaded `/print/save` and got the server's 404 page). The
+    printed page's title/URL are frozen at print-open time
+    (`print_page_title`/`print_page_url`): after the Save redirect
+    re-renders `/print`, the live current page is `frost://print`, and
+    the header used to describe the print page itself ("Page: Print
+    page") instead of the printed page — caught by the harness gate,
+    fixed in-round, covered by a unit test.
+- **What v1 does NOT do:** no live editing, no live updates (the
+  snapshot is frozen at capture time), no click-to-inspect from the
+  page (that needs a docked panel inside the live page — v2), no
+  console, no network panel, no shadow DOM / iframe sub-documents /
+  comments (the walker skips them and says so in its header comment).
+  The tree is capped (8000 nodes / 64 deep) and says "truncated" when
+  the cap bites.
+
+Not proven / known limits:
+
+- Mouse-wheel scrolling still unproven under Xvfb (carried from
+  Round 2). wgpu adapter on Haswell, real mouse/keyboard, and drag
+  latency are Joel's-box verdicts.
+- One cosmetic warning in the build: three `InspectorSnapshot` fields
+  (`captured_at_ms`, `node_count`, `truncated`) are never read by Rust
+  code — the inspector page reads them from the served JSON instead.
+  The fields stay as the snapshot record; the warning is noted, not
+  hidden.
 
 ## Round 4 — what is proven, what is not
 

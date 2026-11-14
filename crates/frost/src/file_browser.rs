@@ -58,6 +58,19 @@ pub fn parse_open_url(url: &Url) -> Option<PathBuf> {
         .map(|(_, value)| PathBuf::from(value.into_owned()))
 }
 
+/// Whether a folder navigation needs the app to intervene (Round 5
+/// wart fix). Only the `frost://open` form does: the engine cannot load
+/// the `frost:` scheme, so the app must translate it to the loopback
+/// form. The loopback `/open` form loads fine on its own — the server
+/// serves the listing directly — and re-loading it (what Round 2/3
+/// did) creates a DUPLICATE history entry for the same folder: Back
+/// then lands on the same folder again, and Forward after such a Back
+/// goes nowhere, because the duplicate sits between the real entries.
+/// So the intercept sites call this, not `parse_open_url`.
+pub fn needs_open_intercept(url: &Url) -> bool {
+    url.scheme() == OPEN_SCHEME && url.host_str() == Some(OPEN_HOST) && parse_open_url(url).is_some()
+}
+
 /// The URL a Markdown file link points at: the server renders it.
 fn markdown_url(path: &Path, base: &str) -> String {
     let encoded: String =
@@ -229,6 +242,25 @@ mod tests {
         assert!(parse_open_url(&Url::parse("frost://open").unwrap()).is_none());
         assert!(parse_open_url(&Url::parse("http://127.0.0.1:54321/settings").unwrap())
             .is_none());
+    }
+
+    #[test]
+    fn only_the_frost_form_needs_interception() {
+        // The loopback form loads on its own; intercepting it re-loads
+        // the same URL and duplicates the history entry (Round 5 wart
+        // fix: Back across folder clicks stayed on the same folder).
+        let loopback = Url::parse("http://127.0.0.1:54321/open?path=%2Fhome%2Fjoel").unwrap();
+        assert!(parse_open_url(&loopback).is_some());
+        assert!(!needs_open_intercept(&loopback));
+        let frost_form = Url::parse("frost://open?path=%2Fhome%2Fjoel").unwrap();
+        assert!(needs_open_intercept(&frost_form));
+        // No path, no interception (nothing to list).
+        assert!(!needs_open_intercept(
+            &Url::parse("frost://open").unwrap()
+        ));
+        assert!(!needs_open_intercept(
+            &Url::parse("https://example.org/").unwrap()
+        ));
     }
 
     #[test]

@@ -132,6 +132,15 @@ pub struct DomSnapshot {
     pub url: String,
     pub root: DomNode,
     pub node_count: usize,
+    /// Unix milliseconds when the walker ran (Round 5: the inspector
+    /// page renders it as a local time; 0 means "unknown", e.g. the
+    /// Round 1 `empty()` fixture).
+    #[serde(default)]
+    pub captured_at_unix_ms: u64,
+    /// True when the walker hit its node/depth limit and the tree is
+    /// incomplete (Round 5: the inspector page says so).
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 impl DomSnapshot {
@@ -147,12 +156,55 @@ impl DomSnapshot {
             url: url.into(),
             root,
             node_count,
+            captured_at_unix_ms: 0,
+            truncated: false,
         }
     }
 
     pub fn find(&self, node_id: u64) -> Option<&DomNode> {
         self.root.find(node_id)
     }
+}
+
+/// The DOM walker script (Round 5): runs inside the inspected page via
+/// `WebView::evaluate_javascript` and returns a JSON string — see
+/// `walk.js`. The tree shape matches [`DomNode`] field-for-field, so
+/// [`snapshot_from_json`] deserializes it directly.
+pub const DOM_WALK_SCRIPT: &str = include_str!("walk.js");
+
+/// The walker output envelope (keys as the script emits them).
+#[derive(Debug, Deserialize)]
+struct WalkerOutput {
+    url: String,
+    #[serde(rename = "capturedAt")]
+    captured_at: u64,
+    #[serde(default)]
+    truncated: bool,
+    #[serde(rename = "nodeCount")]
+    node_count: usize,
+    root: DomNode,
+}
+
+/// Parse the JSON string the walker script returned into a snapshot.
+/// Rejects anything that is not a `#document`-rooted walker envelope,
+/// so a page that redefined something (or a script error that returned
+/// a stray string) never becomes a fake tree.
+pub fn snapshot_from_json(json: &str) -> Result<DomSnapshot, String> {
+    let out: WalkerOutput =
+        serde_json::from_str(json).map_err(|e| format!("inspector JSON did not parse: {e}"))?;
+    if out.root.tag != "#document" {
+        return Err(format!(
+            "inspector JSON has root tag {:?}, expected \"#document\"",
+            out.root.tag
+        ));
+    }
+    Ok(DomSnapshot {
+        url: out.url,
+        root: out.root,
+        node_count: out.node_count,
+        captured_at_unix_ms: out.captured_at,
+        truncated: out.truncated,
+    })
 }
 
 /// Picker state: what the user is hovering / has selected with the
@@ -299,5 +351,95 @@ mod tests {
         assert!(json.contains("example.org"));
         let back: DomSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.node_count, 4);
+    }
+
+    /// The walker output for a page shaped like example.org:
+    /// html > head + body > div > h1 + p. The walker emits
+    /// `computed_style`/`box_model` keys matching the Rust field
+    /// names, so the root deserializes straight into `DomNode`.
+    /// A raw string, not `json!`: the nesting is deep enough to hit
+    /// the macro's recursion limit.
+    fn example_org_walker_json() -> String {
+        r##"{
+            "url": "https://example.org/",
+            "capturedAt": 1794643768000,
+            "truncated": false,
+            "nodeCount": 8,
+            "root": {
+                "node_id": 0, "tag": "#document", "attributes": {},
+                "text": null, "children": [{
+                    "node_id": 1, "tag": "html", "attributes": {},
+                    "text": null, "children": [
+                        {"node_id": 2, "tag": "head", "attributes": {},
+                         "text": null, "children": [],
+                         "computed_style": {}, "box_model": null},
+                        {"node_id": 3, "tag": "body", "attributes": {},
+                         "text": null, "children": [{
+                            "node_id": 4, "tag": "div", "attributes": {},
+                            "text": null, "children": [
+                                {"node_id": 5, "tag": "h1", "attributes": {},
+                                 "text": "Example Domain", "children": [
+                                    {"node_id": 6, "tag": "#text", "attributes": {},
+                                     "text": "Example Domain", "children": [],
+                                     "computed_style": {}, "box_model": null}],
+                                 "computed_style": {"display": "block", "font_size": "32px"},
+                                 "box_model": {"x": 20.0, "y": 20.0, "width": 1240.0, "height": 43.0,
+                                               "margin": [0.0, 0.0, 0.0, 0.0],
+                                               "padding": [0.0, 0.0, 0.0, 0.0],
+                                               "border": [0.0, 0.0, 0.0, 0.0]}},
+                                {"node_id": 7, "tag": "p", "attributes": {},
+                                 "text": "This domain is for use", "children": [],
+                                 "computed_style": {}, "box_model": null}],
+                            "computed_style": {}, "box_model": null}],
+                         "computed_style": {}, "box_model": null}],
+                    "computed_style": {}, "box_model": null}],
+                "computed_style": {}, "box_model": null
+            }
+        }"##
+        .to_string()
+    }
+
+    #[test]
+    fn walker_json_parses_into_a_real_tree() {
+        let snap = snapshot_from_json(&example_org_walker_json()).unwrap();
+        assert_eq!(snap.url, "https://example.org/");
+        assert_eq!(snap.captured_at_unix_ms, 1794643768000);
+        assert!(!snap.truncated);
+        assert_eq!(snap.node_count, 8);
+        // html > body > div > h1 + p, with the h1's text node.
+        let h1 = snap.find(5).unwrap();
+        assert_eq!(h1.tag, "h1");
+        assert_eq!(h1.text.as_deref(), Some("Example Domain"));
+        assert_eq!(
+            h1.computed_style.font_size.as_deref(),
+            Some("32px")
+        );
+        let rect = h1.box_model.as_ref().unwrap();
+        assert_eq!((rect.x, rect.y, rect.width), (20.0, 20.0, 1240.0));
+        let text = snap.find(6).unwrap();
+        assert_eq!(text.tag, "#text");
+        assert_eq!(snap.find(7).unwrap().tag, "p");
+        assert_eq!(snap.root.count(), 8);
+    }
+
+    #[test]
+    fn walker_json_rejects_garbage_and_wrong_roots() {
+        assert!(snapshot_from_json("not json").is_err());
+        assert!(snapshot_from_json("{\"url\":\"x\"}").is_err());
+        let mut wrong = example_org_walker_json();
+        wrong = wrong.replacen("\"#document\"", "\"html\"", 1);
+        assert!(snapshot_from_json(&wrong).is_err());
+    }
+
+    #[test]
+    fn walk_script_has_the_walker_contract() {
+        // Cheap guard against accidental edits: the script must return
+        // a JSON string with the envelope keys and enforce its limits.
+        assert!(DOM_WALK_SCRIPT.contains("JSON.stringify"));
+        assert!(DOM_WALK_SCRIPT.contains("capturedAt"));
+        assert!(DOM_WALK_SCRIPT.contains("getBoundingClientRect"));
+        assert!(DOM_WALK_SCRIPT.contains("getComputedStyle"));
+        assert!(DOM_WALK_SCRIPT.contains("MAX_NODES"));
+        assert!(DOM_WALK_SCRIPT.contains("node_id"));
     }
 }

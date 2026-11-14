@@ -22,6 +22,8 @@ ui-libcosmic = ["dep:libcosmic", "libcosmic/wgpu"]
 [dependencies]
 frost-engine = { path = "../frost-engine" }
 frost-extensions = { path = "../frost-extensions" }
+# Round 5: the inspector (DOM walker script + snapshot parsing).
+frost-inspector = { path = "../frost-inspector" }
 url = "2"
 # Round 3: settings persistence (serde_json), internal-page Markdown
 # rendering (pulldown-cmark 0.13 — cached in the registry).

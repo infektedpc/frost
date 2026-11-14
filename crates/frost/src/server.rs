@@ -51,10 +51,41 @@ pub struct Shared {
     pub print_preview_png: Option<Vec<u8>>,
     /// Label for the preview (which page it is a preview of).
     pub print_preview_label: String,
+    /// Round 5: the printed page's identity, frozen at print-open
+    /// time (title + display URL). The print page renders from THESE,
+    /// not from current_page_*: after Save the server 303s back to
+    /// /print, which re-renders — and by then the live current page
+    /// IS frost://print, so the header would describe the print page
+    /// itself ("Page: Print page") instead of the printed page.
+    pub print_page_title: String,
+    pub print_page_url: String,
     /// The last print-preview capture error, if it failed.
     pub print_preview_error: Option<String>,
     /// Where the preview PNG was last saved (~/Downloads), if saved.
     pub print_saved_path: Option<String>,
+    /// Round 5: the inspector snapshot — the walker JSON for the page
+    /// the user inspected, plus the page it came from. Served verbatim
+    /// as /inspector/snapshot.json; the /inspector page renders it.
+    pub inspector_snapshot: Option<InspectorSnapshot>,
+    /// Round 5: the inspector page asked for a re-capture (the
+    /// /inspector/recapture link). The app polls this each Tick, clears
+    /// it, and re-captures the inspected page once it loads again.
+    pub inspector_recapture_requested: bool,
+}
+
+/// One captured inspector snapshot (Round 5).
+#[derive(Debug, Clone)]
+pub struct InspectorSnapshot {
+    /// The inspected page's URL (the display form, e.g.
+    /// `https://example.org/` or `frost://settings`).
+    pub url: String,
+    /// Unix milliseconds when the walker ran.
+    pub captured_at_ms: u64,
+    pub node_count: usize,
+    pub truncated: bool,
+    /// The walker JSON string, served verbatim at
+    /// /inspector/snapshot.json.
+    pub json: String,
 }
 
 impl Shared {
@@ -70,8 +101,12 @@ impl Shared {
             failed_extensions: Vec::new(),
             print_preview_png: None,
             print_preview_label: String::new(),
+            print_page_title: String::new(),
+            print_page_url: String::new(),
             print_preview_error: None,
             print_saved_path: None,
+            inspector_snapshot: None,
+            inspector_recapture_requested: false,
         }
     }
 }
@@ -160,6 +195,34 @@ fn handle_connection(mut stream: TcpStream, shared: &Arc<Mutex<Shared>>, setting
         }
         return;
     }
+    // The inspector snapshot is JSON, not HTML — serve it here, before
+    // the HTML-only dispatcher (same pattern as the print preview PNG).
+    if parse_target(target).0 == "/inspector/snapshot.json" {
+        let json = shared
+            .lock()
+            .ok()
+            .and_then(|s| s.inspector_snapshot.as_ref().map(|snap| snap.json.clone()));
+        match json {
+            Some(json) => {
+                let response = format!(
+                    "HTTP/1.1 200\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    json.len(),
+                    json
+                );
+                let _ = stream.write_all(response.as_bytes());
+            },
+            None => {
+                let body = "{\"error\":\"no snapshot\"}";
+                let response = format!(
+                    "HTTP/1.1 404\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            },
+        }
+        return;
+    }
     let (status, body, location) = {
         let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
         handle_request(target, &mut shared, settings_path)
@@ -232,6 +295,38 @@ pub fn handle_request(
             )
         },
         "/print" => (200, print_page(shared), None),
+        "/print/save" => {
+            // Round 5: the save is a real server route now (it used to
+            // be an app-side side effect on the UrlChanged event, while
+            // the webview itself loaded /print/save and got the 404
+            // "Not found" page — the "Page: Not found" flash after
+            // Save). The route saves, then redirects to /print, which
+            // shows the saved path (or the error) — no 404 anywhere.
+            match save_print_preview(shared, &downloads_dir()) {
+                Ok(_) => (303, String::new(), Some("/print".to_string())),
+                Err(e) => {
+                    shared.print_preview_error = Some(e);
+                    (303, String::new(), Some("/print".to_string()))
+                },
+            }
+        },
+        "/inspector" => (200, inspector_page(shared), None),
+        "/inspector/recapture" => {
+            // Ask the app to capture the inspected page again: set the
+            // flag (the app polls it each Tick) and send the webview
+            // back to the inspected page, so the capture runs on a
+            // fresh load. A frost:// URL is translated back to the
+            // loopback form the engine can load.
+            match &shared.inspector_snapshot {
+                Some(snap) => {
+                    shared.inspector_recapture_requested = true;
+                    let target = frost_url_to_loopback(&snap.url, &shared.base_url)
+                        .unwrap_or_else(|| snap.url.clone());
+                    (303, String::new(), Some(target))
+                },
+                None => (303, String::new(), Some("/inspector".to_string())),
+            }
+        },
         "/exit" => (200, exit_page(shared), None),
         "/exit/confirm" => (200, exit_confirm_page(shared), None),
         "/open" => {
@@ -325,6 +420,39 @@ pub fn apply_settings_save(
     } else {
         error.unwrap()
     }
+}
+
+/// The user's Downloads directory (`~/Downloads`, or a relative
+/// `Downloads` when HOME is unset).
+pub fn downloads_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("Downloads"))
+        .unwrap_or_else(|| PathBuf::from("Downloads"))
+}
+
+/// Save the captured print preview PNG to `dir` (Round 5: creates the
+/// directory first, so the save works even when ~/Downloads does not
+/// exist yet — the Round 4 gap). Records the saved path (or the error)
+/// on the shared state and returns the path on success. Pure over the
+/// shared state plus the directory, so tests can drive it with a temp
+/// dir.
+pub fn save_print_preview(shared: &mut Shared, dir: &std::path::Path) -> Result<PathBuf, String> {
+    let bytes = shared
+        .print_preview_png
+        .clone()
+        .ok_or_else(|| "no print preview captured".to_string())?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("frost-print-{secs}.png"));
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    shared.print_saved_path = Some(path.display().to_string());
+    shared.print_preview_error = None;
+    Ok(path)
 }
 
 /// Apply a settings reset: defaults, persist, bump the version.
@@ -434,10 +562,13 @@ fn settings_page(shared: &Shared, note: Option<&str>) -> String {
 }
 
 fn print_page(shared: &Shared) -> String {
-    let title = if shared.current_page_title.is_empty() {
+    // The printed page's identity is frozen at print-open time
+    // (print_page_title/print_page_url): the live current page is
+    // frost://print by the time this re-renders after a Save.
+    let title = if shared.print_page_title.is_empty() {
         "Untitled page".to_string()
     } else {
-        shared.current_page_title.clone()
+        shared.print_page_title.clone()
     };
     // F-003 (Round 4): a real print preview — a screenshot of the
     // page's current viewport, served as /print/preview.png. Servo
@@ -483,7 +614,7 @@ fn print_page(shared: &Shared) -> String {
          Save the PNG and print it from any image viewer.</p>\
          <p><a href=\"{}\">Back to the page</a></p>",
         file_browser::html_escape(&title),
-        file_browser::html_escape(&shared.current_page_url),
+        file_browser::html_escape(&shared.print_page_url),
         file_browser::html_escape(
             shared
                 .last_external_url
@@ -492,6 +623,141 @@ fn print_page(shared: &Shared) -> String {
         ),
     );
     page_shell("Print page", &body, shared)
+}
+
+/// The inspector page (Round 5). The shell is static: the tree, the
+/// header, and the details pane are all rendered by the page's own
+/// JavaScript from `/inspector/snapshot.json`, so the server only has
+/// to fill in the "back to the page" link for the no-snapshot state
+/// (`{BACK_URL}` placeholder). The tree is a snapshot — the page says
+/// so — never presented as live.
+fn inspector_page(shared: &Shared) -> String {
+    let back = shared
+        .last_external_url
+        .clone()
+        .unwrap_or_else(|| shared.settings.homepage.clone());
+    let html = r##"<h1>Inspector</h1>
+<div id="insp-head"><p class="muted">Loading snapshot…</p></div>
+<div id="insp-main" style="display:none">
+<div style="display:flex;gap:24px;align-items:flex-start">
+<div id="insp-tree" style="flex:1;min-width:0;overflow:auto"></div>
+<div id="insp-details" style="flex:0 0 340px;border:1px solid #888;padding:12px">
+<p class="muted">Click a node to see its details.</p>
+</div>
+</div>
+</div>
+<div id="insp-empty" style="display:none">
+<p>No page inspected yet.</p>
+<p>Go to a page, then open the Inspector from the hamburger menu (or press F12). Frost captures the page's structure first, then shows it here — a snapshot of the page as it was when captured, not a live view.</p>
+<p><a href="{BACK_URL}">Back to the page</a></p>
+</div>
+<style>
+body{max-width:1100px}
+#insp-tree ul{list-style:none;margin:0;padding-left:22px}
+#insp-tree>ul{padding-left:0}
+#insp-tree li{font-family:monospace;font-size:13px;line-height:1.7;white-space:nowrap}
+#insp-tree .tw{display:inline-block;width:16px;cursor:pointer;color:#888;text-align:center}
+#insp-tree .nl{cursor:pointer;padding:1px 4px}
+#insp-tree .nl:hover{background:rgba(127,127,127,.3)}
+#insp-details h2{font-size:16px;word-break:break-all}
+#insp-details h3{font-size:13px;margin:16px 0 4px}
+#insp-details table{font-size:12px}
+#insp-details td{word-break:break-all}
+</style>
+<script>
+(function(){
+var byId = {};
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function label(n){
+  if(n.tag === '#text') return '"' + esc(n.text || '') + '"';
+  var s = esc(n.tag);
+  if(n.attributes.id) s += '#' + esc(n.attributes.id);
+  if(n.attributes.class){
+    var cls = n.attributes.class.trim().split(/\s+/);
+    for(var i=0;i<cls.length;i++) if(cls[i]) s += '.' + esc(cls[i]);
+  }
+  return s;
+}
+function renderNode(n){
+  byId[n.node_id] = n;
+  var html = '<li data-id="' + n.node_id + '">';
+  if(n.children && n.children.length){
+    html += '<span class="tw" data-toggle="1">\u2212</span>';
+  } else {
+    html += '<span class="tw">&nbsp;</span>';
+  }
+  html += '<span class="nl">' + label(n) + '</span>';
+  if(n.children && n.children.length){
+    html += '<ul>';
+    for(var i=0;i<n.children.length;i++) html += renderNode(n.children[i]);
+    html += '</ul>';
+  }
+  return html + '</li>';
+}
+function details(n){
+  var h = '<h2>' + esc(n.tag) + '</h2>';
+  var keys = Object.keys(n.attributes || {});
+  if(keys.length){
+    h += '<h3>Attributes</h3><table>';
+    for(var i=0;i<keys.length;i++) h += '<tr><td>' + esc(keys[i]) + '</td><td>' + esc(n.attributes[keys[i]]) + '</td></tr>';
+    h += '</table>';
+  } else {
+    h += '<p class="muted">No attributes.</p>';
+  }
+  if(n.text) h += '<h3>Text</h3><p>' + esc(n.text) + '</p>';
+  var cs = n.computed_style || {};
+  var shown = ['color','background_color','display','position','font_family','font_size','font_weight','width','height'];
+  var rows = '';
+  for(var j=0;j<shown.length;j++) if(cs[shown[j]]) rows += '<tr><td>' + esc(shown[j]) + '</td><td>' + esc(cs[shown[j]]) + '</td></tr>';
+  if(rows) h += '<h3>Computed style</h3><table>' + rows + '</table>';
+  if(n.box_model){
+    var b = n.box_model;
+    h += '<h3>Box (viewport-relative)</h3><p>x ' + b.x + ' &middot; y ' + b.y + ' &middot; ' + b.width + ' &times; ' + b.height + '</p>';
+    h += '<p class="muted">margin ' + b.margin.join(' ') + '<br>padding ' + b.padding.join(' ') + '<br>border ' + b.border.join(' ') + '</p>';
+  }
+  return h;
+}
+fetch('/inspector/snapshot.json').then(function(r){
+  if(!r.ok) throw new Error('no snapshot');
+  return r.json();
+}).then(function(data){
+  var when = new Date(data.capturedAt).toLocaleString();
+  var head = '<p>Snapshot of <b>' + esc(data.url) + '</b></p>'
+    + '<p class="muted">Captured ' + esc(when) + ' &middot; ' + data.nodeCount + ' nodes'
+    + (data.truncated ? ' &middot; <b>truncated</b> — the page is bigger than the walker limit, so the deepest nodes are missing' : '')
+    + ' — this is a snapshot, not a live view. The page may have changed since.</p>'
+    + '<p><a href="' + esc(data.url) + '">Back to the page</a> &middot; <a href="/inspector/recapture">Re-capture</a></p>';
+  document.getElementById('insp-head').innerHTML = head;
+  document.getElementById('insp-tree').innerHTML = '<ul>' + renderNode(data.root) + '</ul>';
+  document.getElementById('insp-main').style.display = 'block';
+  document.getElementById('insp-tree').addEventListener('click', function(e){
+    var t = e.target.closest('.tw');
+    if(t && t.getAttribute('data-toggle')){
+      var ul = t.parentElement.querySelector('ul');
+      if(ul){
+        var hidden = ul.style.display === 'none';
+        ul.style.display = hidden ? '' : 'none';
+        t.textContent = hidden ? '\u2212' : '+';
+      }
+      return;
+    }
+    var li = e.target.closest('li[data-id]');
+    if(!li) return;
+    var n = byId[+li.getAttribute('data-id')];
+    if(n) document.getElementById('insp-details').innerHTML = details(n);
+  });
+}).catch(function(){
+  document.getElementById('insp-head').innerHTML = '';
+  document.getElementById('insp-empty').style.display = 'block';
+});
+})();
+</script>
+"##;
+    page_shell(
+        "Inspector",
+        &html.replace("{BACK_URL}", &file_browser::html_escape(&back)),
+        shared,
+    )
 }
 
 fn exit_page(shared: &Shared) -> String {
@@ -653,5 +919,96 @@ mod tests {
         let (status, _, _) =
             handle_request("/nope", &mut shared, std::path::Path::new("/nonexistent"));
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn inspector_page_renders_shell_and_fetch_endpoint() {
+        let mut shared = test_shared();
+        let (_, body, _) =
+            handle_request("/inspector", &mut shared, std::path::Path::new("/nonexistent"));
+        assert!(body.contains("Inspector"), "{body}");
+        assert!(body.contains("/inspector/snapshot.json"), "{body}");
+        assert!(body.contains("No page inspected yet"), "{body}");
+        // No snapshot stored yet: the recapture link goes back to the
+        // inspector page, not to a page that was never captured.
+        let (_, _, location) =
+            handle_request("/inspector/recapture", &mut shared, std::path::Path::new("/nonexistent"));
+        assert_eq!(location.as_deref(), Some("/inspector"));
+    }
+
+    #[test]
+    fn inspector_recapture_redirects_to_the_inspected_page() {
+        let mut shared = test_shared();
+        shared.base_url = "http://127.0.0.1:54321".to_string();
+        shared.inspector_snapshot = Some(InspectorSnapshot {
+            url: "https://example.org/".to_string(),
+            captured_at_ms: 1794643768000,
+            node_count: 8,
+            truncated: false,
+            json: "{}".to_string(),
+        });
+        let (status, _, location) = handle_request(
+            "/inspector/recapture",
+            &mut shared,
+            std::path::Path::new("/nonexistent"),
+        );
+        assert_eq!(status, 303);
+        assert_eq!(location.as_deref(), Some("https://example.org/"));
+        assert!(shared.inspector_recapture_requested);
+    }
+
+    #[test]
+    fn print_save_creates_the_downloads_dir_and_redirects() {
+        // Round 5 wart fix: the save used to fail outright when
+        // ~/Downloads did not exist; the route now creates it first.
+        let dir = std::env::temp_dir().join("frost-print-save-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut shared = test_shared();
+        shared.print_preview_png = Some(vec![0x89, 0x50, 0x4e, 0x47]); // PNG magic
+        let path = save_print_preview(&mut shared, &dir).unwrap();
+        assert!(path.starts_with(&dir));
+        assert!(path.exists());
+        assert!(shared.print_saved_path.is_some());
+        // And the route itself redirects to /print (no 404 "Not found"
+        // page — the Round 4 flash after Save). Drive it with no
+        // preview captured, so it does not write to the real
+        // ~/Downloads: the error path redirects the same way.
+        shared.print_preview_png = None;
+        let (status, _, location) = handle_request(
+            "/print/save",
+            &mut shared,
+            std::path::Path::new("/nonexistent"),
+        );
+        assert_eq!(status, 303);
+        assert_eq!(location.as_deref(), Some("/print"));
+        assert!(shared.print_preview_error.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn print_save_fails_cleanly_with_no_preview() {
+        let mut shared = test_shared();
+        assert!(shared.print_preview_png.is_none());
+        let dir = std::env::temp_dir().join("frost-print-save-test2");
+        assert!(save_print_preview(&mut shared, &dir).is_err());
+    }
+
+    #[test]
+    fn print_page_keeps_the_printed_page_after_a_reload() {
+        // Round 5 follow-up (caught in the harness gate): after Save
+        // the server 303s back to /print, which re-renders — and by
+        // then the live current page IS frost://print. The header must
+        // still name the page that was printed, frozen at print-open.
+        let mut shared = test_shared();
+        shared.print_page_title = "Example Domain".to_string();
+        shared.print_page_url = "https://example.org/".to_string();
+        shared.print_preview_png = Some(vec![0x89, 0x50, 0x4e, 0x47]);
+        shared.print_preview_label = "Preview of https://example.org/".to_string();
+        shared.current_page_title = "Print page".to_string();
+        shared.current_page_url = "frost://print".to_string();
+        let body = print_page(&shared);
+        assert!(body.contains("Page: <b>Example Domain</b>"));
+        assert!(body.contains("https://example.org/"));
+        assert!(!body.contains("Page: <b>Print page</b>"));
     }
 }

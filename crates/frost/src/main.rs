@@ -20,7 +20,10 @@
 //!   browser — the listing is generated app-side and served by the
 //!   server, folder clicks re-list, file clicks open the file in the
 //!   browser, `.md` files render as formatted HTML; Exit quits the
-//!   process (via the confirmation page when enabled).
+//!   process (via the confirmation page when enabled). Inspector
+//!   (Round 5) captures the current page's DOM before opening
+//!   `frost://inspector` on the snapshot — the single webview cannot
+//!   show the inspector and the inspected page at once.
 //! * Settings (`settings.rs`) are a working page: theme (light/dark,
 //!   applied live to Frost's own chrome and to the pages), homepage
 //!   (next launch), default search engine, exit confirmation. Settings
@@ -87,11 +90,12 @@ mod app {
         FrostMouseButtonAction, FrostWebView,
     };
     use frost_extensions::{ExtensionHost, ExtensionManifest, StubHost};
+    use frost_inspector::{snapshot_from_json, DOM_WALK_SCRIPT};
     use url::Url;
 
     use crate::file_browser;
     use crate::keymap::{map_button, map_code, map_key_with_text, map_location, map_modifiers};
-    use crate::server::{InternalServer, Shared};
+    use crate::server::{InspectorSnapshot, InternalServer, Shared};
     use crate::settings::{ChromeColors, Settings as FrostSettings};
 
     /// Chrome geometry, fixed by construction (see the module docs).
@@ -104,10 +108,10 @@ mod app {
     const TITLEBAR_HEIGHT: f32 = 40.0;
     const TOOLBAR_HEIGHT: f32 = 48.0;
     const STATUS_HEIGHT: f32 = 28.0;
-    /// Height of the hamburger menu (4 entries). Round 2 used 136 and
-    /// the 4th entry (Exit) was clipped ~4 px at the bottom edge; 148
-    /// fits all four fully.
-    const MENU_HEIGHT: f32 = 148.0;
+    /// Height of the hamburger menu (5 entries since Round 5). Round 2
+    /// used 136 and the 4th entry (Exit) was clipped ~4 px at the
+    /// bottom edge; 148 fits four fully, 185 fits five.
+    const MENU_HEIGHT: f32 = 185.0;
     const INITIAL_WINDOW: (f32, f32) = (1280.0, 800.0);
     const HOME_URL: &str = "https://example.org";
     /// Engine pump rate. The tick spins Servo, drains its events, and
@@ -129,6 +133,7 @@ mod app {
         ToggleMenu,
         OpenSettings,
         OpenPrint,
+        OpenInspector,
         OpenFile,
         Exit,
         /// Titlebar window controls (real iced window commands).
@@ -199,6 +204,23 @@ mod app {
         /// A print preview capture is in flight; the status line says
         /// so until the bytes arrive.
         print_shot_pending: bool,
+        /// An inspector DOM capture is in flight (Round 5): the channel
+        /// the walker JSON arrives on, polled by the Tick. Set by
+        /// `open_inspector`; cleared when the JSON arrives (or the
+        /// capture errors) and frost://inspector opens.
+        inspector_shot_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+        /// An inspector capture is in flight; the status line says so
+        /// until the snapshot arrives.
+        inspector_shot_pending: bool,
+        /// The display URL the in-flight inspector capture is for
+        /// (shown in the snapshot header once it arrives).
+        inspector_capture_url: Option<String>,
+        /// A re-capture was requested from the inspector page (Round 5):
+        /// once the inspected page (this URL) loads again, capture it.
+        /// Set by the Tick when it sees the server's
+        /// `inspector_recapture_requested` flag; cleared when the
+        /// capture starts.
+        pending_inspector_capture: Option<String>,
         /// Current settings (theme, homepage, search engine, exit
         /// confirmation). Loaded at startup; the Tick polls the shared
         /// version for changes made through the settings page.
@@ -315,42 +337,6 @@ mod app {
                     if display == "frost://exit/confirm" {
                         std::process::exit(0);
                     }
-                    // F-003: the print page's "Save as PNG" link lands
-                    // here — write the captured preview to ~/Downloads
-                    // and re-open frost://print, which shows the path.
-                    if display == "frost://print/save" {
-                        let bytes = self
-                            .server
-                            .shared
-                            .lock()
-                            .ok()
-                            .and_then(|shared| shared.print_preview_png.clone());
-                        if let Some(bytes) = bytes {
-                            let secs = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            let dir = std::env::var_os("HOME")
-                                .map(|h| std::path::PathBuf::from(h).join("Downloads"))
-                                .unwrap_or_else(|| std::path::PathBuf::from("Downloads"));
-                            let path = dir.join(format!("frost-print-{secs}.png"));
-                            let result = std::fs::write(&path, &bytes);
-                            if let Ok(mut shared) = self.server.shared.lock() {
-                                match result {
-                                    Ok(()) => {
-                                        shared.print_saved_path =
-                                            Some(path.display().to_string());
-                                    },
-                                    Err(e) => {
-                                        shared.print_preview_error = Some(format!(
-                                            "Could not save the PNG: {e}"
-                                        ));
-                                    },
-                                }
-                            }
-                        }
-                        self.open_internal("frost://print");
-                    }
                     // Track the live page for the print/exit pages.
                     if let Ok(mut shared) = self.server.shared.lock() {
                         shared.current_page_url = display.clone();
@@ -359,13 +345,20 @@ mod app {
                         }
                     }
                     // A folder click in the file browser navigates to
-                    // `frost://open?path=...` (or the loopback form) —
-                    // re-list that folder instead of leaving the engine
-                    // on an unloadable URL. Guarded by last_open_path
-                    // so one navigation is intercepted exactly once.
-                    if let Some(path) = file_browser::parse_open_url(&url) {
-                        if self.last_open_path.as_ref() != Some(&path) {
-                            self.open_file_browser(&path);
+                    // `frost://open?path=...` — but only the `frost://`
+                    // form needs intercepting: the engine cannot load
+                    // the `frost:` scheme, so the app translates it to
+                    // the loopback form. The loopback `/open` form
+                    // loads fine on its own (Round 5 wart fix:
+                    // re-loading it duplicated the history entry, so
+                    // Back across folder clicks stayed on the same
+                    // folder). Guarded by last_open_path so one
+                    // navigation is intercepted exactly once.
+                    if file_browser::needs_open_intercept(&url) {
+                        if let Some(path) = file_browser::parse_open_url(&url) {
+                            if self.last_open_path.as_ref() != Some(&path) {
+                                self.open_file_browser(&path);
+                            }
                         }
                     }
                 },
@@ -383,6 +376,10 @@ mod app {
                     self.address_editing = false;
                     self.status = self.title.clone().unwrap_or_else(|| "Done".to_string());
                     self.inject_content_scripts();
+                    // Round 5: a re-capture was requested from the
+                    // inspector page — capture this page now that it
+                    // loaded, if it is the page asked for.
+                    self.maybe_capture_inspector();
                     // Round 4, F-007: no post-load jiggle any more — the
                     // fork uses full present, so the first paint after
                     // LoadFinished is complete as-is.
@@ -470,7 +467,16 @@ mod app {
                     repeat,
                     ..
                 }) => {
-                    if self.content_focused {
+                    // Round 5: F12 opens the Inspector — a browser
+                    // shortcut, not a page key. Checked before the
+                    // content-focus gate, so it works from the address
+                    // bar too; repeats are ignored (one capture per
+                    // press). The key never reaches the page.
+                    if !repeat
+                        && matches!(key, keyboard::Key::Named(keyboard::key::Named::F12))
+                    {
+                        self.open_inspector();
+                    } else if self.content_focused {
                         self.send_key(
                             FrostKeyState::Down,
                             &key,
@@ -585,6 +591,56 @@ mod app {
                 .unwrap_or(loopback.clone());
             self.load_loopback(&loopback, &display);
             self.status = format!("Files: {}", path.display());
+        }
+
+        /// Open the inspector for the current page (Round 5): capture
+        /// the page's DOM first — navigating to frost://inspector
+        /// would replace the page being inspected, so the snapshot is
+        /// taken BEFORE the navigation, and the inspector page renders
+        /// that snapshot (labeled with its URL and capture time). The
+        /// inspector opens from the Tick once the walker JSON arrives
+        /// (or the capture errors, and the page stays put).
+        fn open_inspector(&mut self) {
+            if self.inspector_shot_pending {
+                return;
+            }
+            let Some(current) = self.webview.url().map(|u| u.to_string()) else {
+                self.status = "Inspector: no page loaded yet.".to_string();
+                return;
+            };
+            let display = crate::server::loopback_url_to_frost(&current, &self.server.base_url)
+                .unwrap_or(current);
+            if display == "frost://inspector" {
+                return; // Already looking at the inspector.
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.webview
+                .evaluate_javascript_string(DOM_WALK_SCRIPT, tx);
+            self.inspector_shot_rx = Some(rx);
+            self.inspector_shot_pending = true;
+            self.inspector_capture_url = Some(display);
+            self.status = "Capturing page structure…".to_string();
+        }
+
+        /// Run a pending inspector re-capture, if the page that just
+        /// loaded is the one asked for (Round 5). The flag is cleared
+        /// either way: a capture for a different URL is dropped, not
+        /// queued — the snapshot header always names the page it
+        /// actually captured.
+        fn maybe_capture_inspector(&mut self) {
+            let Some(expected) = self.pending_inspector_capture.take() else {
+                return;
+            };
+            let current = self
+                .webview
+                .url()
+                .map(|u| u.to_string())
+                .unwrap_or_default();
+            let display = crate::server::loopback_url_to_frost(&current, &self.server.base_url)
+                .unwrap_or(current);
+            if display == expected {
+                self.open_inspector();
+            }
         }
 
         /// Inject the content scripts that match the current page URL.
@@ -704,6 +760,10 @@ mod app {
                     loading_since: Some(std::time::Instant::now()),
                     print_shot_rx: None,
                     print_shot_pending: false,
+                    inspector_shot_rx: None,
+                    inspector_shot_pending: false,
+                    inspector_capture_url: None,
+                    pending_inspector_capture: None,
                     settings,
                     settings_version: 0,
                     server,
@@ -736,13 +796,30 @@ mod app {
                     // Settings changed through the settings page (the
                     // server bumps the shared version): apply them.
                     // Theme and search engine apply live; the homepage
-                    // applies on next launch (the page says so).
-                    let (new_settings, new_version) = {
+                    // applies on next launch (the page says so). The
+                    // same lock read also picks up an inspector
+                    // re-capture request (Round 5): the flag is cleared
+                    // here, and the URL to capture is remembered until
+                    // that page loads again.
+                    let (new_settings, new_version, recapture_url) = {
                         match self.server.shared.lock() {
-                            Ok(shared) => {
-                                (shared.settings.clone(), shared.settings_version)
+                            Ok(mut shared) => {
+                                let recapture_url = if shared.inspector_recapture_requested {
+                                    shared.inspector_recapture_requested = false;
+                                    shared
+                                        .inspector_snapshot
+                                        .as_ref()
+                                        .map(|snap| snap.url.clone())
+                                } else {
+                                    None
+                                };
+                                (shared.settings.clone(), shared.settings_version, recapture_url)
                             },
-                            Err(e) => (e.into_inner().settings.clone(), self.settings_version),
+                            Err(e) => (
+                                e.into_inner().settings.clone(),
+                                self.settings_version,
+                                None,
+                            ),
                         }
                     };
                     if new_version != self.settings_version {
@@ -753,24 +830,29 @@ mod app {
                             self.webview.set_theme(self.settings.theme.is_dark());
                         }
                     }
+                    if let Some(url) = recapture_url {
+                        self.pending_inspector_capture = Some(url);
+                    }
                     // Poll the webview URL for a frost://open folder
                     // navigation: if the engine did not emit a
                     // UrlChanged event for it (an unknown-scheme load may
                     // not produce one), the poll still catches it and
                     // re-lists the folder. Guarded by last_open_path so
                     // one navigation is intercepted exactly once; cleared
-                    // whenever the webview is on a non-frost://open URL,
-                    // so going Back onto a frost://open URL re-lists it
-                    // instead of showing the engine's error page.
+                    // whenever the webview is on a non-open URL, so going
+                    // Back onto a frost://open URL re-lists it instead
+                    // of showing the engine's error page. Only the
+                    // frost:// form is intercepted (Round 5 wart fix):
+                    // the loopback /open form loads fine on its own.
                     if let Some(url) = self.webview.url() {
-                        match file_browser::parse_open_url(&url) {
-                            Some(path)
-                                if self.last_open_path.as_ref() != Some(&path) =>
-                            {
-                                self.open_file_browser(&path);
-                            },
-                            None => self.last_open_path = None,
-                            _ => {},
+                        if file_browser::needs_open_intercept(&url) {
+                            if let Some(path) = file_browser::parse_open_url(&url) {
+                                if self.last_open_path.as_ref() != Some(&path) {
+                                    self.open_file_browser(&path);
+                                }
+                            }
+                        } else if file_browser::parse_open_url(&url).is_none() {
+                            self.last_open_path = None;
                         }
                     }
                     // Safety net: a page that never fires LoadFinished
@@ -792,6 +874,10 @@ mod app {
                                 // The traversal's page still gets its
                                 // content scripts (no LoadFinished fired).
                                 self.inject_content_scripts();
+                                // Round 5: a re-capture was requested
+                                // and this traversal is the inspected
+                                // page loading again — capture it.
+                                self.maybe_capture_inspector();
                             }
                         }
                     }
@@ -830,6 +916,40 @@ mod app {
                                 }
                             }
                             self.open_internal("frost://print");
+                        }
+                    }
+                    // Round 5 inspector: the walker JSON arrives on
+                    // this channel once the script runs in the page.
+                    // Parse it, store it, and only then open
+                    // frost://inspector, so the page shows the tree at
+                    // once. A failed capture leaves the current page
+                    // up and says so in the status line.
+                    if let Some(rx) = &self.inspector_shot_rx {
+                        if let Ok(result) = rx.try_recv() {
+                            self.inspector_shot_rx = None;
+                            self.inspector_shot_pending = false;
+                            let url =
+                                self.inspector_capture_url.take().unwrap_or_default();
+                            let parsed = result.and_then(|json| {
+                                snapshot_from_json(&json).map(|snap| (json, snap))
+                            });
+                            match parsed {
+                                Ok((json, snap)) => {
+                                    if let Ok(mut shared) = self.server.shared.lock() {
+                                        shared.inspector_snapshot = Some(InspectorSnapshot {
+                                            url,
+                                            captured_at_ms: snap.captured_at_unix_ms,
+                                            node_count: snap.node_count,
+                                            truncated: snap.truncated,
+                                            json,
+                                        });
+                                    }
+                                    self.open_internal("frost://inspector");
+                                },
+                                Err(e) => {
+                                    self.status = format!("Inspector failed: {e}");
+                                },
+                            }
                         }
                     }
                     // Keep the OS window title in step with the titlebar.
@@ -945,8 +1065,21 @@ mod app {
                     if let Ok(mut shared) = self.server.shared.lock() {
                         shared.print_preview_label =
                             format!("Preview of {}", self.address);
+                        // Freeze the printed page's identity here too:
+                        // by the time /print re-renders after a Save,
+                        // the live current page is frost://print.
+                        shared.print_page_title =
+                            self.title.clone().unwrap_or_default();
+                        shared.print_page_url = self.address.clone();
                         shared.print_saved_path = None;
                     }
+                    Task::none()
+                },
+                Message::OpenInspector => {
+                    // Round 5: capture the current page's DOM, then
+                    // open frost://inspector on the snapshot (see
+                    // open_inspector).
+                    self.open_inspector();
                     Task::none()
                 },
                 Message::OpenFile => {
@@ -1095,6 +1228,7 @@ mod app {
                     widget::column::with_children(vec![
                         button::text("Settings").on_press(Message::OpenSettings).into(),
                         button::text("Print page…").on_press(Message::OpenPrint).into(),
+                        button::text("Inspector").on_press(Message::OpenInspector).into(),
                         button::text("Open file…").on_press(Message::OpenFile).into(),
                         button::text("Exit").on_press(Message::Exit).into(),
                     ])

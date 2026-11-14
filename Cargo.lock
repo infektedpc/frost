@@ -3194,6 +3194,7 @@ version = "0.1.0"
 dependencies = [
  "frost-engine",
  "frost-extensions",
+ "frost-inspector",
  "libcosmic",
  "pulldown-cmark",
  "serde",

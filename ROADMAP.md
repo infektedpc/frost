@@ -127,12 +127,33 @@ No new features — this round finishes what Round 3 left open:
   aborts a hanging load; settings, file browser, menu, back/forward
   still work.
 
-## Round 5 — Inspector v1
+## Round 5 — Inspector v1 (DONE 2026-11-14)
 
-- Fork patch F-002: constellation DOM snapshot hook.
-- `frost://inspect`: DOM tree, computed style, box model, element picker
-  with highlight overlay.
-- Gate: inspect example.org, pick an element, see its real style + box.
+- **Script-injection path, NOT fork patch F-002.** The fork's
+  `WebView::evaluate_javascript` already returns values, so a DOM
+  walker script (`crates/frost-inspector/src/walk.js`) serializes the
+  live DOM to JSON and the app parses it. F-002 is closed as not
+  needed; a devtools server is a multi-round job, not v1.
+- `frost://inspector`: snapshot model (capture the DOM first, then
+  open the inspector page — Frost has one webview, so navigating to
+  the inspector would replace the inspected page). Expandable tree,
+  click a node for attributes/text/computed style/box, "Back to the
+  page" + "Re-capture" links, snapshot URL + time + node count in the
+  header, honest "No page inspected yet" state. Menu entry + F12.
+  Click-to-inspect from the live page is v2 (needs a docked panel),
+  not faked in v1.
+- Wart fixes in the same round: file-browser history (only the
+  `frost://open` form is intercepted now), print save creates
+  `~/Downloads` first and is a real `/print/save` server route
+  (no more "Not found" flash after Save).
+- Gate: inspect example.org, see the real current DOM (`html > head
+  (meta, link, meta, title, style) > body (div#frost-sample-banner,
+  style, svg, p ×5)`, 35 nodes — the live page has no `<h1>` anymore),
+  click a node for its details; folder clicks then Back/Forward move
+  correctly; print Save works with `~/Downloads` deleted first and
+  never flashes "Not found"; settings, banner, back/forward, menu
+  still work. Tests 49/49 green (frost 29, engine 4, extensions 8,
+  inspector 8).
 
 ## Later rounds (in rough order)
 
@@ -203,7 +224,7 @@ changes. Frostbite freezes the workspace you leave.
 | Gap | Frost answer |
 |---|---|
 | No WebExtensions API | We build our own host (`frost-extensions`); manifest is close to WebExtensions so authors can port with small edits. |
-| No HTML inspector | We build our own (`frost-inspector` + fork patch F-002). |
+| No HTML inspector | We built our own (`frost-inspector` walker script + `frost://inspector` snapshot page, Round 5 — no fork patch; F-002 closed as not needed). Click-to-inspect is v2. |
 | Limited print support | Fork patch F-003 or paginated-image export from the render path. |
 | No PDF viewer | Later round: render PDFs via the engine (pdf.js-style, Servo-rendered) or a native viewer page. |
 | No spellcheck | Fork patch F-004 or a pure-Rust spellcheck in the UI layer. |

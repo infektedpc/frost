@@ -31,10 +31,10 @@ use std::sync::{mpsc, Arc};
 use dpi::PhysicalSize;
 use servo::{
     Code, DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePoint, EventLoopWaker, InputEvent,
-    Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, PrefValue, RenderingContext,
-    Servo, ServoBuilder, SoftwareRenderingContext, Theme, WebView, WebViewBuilder,
-    WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
+    JSValue, JavaScriptEvaluationError, Key, KeyState, KeyboardEvent, LoadStatus, Location,
+    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, PrefValue,
+    RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext, Theme, WebView,
+    WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 
@@ -374,6 +374,24 @@ impl FrostWebView {
         self.inner.evaluate_javascript(script.to_string(), |_| {});
     }
 
+    /// Evaluate a JavaScript snippet and deliver its return value as a
+    /// string (Round 5: the inspector walker returns a JSON string).
+    /// Async like [`FrostWebView::request_screenshot_png`]: the result
+    /// arrives on the caller's channel, polled by the app's Tick. The
+    /// callback runs on the app thread — Servo delivers
+    /// `FinishJavaScriptEvaluation` while `Engine::spin` pumps the
+    /// event loop — so sending into the channel from it is safe. A
+    /// non-string return value is an error, never a silent empty result.
+    pub fn evaluate_javascript_string(
+        &self,
+        script: &str,
+        tx: std::sync::mpsc::Sender<Result<String, String>>,
+    ) {
+        self.inner.evaluate_javascript(script.to_string(), move |result| {
+            let _ = tx.send(js_string_result(result));
+        });
+    }
+
     /// Capture the current page as PNG bytes (Round 4, F-003 print
     /// preview). Servo 0.8.0 has no print pipeline — no `WebView::print`,
     /// no PDF path, only debug tree dumps — so a screenshot of the
@@ -487,6 +505,20 @@ impl FrostWebView {
     }
 }
 
+/// Convert a script-evaluation result into the string the caller asked
+/// for (Round 5). Pure, so it is unit-tested here: the inspector walker
+/// returns a JSON string, so any other value — a number, an object, a
+/// script error — is an error, never a silent empty tree.
+pub fn js_string_result(
+    result: Result<JSValue, JavaScriptEvaluationError>,
+) -> Result<String, String> {
+    match result {
+        Ok(JSValue::String(s)) => Ok(s),
+        Ok(other) => Err(format!("script returned a non-string value: {other:?}")),
+        Err(e) => Err(format!("script evaluation failed: {e:?}")),
+    }
+}
+
 /// Build a `data:` URL for a small placeholder page (Round 2 menu entries:
 /// Settings / Print / Open load these through the engine until the real
 /// `frost://` internal pages land in Round 3). The HTML is percent-encoded
@@ -556,6 +588,18 @@ mod tests {
             }
         }
         assert!(decoded.contains("<p>hello world</p>"));
+    }
+
+    #[test]
+    fn js_string_result_keeps_strings_and_rejects_the_rest() {
+        assert_eq!(
+            js_string_result(Ok(JSValue::String("{\"a\":1}".to_string()))).unwrap(),
+            "{\"a\":1}"
+        );
+        assert!(js_string_result(Ok(JSValue::Number(42.0))).is_err());
+        assert!(js_string_result(Ok(JSValue::Undefined)).is_err());
+        assert!(js_string_result(Err(JavaScriptEvaluationError::DocumentNotFound)).is_err());
+        assert!(js_string_result(Err(JavaScriptEvaluationError::CompilationFailure)).is_err());
     }
 
     #[test]

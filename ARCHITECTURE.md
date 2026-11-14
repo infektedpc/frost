@@ -7,7 +7,7 @@
 | `frost` | libcosmic app: window, toolbar, address bar, hamburger menu, titlebar (Round 2); tab strip later | `frost-engine`, `libcosmic` (optional, git) |
 | `frost-engine` | Servo embedding: engine, webview per tab, event pump, frame readback | fork `servo/components/servo` (path dep) |
 | `frost-extensions` | Extension host: manifests, content scripts, `frost.*` bridge trait, stub host | `serde`, `serde_json`, `url` |
-| `frost-inspector` | Inspector: DOM snapshot types, picker state, `Inspector` trait, stub | `serde`, `serde_json` |
+| `frost-inspector` | Inspector: DOM snapshot types, walker script (`walk.js`), `snapshot_from_json`, `DOM_WALK_SCRIPT` | `serde`, `serde_json` |
 
 Rules:
 
@@ -201,7 +201,7 @@ loads it like any other URL.
 | `frost://print` | Print page: a real preview of the current page (viewport screenshot) + "Save as PNG" to ~/Downloads; says plainly it is not paginated print layout (Servo 0.8.0 has no print pipeline — F-003) | 4 |
 | `frost://open` | Open a local file (file picker page, then the file renders in a tab) | 2 — working now (see below); the Round 3 loopback server takes over serving it |
 | `frost://exit` | Confirm-exit page (with "don't ask again") | 3 |
-| `frost://inspect` | The HTML inspector (DOM tree, computed style, box model, picker) | 5 (needs fork patch F-002 for the DOM snapshot hook) |
+| `frost://inspector` | The HTML inspector (DOM tree, computed style, box model; snapshot model — see Inspector section) | 5 (no fork patch — script-injection via `evaluate_javascript`) |
 | `frost://extensions` | Extension list, permissions, enable/disable | 3 |
 
 `frost://` URLs are intercepted by the engine before the network stack
@@ -245,14 +245,46 @@ without restructuring:
 
 ## Inspector
 
-`frost-inspector` defines the snapshot contract now:
+`frost-inspector` defines the snapshot contract, and Round 5 fills it
+in — with a walker script, NOT a fork patch (F-002 is not needed; see
+FORK.md):
 
 - `DomSnapshot`: an owned tree (`DomNode` with tag, attributes, computed
   style, box model) — no live handles into Servo, so it serializes cleanly
-  to the `frost://inspect` page.
-- `Inspector::inspect(url) -> DomSnapshot` and the element picker
-  (`pick_element` maps a viewport point to the deepest node id).
-- The real implementation needs fork patch F-002 (a constellation request
-  that serializes a DOM subtree), because Servo exposes no DOM snapshot
-  API today. The stub returns an empty document so the UI can be built
-  against the trait now.
+  to the `frost://inspector` page. `DomNode` fields match the walker's
+  JSON exactly (`node_id, tag, attributes, text, children,
+  computed_style, box_model`); `snapshot_from_json` parses and validates
+  it (root must be `#document`).
+- The walker (`crates/frost-inspector/src/walk.js`, included into the
+  crate with `include_str!` as `DOM_WALK_SCRIPT`) is an IIFE that walks
+  the live DOM and returns `JSON.stringify({url, capturedAt, truncated,
+  nodeCount, root})`. Caps: 8000 nodes, 64 deep, text 200 chars, attr
+  values 256 chars; skips whitespace-only text nodes and comments;
+  includes `getComputedStyle` (color, background, font, display,
+  position, width, height) and `getBoundingClientRect` + margin/padding/
+  border. Node 0 is `#document`; element ids count from 1.
+- The engine ferries the string: `FrostWebView::evaluate_javascript_string`
+  wraps the fork's `WebView::evaluate_javascript(script, callback)` —
+  the callback receives `Result<JSValue, JavaScriptEvaluationError>` on
+  the app thread during `spin_event_loop`, so the same mpsc-channel
+  pattern as `request_screenshot_png` works. Only `JSValue::String` is
+  accepted back (a pure `js_string_result` helper, unit-tested).
+- **Snapshot model (the single-webview answer).** Frost has one webview,
+  so navigating to `frost://inspector` would replace the page being
+  inspected. The menu entry / F12 captures the DOM FIRST (walker runs
+  in the current page), stores the snapshot in the loopback server's
+  shared state, and only then opens `frost://inspector`, which fetches
+  `/inspector/snapshot.json` and renders the tree. The page is labeled
+  "Snapshot of <url>, captured <time>, N nodes — not a live view", with
+  "Back to the page" and "Re-capture" links; "Re-capture" sets a flag
+  and 303s back to the inspected page, and the app captures again once
+  it loads. Opening `frost://inspector` with no snapshot shows an honest
+  "No page inspected yet" page. A failed capture leaves the current
+  page up and reports in the status line.
+- The inspector page renders the tree with JS +/− toggles (not
+  `<details>` — the toggle is Frost's own code); clicking a node fills
+  the details pane (tag, full attributes, text, computed style, box).
+- What v1 does NOT do: no live editing, no live updates, no
+  click-to-inspect from the page (that needs a docked panel inside the
+  live page — v2), no console, no network panel, no shadow DOM / iframe
+  sub-documents / comments.
