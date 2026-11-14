@@ -29,7 +29,10 @@ servo = { path = "../../servo/components/servo", default-features = false, featu
 dpi = "0.1"
 keyboard-types = "0.8"
 url = "2"
+# Round 4 (F-003): print preview encodes the screenshot as PNG.
+png = "0.17"
 
 [dev-dependencies]
-# The smoke example writes a PNG screenshot.
+# The smoke example writes a PNG screenshot (same crate, kept here too
+# so the example builds without the main dependencies).
 png = "0.17"

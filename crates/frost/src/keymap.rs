@@ -587,7 +587,26 @@ pub fn map_key(key: &IcedKey) -> FrostKey {
 /// Prefer `text` for printable (`Character`) keys only. Named keys keep
 /// their logical key: `text` for Enter is `"\r"`, which Servo must not
 /// see as typed text (form submission and shortcuts need the named key).
-pub fn map_key_with_text(key: &IcedKey, text: Option<&str>) -> FrostKey {
+///
+/// Round 4: never prefer `text` while Control or Meta (Super/Logo) is
+/// held — those are shortcut chords, not text. Winit reports the
+/// produced text for Ctrl+A as `"\x01"` (the control character), and
+/// preferring it sent `Character("\x01")` to Servo, whose shortcut
+/// matcher compares against `'A'` and never matches — so Ctrl+A
+/// select-all silently did nothing (gate 2026-11-14: the page saw
+/// keydown `U+1+ctrl`, keyup `a+ctrl`, selection stayed `5..5`). With
+/// a shortcut modifier held the logical key IS the shortcut key, so
+/// `map_key` (the logical key) is used instead. Alt alone is left
+/// alone: AltGr text entry on non-US layouts goes through Alt, and
+/// Ctrl+Alt chords already include Control.
+pub fn map_key_with_text(
+    key: &IcedKey,
+    text: Option<&str>,
+    modifiers: IcedModifiers,
+) -> FrostKey {
+    if modifiers.control() || modifiers.logo() {
+        return map_key(key);
+    }
     match (key, text) {
         (IcedKey::Character(_), Some(t)) if !t.is_empty() => {
             FrostKey::Character(t.to_string())
@@ -620,7 +639,7 @@ mod tests {
         // Shift+; on X11: logical key ";" but produced text ":".
         let key = IcedKey::Character(";".into());
         assert_eq!(
-            map_key_with_text(&key, Some(":")),
+            map_key_with_text(&key, Some(":"), IcedModifiers::SHIFT),
             FrostKey::Character(":".to_string())
         );
     }
@@ -629,7 +648,7 @@ mod tests {
     fn unshifted_character_keeps_text() {
         let key = IcedKey::Character("a".into());
         assert_eq!(
-            map_key_with_text(&key, Some("a")),
+            map_key_with_text(&key, Some("a"), IcedModifiers::empty()),
             FrostKey::Character("a".to_string())
         );
     }
@@ -639,7 +658,7 @@ mod tests {
         // Enter's text is "\r" — it must stay the named key.
         let key = IcedKey::Named(IcedNamedKey::Enter);
         assert_eq!(
-            map_key_with_text(&key, Some("\r")),
+            map_key_with_text(&key, Some("\r"), IcedModifiers::empty()),
             FrostKey::Named(FrostNamedKey::Enter)
         );
     }
@@ -648,7 +667,42 @@ mod tests {
     fn no_text_falls_back_to_logical_key() {
         let key = IcedKey::Character(";".into());
         assert_eq!(
-            map_key_with_text(&key, None),
+            map_key_with_text(&key, None, IcedModifiers::empty()),
+            FrostKey::Character(";".to_string())
+        );
+    }
+
+    #[test]
+    fn control_chord_ignores_control_character_text() {
+        // Ctrl+A on X11: logical key "a" but produced text "\x01".
+        // Servo's shortcut matcher compares against 'A'; sending
+        // "\x01" meant select-all never fired (Round 4 gate).
+        let key = IcedKey::Character("a".into());
+        assert_eq!(
+            map_key_with_text(&key, Some("\x01"), IcedModifiers::CTRL),
+            FrostKey::Character("a".to_string())
+        );
+    }
+
+    #[test]
+    fn meta_chord_ignores_text() {
+        let key = IcedKey::Character("a".into());
+        assert_eq!(
+            map_key_with_text(&key, Some("\x01"), IcedModifiers::LOGO),
+            FrostKey::Character("a".to_string())
+        );
+    }
+
+    #[test]
+    fn control_shift_chord_ignores_text() {
+        // Ctrl+Shift+; is a shortcut chord, not a ":" keystroke.
+        let key = IcedKey::Character(";".into());
+        assert_eq!(
+            map_key_with_text(
+                &key,
+                Some(":"),
+                IcedModifiers::CTRL | IcedModifiers::SHIFT
+            ),
             FrostKey::Character(";".to_string())
         );
     }

@@ -63,59 +63,129 @@ and load state.
    Wayland seat input (evdev keycodes) and does NOT apply here — Frost
    keys come from winit/libcosmic. Round 3 prefers the key event's
    produced text for page text input (typing works, proven by the
-   keytest and settings fields), but modifier chords do not reach the
+   keytest and settings fields), but modifier chords did not reach the
    page the same way: Ctrl+A select-all produced no selection in a
    page input under the harness, so typed text appended instead of
-   replacing. Unproven whether that is the produced-text path or a
-   harness artifact — a real keyboard is the verdict.
+   replacing. Round 4 found it in the app: iced/winit reports the
+   produced text for Ctrl+A as `"\x01"`, and `map_key_with_text`
+   preferred it, so Servo got `Key::Character("\x01")` and the
+   `ShortcutMatcher` (which compares against `'A'`) never matched —
+   the engine side is sound (`editing_action_from_keyboard_event`
+   maps Ctrl+A to `EditingAction::SelectAll` on keydown). The fix:
+   `map_key_with_text` takes the modifiers and returns the logical
+   key when CONTROL or META/LOGO is held — shortcut chords ignore
+   produced text. Gate (type "hello", Ctrl+A, type "X" → `val="X"`)
+   passes. Alt alone is left alone (AltGr text entry on non-US
+   layouts; Ctrl+Alt chords already include Control).
 
-### The partial first paint and the resize jiggle (Round 2, still the repair in Round 3)
+### The partial first paint and the resize jiggle (Round 2; root cause found and fixed in Round 4 as F-007)
 
-A load's first paint covers only a ~1024×512 region of a 1280×684
-frame, and no later paint repairs it — not a render after
-`LoadFinished`, not a reload. What repairs it is a real resize to a
+A load's first paint used to cover only a ~1024×512 region of a
+1280×684 frame, and no later paint repaired it — not a render after
+`LoadFinished`, not a reload. What repaired it was a real resize to a
 different size (maximizing, restoring, even a 1 px window resize all
-paint fully, and the repair persists). So after every `LoadFinished`
-(or `LoadStopped`) the app forces a full repaint with a two-phase
+painted fully, and the repair persisted). So after every `LoadFinished`
+(or `LoadStopped`) the app forced a full repaint with a two-phase
 resize jiggle: resize 1 px wider, wait ~0.25 s, resize back to the
-content size, wait ~0.25 s, then upload. The waits are timed, not
+content size, wait ~0.25 s, then upload. The waits were timed, not
 `FrameReady`-driven — advancing on a `FrameReady` resized straight
 back on a stale (pre-resize) event, coalescing the two resizes into a
-net no-op. The intermediate size is never uploaded, so the user never
-sees it. This works around a damage/initialization gap in the engine
-(same family as the WayServo ghost finding that dirty rects
-under-report). History traversals (back/forward) restore from cache and
+net no-op. The intermediate size was never uploaded, so the user never
+saw it. History traversals (back/forward) restore from cache and
 never fire `LoadFinished` — the 15 s load-timeout safety net clears
 the stuck loading state instead.
 
 Round 3 tried to retire the jiggle with fork patch F-005
 (`WebView::refresh_viewport`: re-send the current viewport without
 resizing). The finish pass PROVED it insufficient: 2 of 3 first loads
-still painted partial and stayed partial for minutes. The mechanism:
-WebRender repaints fully every render (`buffer_age` 0), so the partial
-frame means the pipeline's *display list* is partial — and re-sending
-an unchanged viewport does not force layout to reflow that list.
-Only a real size change (the jiggle) or a fresh document load (which
-is why reloads paint fully) reflows it. F-005 stays in the fork as a
-harmless viewport re-send; the jiggle stays as the reliable repair. A
-fork patch that forces a reflow at an unchanged viewport is the real
-follow-up (FORK.md, candidate F-007).
+still painted partial and stayed partial for minutes.
 
-Standing counterexample (finish pass, 2026-11-13): a tiny
-instant-loading local HTML page (`file://…/keytest.html`, 529 B, a
-script focuses an input on load) never paints its body — not on load,
-not on reload. The page itself is alive (title known, input focusable,
-typed text lands in it), and interaction paints only the tiles it
-touches (typed `abc` appeared alone on a blank page). It painted fully
-exactly once, transiently, after a click. The same held across all
-three finish attempts. Real pages (network, loopback, file listings,
-Markdown) paint fully. The jiggle repairs loads whose display list is
-partial; this page's display list is complete but its first paint never
-reaches the back buffer — F-007 is the candidate fix.
+**Round 4 found the real mechanism (F-007) — and the Round 2/3
+theory was wrong.** The old theory said WebRender repaints fully
+every render (`buffer_age` 0), so a partial frame must mean a partial
+display list. Instrumented paint-thread logging (`frost-diag`
+`debug!` lines in the fork, 2026-11-14 — the display-list and
+root-wrapper lines are permanent; the per-frame dirty-rect logging
+was removed after the diagnosis) proved the opposite:
+
+- The pipeline's display lists arrive complete and on time: for the
+  keytest page, epoch 1 carried 2046 bytes at viewport 1280×684
+  (`first_reflow=true`), later epochs 34898→36474 bytes for a real
+  page; a forced in-page reflow grew the list to 2356 bytes. Layout
+  was also proven correct independently (the page's own script
+  reported `h1=1240x43.58@20,20`, viewport 1280×684).
+- The root wrapper's iframe rect is correct (1280×684).
+- WebRender renders the full frame exactly once after a new display
+  list, then reports only the dirty regions — e.g. a 70×18 px caret
+  rect `(7,86)-(77,104)` re-rendered every second, and a
+  `(0,0)-(1280,512)` rect after the forced reflow.
+
+The cause: the fork's damage-rects patch (WayServo Round 17) set
+WebRender's `max_partial_present_rects` to 1, enabling partial
+present — WebRender then repaints only dirty regions. That contract
+requires the embedder to keep its own full-frame backing buffers
+and composite the delta onto them (what WayServo does). Frost does
+not: its engine reads the GL back buffer wholesale every tick and
+uploads it as the frame, and `Painter::render` clears that buffer
+first. So the full scene is rendered once and lost; every later
+frame is white except the dirty regions. Slow pages mask this
+because their display lists keep arriving (network, JS) and keep
+re-rendering large regions after the jiggle; instant pages expose
+it, because their single full-frame render is swallowed by the
+jiggle's `FrameReady` suppression and never reaches the screen.
+
+**F-007 (Round 4, gated 2026-11-14):** the fork sets
+`max_partial_present_rects: 0` — full present, the upstream Servo
+default ("a full screen present occurs at the end of the frame").
+WebRender repaints the whole scene every frame, which is what Frost's
+read path needs. The jiggle is RETIRED: `start_repaint_jiggle`,
+`advance_repaint_jiggle`, and the `RepaintPhase` machinery are deleted
+from the app, and the Tick renders on `frame_dirty &&
+!awaiting_load`. Gate: the keytest page paints fully on load AND
+reload with no jiggle (screenshots `r4-11-keytest-fixed.jpg`,
+`r4-12-keytest-reload.jpg`). F-005 stays as a harmless viewport
+re-send. Tradeoff, stated plainly: full present is more paint work
+per frame under SwiftShader/llvmpipe than partial present — but
+partial present never actually saved Frost anything, since the engine
+reads the full framebuffer regardless.
+
+Standing repro, now FIXED (finish pass, 2026-11-13; F-007 is the fix,
+gated in Round 4): a tiny instant-loading local HTML page
+(`file://…/keytest.html`, 529 B, a script focuses an input on load)
+never painted its body — not on load, not on reload. The page itself
+was alive (title known, input focusable, typed text lands in it), and
+interaction painted only the tiles it touches (typed `abc` appeared
+alone on a blank page). It painted fully exactly once, transiently,
+after a click. Real pages (network, loopback, file listings,
+Markdown) painted fully. The jiggle repaired loads whose display list
+was partial; this page's display list was complete but its first paint
+never reached the back buffer — the partial-present mechanism above
+was the cause, and full present is the fix.
 
 Later rounds may switch the context to a GPU path (the dmabuf fork patch
 exists for exactly this), but the `render() -> Frame` contract does not
 change — the UI never sees how the pixels were produced.
+
+### The loading flag and Stop (Round 4, F-008 app-side)
+
+The Stop button (✕) is live only while `self.loading` is true, and
+`loading` used to be set only by the `LoadStarted` engine event.
+Servo reports `LoadStatus::Started` from
+`Document::set_document_readiness_to_loading_for_initialization` —
+which runs when a new Document is initialized, i.e. when the first
+response bytes arrive. A server that never responds at all therefore
+never fires `LoadStarted`: the app never learns a load is in flight,
+the Stop button stays dead, and the hang has no escape hatch. (The
+15 s safety net eventually clears `awaiting_load`, but it does not
+stop the load.) Since Round 4 the app sets `loading = true` at the
+moment a navigation is requested — address-bar submit, Back,
+Forward, Reload, and `load_loopback` — so Stop is live from the
+request, not the first response. `LoadStarted`/`LoadFinished`/
+`LoadStopped` and the 15 s net manage the flag consistently
+afterward. The fork side of F-008 (`handle_stop_msg` also draining
+pending session-history changes) is what makes the resulting Stop
+actually abort a stuck navigation; the app-side flag is what makes
+Stop reachable for one. See FORK.md.
 
 ## Internal pages
 
@@ -128,10 +198,10 @@ loads it like any other URL.
 | URL | Page | Round |
 |---|---|---|
 | `frost://settings` | Settings (theme, homepage, search engine, privacy) | 3 |
-| `frost://print` | Print page: names the page to print and says plainly that printing is not wired up yet | 3 (preview + print-to-PDF need fork patch F-003; Round 4–5) |
+| `frost://print` | Print page: a real preview of the current page (viewport screenshot) + "Save as PNG" to ~/Downloads; says plainly it is not paginated print layout (Servo 0.8.0 has no print pipeline — F-003) | 4 |
 | `frost://open` | Open a local file (file picker page, then the file renders in a tab) | 2 — working now (see below); the Round 3 loopback server takes over serving it |
 | `frost://exit` | Confirm-exit page (with "don't ask again") | 3 |
-| `frost://inspect` | The HTML inspector (DOM tree, computed style, box model, picker) | 4 (needs fork patch F-002 for the DOM snapshot hook) |
+| `frost://inspect` | The HTML inspector (DOM tree, computed style, box model, picker) | 5 (needs fork patch F-002 for the DOM snapshot hook) |
 | `frost://extensions` | Extension list, permissions, enable/disable | 3 |
 
 `frost://` URLs are intercepted by the engine before the network stack
@@ -150,10 +220,12 @@ event for an unknown-scheme load — and re-lists the folder. File links
 are plain `file://` URLs, which Servo loads natively, so clicking a
 file opens it in the browser. Settings and Print were placeholder
 `data:` pages in Round 2; the Round 3 server serves them for real now
-(`frost://settings`, `frost://print`). Print is still an honest
-placeholder in content — it names the page and says printing is not
-wired up yet (F-003, planned) — there is no print preview or printer
-output in this build.
+(`frost://settings`, `frost://print`). Print is a real preview in
+Round 4 (F-003): the app captures the current page as a PNG before
+opening the page, the server serves it as `/print/preview.png`, and
+"Save as PNG" writes it to ~/Downloads. It says plainly it is a
+viewport screenshot, not paginated print layout — Servo 0.8.0 has no
+print pipeline, so there is no print-to-PDF or printer output.
 
 ## Extensions
 

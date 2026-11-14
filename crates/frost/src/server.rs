@@ -45,6 +45,16 @@ pub struct Shared {
     pub extensions: Vec<(String, String, bool)>,
     /// (directory, error) for every extension directory that failed.
     pub failed_extensions: Vec<(String, String)>,
+    /// Round 4, F-003: the print preview — PNG bytes of the current
+    /// page's viewport, captured by the app before frost://print
+    /// opens. Served as /print/preview.png.
+    pub print_preview_png: Option<Vec<u8>>,
+    /// Label for the preview (which page it is a preview of).
+    pub print_preview_label: String,
+    /// The last print-preview capture error, if it failed.
+    pub print_preview_error: Option<String>,
+    /// Where the preview PNG was last saved (~/Downloads), if saved.
+    pub print_saved_path: Option<String>,
 }
 
 impl Shared {
@@ -58,6 +68,10 @@ impl Shared {
             last_external_url: None,
             extensions: Vec::new(),
             failed_extensions: Vec::new(),
+            print_preview_png: None,
+            print_preview_label: String::new(),
+            print_preview_error: None,
+            print_saved_path: None,
         }
     }
 }
@@ -120,6 +134,32 @@ fn handle_connection(mut stream: TcpStream, shared: &Arc<Mutex<Shared>>, setting
     let mut parts = request_line.split_whitespace();
     let _method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
+    // F-003: the print preview is binary PNG, not HTML — serve it
+    // here, before the HTML-only dispatcher. (The route never reaches
+    // `handle_request`, which returns String bodies.)
+    if parse_target(target).0 == "/print/preview.png" {
+        let bytes = shared.lock().ok().and_then(|s| s.print_preview_png.clone());
+        match bytes {
+            Some(bytes) => {
+                let response = format!(
+                    "HTTP/1.1 200\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&bytes);
+            },
+            None => {
+                let body = "no print preview captured";
+                let response = format!(
+                    "HTTP/1.1 404\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            },
+        }
+        return;
+    }
     let (status, body, location) = {
         let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
         handle_request(target, &mut shared, settings_path)
@@ -399,13 +439,48 @@ fn print_page(shared: &Shared) -> String {
     } else {
         shared.current_page_title.clone()
     };
+    // F-003 (Round 4): a real print preview — a screenshot of the
+    // page's current viewport, served as /print/preview.png. Servo
+    // 0.8.0 has no print pipeline (no paginated print layout, no
+    // print-to-PDF), so this is a viewport screenshot, not a print
+    // layout: what you see is the page as it appears on screen, and
+    // "Save as PNG" writes that image to ~/Downloads for printing
+    // from any viewer. The page says so plainly.
+    let preview = if let Some(error) = &shared.print_preview_error {
+        format!(
+            "<p><b>Preview failed:</b> {}</p>",
+            file_browser::html_escape(error),
+        )
+    } else if shared.print_preview_png.is_some() {
+        let saved = match &shared.print_saved_path {
+            Some(path) => format!(
+                "<p>Saved to <b>{}</b></p>",
+                file_browser::html_escape(path),
+            ),
+            None => String::new(),
+        };
+        format!(
+            "<p>{}</p>\
+             <p><img src=\"/print/preview.png\" alt=\"Print preview\" \
+             style=\"max-width:100%;border:1px solid #555\"></p>\
+             <p><a href=\"/print/save\">Save as PNG</a> \
+             (writes the preview to ~/Downloads)</p>{saved}",
+            file_browser::html_escape(&shared.print_preview_label),
+        )
+    } else {
+        "<p>Capturing the preview… (if this stays, the capture failed — \
+         try Print page again.)</p>"
+            .to_string()
+    };
     let body = format!(
         "<h1>Print page</h1>\
          <p>Page: <b>{}</b></p>\
          <p class=\"muted\">{}</p>\
-         <p>Printing is not wired up yet (fork patch F-003, planned). \
-         There is no print preview or printer output in this build — \
-         this page only names the page you asked to print.</p>\
+         {preview}\
+         <p>This is a screenshot of the page as it appears on screen, \
+         not a paginated print layout — Servo 0.8.0 has no print \
+         pipeline, so there is no print-to-PDF or printer output. \
+         Save the PNG and print it from any image viewer.</p>\
          <p><a href=\"{}\">Back to the page</a></p>",
         file_browser::html_escape(&title),
         file_browser::html_escape(&shared.current_page_url),

@@ -33,11 +33,15 @@
 //!   hidden — it renders the title but no window-control buttons on this
 //!   setup): "Frost — <page title>" with real minimize, maximize/restore,
 //!   and close buttons (text glyphs, real iced window commands).
-//! * The Round 2 resize "jiggle" is the full-repaint repair after a
-//!   load: fork patch F-005 (`WebView::refresh_viewport`) was tried in
-//!   Round 3 and proved insufficient on its own (an unchanged viewport
-//!   does not force layout to reflow the pipeline's display list), so
-//!   the jiggle stays — see `start_repaint_jiggle`.
+//! * Round 4, F-007: the Round 2 resize "jiggle" is RETIRED. Its root
+//!   cause was the fork's damage-rects patch setting WebRender
+//!   `max_partial_present_rects: 1` (partial present) while Frost's
+//!   engine reads the GL back buffer wholesale — the full scene
+//!   rendered once and was lost, and only dirty regions repainted.
+//!   The fork now uses full present (`max_partial_present_rects: 0`,
+//!   the upstream default), so the first paint is complete and no
+//!   post-load jiggle is needed. F-005's `refresh_viewport` stays
+//!   (harmless viewport re-send).
 //!
 //! Chrome geometry is fixed by construction (Frost titlebar 40, toolbar
 //! 48, menu 148 when open, status 28), so the webview size and the click
@@ -137,17 +141,6 @@ mod app {
         TitlebarDoubleClick,
     }
 
-    /// Phase of the post-load forced repaint (see `start_repaint_jiggle`).
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum RepaintPhase {
-        /// No forced repaint in flight.
-        Idle,
-        /// Resized 1 px wider; waiting for the frame that resize produces.
-        WaitFirstFrame,
-        /// Resized back to the content size; waiting for that frame.
-        WaitSecondFrame,
-    }
-
     pub struct Frost {
         core: Core,
         engine: Engine,
@@ -184,28 +177,28 @@ mod app {
         /// same update (via set_window_title, issued from the Tick).
         title_dirty: bool,
         /// A load is in flight and no frame from it may be rendered yet.
-        /// The first paint of a load is the one that decides the frame:
-        /// rendering while the display list is still being built leaves
-        /// the frame partially painted (~1024x512 of a 1280x676 frame)
-        /// and no later paint repairs it, because the background damage
-        /// is already spent. So the app renders nothing until
-        /// LoadFinished (the smoke test's pattern: one render after
-        /// load + FrameReady always paints fully). The old frame stays
-        /// up during a navigation until the new one is ready.
+        /// The first paint of a load may be mid-build (the display list
+        /// is still arriving); rendering it would show a half-loaded
+        /// page, so the app renders nothing until LoadFinished (the
+        /// smoke test's pattern: one render after load + FrameReady
+        /// always paints fully). The old frame stays up during a
+        /// navigation until the new one is ready. (Round 4, F-007: with
+        /// full present a later paint DOES repair a partial frame now —
+        /// the old "damage is spent" claim is gone — but waiting for
+        /// LoadFinished still avoids showing a half-loaded page.)
         awaiting_load: bool,
         /// When the current load started; bounds the wait so a page that
         /// never fires LoadFinished cannot leave a blank content area
         /// forever (after 15 s renders are allowed anyway).
         loading_since: Option<std::time::Instant>,
-        /// A post-load forced repaint is in flight (see
-        /// `start_repaint_jiggle`); no frame may be uploaded until it
-        /// completes.
-        repaint_pending: bool,
-        /// Which step of the forced repaint is running.
-        repaint_phase: RepaintPhase,
-        /// Ticks waited for the current repaint step's frame; bounds the
-        /// wait so a missing FrameReady can never wedge the display.
-        repaint_wait_ticks: u32,
+        /// A print preview capture is in flight (Round 4, F-003): the
+        /// channel the engine delivers the PNG bytes on, polled by the
+        /// Tick. Set by `Message::OpenPrint`; cleared when the bytes
+        /// arrive (or the capture errors) and frost://print opens.
+        print_shot_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+        /// A print preview capture is in flight; the status line says
+        /// so until the bytes arrive.
+        print_shot_pending: bool,
         /// Current settings (theme, homepage, search engine, exit
         /// confirmation). Loaded at startup; the Tick polls the shared
         /// version for changes made through the settings page.
@@ -251,89 +244,11 @@ mod app {
         }
 
         /// Resize the webview to the content area, if it changed.
-        /// While a forced repaint is running the jiggle owns the webview
-        /// size, so a window resize during it is deferred (the jiggle's
-        /// resize-back uses the current content size anyway).
         fn resize_webview(&mut self) {
-            if self.repaint_pending {
-                return;
-            }
             let (w, h) = self.content_size();
             if self.webview.size() != (w, h) {
                 self.webview.resize(w, h);
                 self.frame_dirty = true;
-            }
-        }
-
-        /// Force a full repaint after a load (two-phase resize jiggle).
-        ///
-        /// A load's first paint is partial — only a ~1024x512 region of
-        /// a 1280x684 frame — and no later paint repairs it, even a
-        /// render after LoadFinished (the load gate alone does not fix
-        /// it). What DOES repair it is a real resize to a different
-        /// size: maximizing to 1600x900 painted the whole 1600x784
-        /// frame, restoring to 1280x800 painted the whole 1280x684
-        /// frame, and even a 1 px window resize paints fully. So the
-        /// webview itself must be resized: a same-size resize is a
-        /// no-op in Servo (the painter dedupes it). This jiggle
-        /// therefore does it in two steps, one per timed wait: resize
-        /// 1 px wider, wait ~0.25 s, resize back to the content size,
-        /// wait ~0.25 s, then upload. The intermediate size is never
-        /// uploaded, so the user never sees it. The waits are timed,
-        /// not FrameReady-driven: advancing on a FrameReady resized
-        /// straight back on a stale (pre-resize) event, coalescing the
-        /// two resizes into a net no-op. This works around a
-        /// damage/initialization gap in the engine (same family as the
-        /// WayServo ghost finding that dirty rects under-report).
-        ///
-        /// Round 3 tried to retire the jiggle with fork patch F-005
-        /// (`WebView::refresh_viewport`, re-send the viewport without
-        /// resizing). The finish pass PROVED that insufficient: 2 of 3
-        /// first loads painted partial (~1024x512, white bottom-right)
-        /// and stayed partial for minutes, because re-sending an
-        /// unchanged viewport does not force layout to reflow the
-        /// pipeline's display list — only a real size change (or a
-        /// fresh document load, which is why reloads paint fully)
-        /// reflows it. F-005 stays in the fork (harmless, and the
-        /// viewport re-send is still useful), but the jiggle is the
-        /// reliable repair and stays. A fork patch that forces a
-        /// reflow at an unchanged viewport is the real follow-up
-        /// (FORK.md, candidate F-007).
-        fn start_repaint_jiggle(&mut self) {
-            let (w, h) = self.content_size();
-            self.webview.resize(w + 1, h);
-            self.repaint_phase = RepaintPhase::WaitFirstFrame;
-            self.repaint_pending = true;
-            self.repaint_wait_ticks = 0;
-            // Discard any pre-jiggle frame flag: the frame it names is
-            // the stale partial one.
-            self.frame_dirty = false;
-        }
-
-        /// Advance the forced repaint one step (called by the Tick
-        /// once the current step's timed wait has elapsed). The Tick's
-        /// render gate uploads the final frame once the jiggle
-        /// completes.
-        fn advance_repaint_jiggle(&mut self) {
-            match self.repaint_phase {
-                RepaintPhase::WaitFirstFrame => {
-                    // The wider frame arrived: resize back to the
-                    // content size (which may have changed if the
-                    // window was resized mid-jiggle) and wait for it.
-                    let (w, h) = self.content_size();
-                    self.webview.resize(w, h);
-                    self.repaint_phase = RepaintPhase::WaitSecondFrame;
-                    self.repaint_wait_ticks = 0;
-                    self.frame_dirty = false;
-                },
-                RepaintPhase::WaitSecondFrame => {
-                    // The back-to-size frame arrived: the jiggle is
-                    // done; the Tick uploads it.
-                    self.repaint_phase = RepaintPhase::Idle;
-                    self.repaint_pending = false;
-                    self.frame_dirty = true;
-                },
-                RepaintPhase::Idle => {},
             }
         }
 
@@ -400,6 +315,42 @@ mod app {
                     if display == "frost://exit/confirm" {
                         std::process::exit(0);
                     }
+                    // F-003: the print page's "Save as PNG" link lands
+                    // here — write the captured preview to ~/Downloads
+                    // and re-open frost://print, which shows the path.
+                    if display == "frost://print/save" {
+                        let bytes = self
+                            .server
+                            .shared
+                            .lock()
+                            .ok()
+                            .and_then(|shared| shared.print_preview_png.clone());
+                        if let Some(bytes) = bytes {
+                            let secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let dir = std::env::var_os("HOME")
+                                .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+                                .unwrap_or_else(|| std::path::PathBuf::from("Downloads"));
+                            let path = dir.join(format!("frost-print-{secs}.png"));
+                            let result = std::fs::write(&path, &bytes);
+                            if let Ok(mut shared) = self.server.shared.lock() {
+                                match result {
+                                    Ok(()) => {
+                                        shared.print_saved_path =
+                                            Some(path.display().to_string());
+                                    },
+                                    Err(e) => {
+                                        shared.print_preview_error = Some(format!(
+                                            "Could not save the PNG: {e}"
+                                        ));
+                                    },
+                                }
+                            }
+                        }
+                        self.open_internal("frost://print");
+                    }
                     // Track the live page for the print/exit pages.
                     if let Ok(mut shared) = self.server.shared.lock() {
                         shared.current_page_url = display.clone();
@@ -432,27 +383,18 @@ mod app {
                     self.address_editing = false;
                     self.status = self.title.clone().unwrap_or_else(|| "Done".to_string());
                     self.inject_content_scripts();
-                    // The load's first paint is partial; force a full
-                    // repaint before any frame is uploaded.
-                    self.start_repaint_jiggle();
+                    // Round 4, F-007: no post-load jiggle any more — the
+                    // fork uses full present, so the first paint after
+                    // LoadFinished is complete as-is.
                 },
                 EngineEvent::LoadStopped => {
                     self.loading = false;
                     self.awaiting_load = false;
                     self.loading_since = None;
                     self.status = "Stopped.".to_string();
-                    self.start_repaint_jiggle();
                 },
                 EngineEvent::FrameReady => {
-                    if self.repaint_pending {
-                        // The jiggle is time-driven (see the Tick): a
-                        // FrameReady arriving during it may be stale
-                        // (queued before the jiggle's resize), so it must
-                        // not advance the jiggle or flag a frame — the
-                        // frame it names is the stale partial one.
-                    } else {
-                        self.frame_dirty = true;
-                    }
+                    self.frame_dirty = true;
                 },
                 EngineEvent::Crashed(reason) => {
                     self.loading = false;
@@ -580,8 +522,10 @@ mod app {
             self.webview.send_input(FrostInputEvent::Key {
                 state,
                 // `text` is the character the keypress actually
-                // produced; see `map_key_with_text`.
-                key: map_key_with_text(key, text),
+                // produced; see `map_key_with_text`. Control/Meta
+                // chords ignore it (they are shortcuts, and winit
+                // reports e.g. "\x01" as the text for Ctrl+A).
+                key: map_key_with_text(key, text, modifiers),
                 code,
                 location: map_location(location),
                 modifiers: map_modifiers(modifiers),
@@ -594,6 +538,14 @@ mod app {
         fn load_loopback(&mut self, loopback_url: &str, display_url: &str) {
             match self.webview.load(loopback_url) {
                 Ok(()) => {
+                    // Round 4, F-008: mark the load in flight NOW, not
+                    // when LoadStarted fires — a navigation whose first
+                    // response never arrives (hung server) never fires
+                    // LoadStarted at all (Servo only reports Started
+                    // when a Document is initialized), so without this
+                    // the Stop button would stay dead for exactly the
+                    // hang Stop is meant to escape.
+                    self.loading = true;
                     self.awaiting_load = true;
                     self.loading_since = Some(std::time::Instant::now());
                     self.address = display_url.to_string();
@@ -750,9 +702,8 @@ mod app {
                     title_dirty: true,
                     awaiting_load: true,
                     loading_since: Some(std::time::Instant::now()),
-                    repaint_pending: false,
-                    repaint_phase: RepaintPhase::Idle,
-                    repaint_wait_ticks: 0,
+                    print_shot_rx: None,
+                    print_shot_pending: false,
                     settings,
                     settings_version: 0,
                     server,
@@ -844,26 +795,10 @@ mod app {
                             }
                         }
                     }
-                    // The forced repaint is time-driven, not event-driven:
-                    // a FrameReady arriving during the jiggle may be stale
-                    // (queued before the jiggle's resize — advancing on it
-                    // would resize straight back and coalesce the two
-                    // resizes into a net no-op). Each phase therefore
-                    // waits ~15 ticks (~0.25 s, far more than the 1–2
-                    // spins the constellation needs to process a resize)
-                    // before advancing, so the resize is certainly
-                    // processed before the frame is uploaded.
-                    if self.repaint_pending {
-                        self.repaint_wait_ticks += 1;
-                        if self.repaint_wait_ticks >= 15 {
-                            self.advance_repaint_jiggle();
-                        }
-                    }
                     // Render ONLY when the engine flagged a new frame AND
-                    // no load is in flight (see awaiting_load) AND no
-                    // forced repaint is running: a pre-jiggle partial
-                    // frame must never reach the screen.
-                    if self.frame_dirty && !self.awaiting_load && !self.repaint_pending {
+                    // no load is in flight (see awaiting_load): a
+                    // mid-load frame would show a half-loaded page.
+                    if self.frame_dirty && !self.awaiting_load {
                         if let Some(frame) = self.webview.render() {
                             self.frame = Some(Handle::from_rgba(
                                 frame.width,
@@ -871,6 +806,30 @@ mod app {
                                 frame.rgba,
                             ));
                             self.frame_dirty = false;
+                        }
+                    }
+                    // F-003 print preview: the screenshot bytes arrive
+                    // on this channel once rendering is up to date.
+                    // Store them and only then open frost://print, so
+                    // the page shows the preview (or the error) at
+                    // once.
+                    if let Some(rx) = &self.print_shot_rx {
+                        if let Ok(result) = rx.try_recv() {
+                            self.print_shot_rx = None;
+                            self.print_shot_pending = false;
+                            if let Ok(mut shared) = self.server.shared.lock() {
+                                match result {
+                                    Ok(bytes) => {
+                                        shared.print_preview_png = Some(bytes);
+                                        shared.print_preview_error = None;
+                                    },
+                                    Err(e) => {
+                                        shared.print_preview_png = None;
+                                        shared.print_preview_error = Some(e);
+                                    },
+                                }
+                            }
+                            self.open_internal("frost://print");
                         }
                     }
                     // Keep the OS window title in step with the titlebar.
@@ -886,6 +845,10 @@ mod app {
                     Task::none()
                 },
                 Message::Back => {
+                    // Round 4, F-008: mark loading NOW (see
+                    // load_loopback) so Stop is live even if this
+                    // traversal never reports a load start.
+                    self.loading = true;
                     self.awaiting_load = true;
                     self.loading_since = Some(std::time::Instant::now());
                     self.webview.go_back();
@@ -893,6 +856,9 @@ mod app {
                     Task::none()
                 },
                 Message::Forward => {
+                    // Round 4, F-008: mark loading NOW (see
+                    // load_loopback).
+                    self.loading = true;
                     self.awaiting_load = true;
                     self.loading_since = Some(std::time::Instant::now());
                     self.webview.go_forward();
@@ -900,21 +866,16 @@ mod app {
                     Task::none()
                 },
                 Message::Reload => {
+                    self.loading = true;
                     self.awaiting_load = true;
                     self.loading_since = Some(std::time::Instant::now());
-                    // Servo 0.8.0's `WebView::reload()` sets
-                    // `load_status` by direct field assignment instead
-                    // of `set_load_status`, so the delegate is never
-                    // notified and the engine reports no `LoadStarted`
-                    // for a reload. The app therefore clears the
-                    // content-script guard and marks loading here, or
-                    // content scripts never re-run after a reload (the
-                    // banner was gone after every reload) and Stop stays
-                    // disabled while reloading. (The fork-level fix —
-                    // `reload()` via `set_load_status` — is recorded in
-                    // FORK.md as candidate F-006.)
-                    self.injected_for = None;
-                    self.loading = true;
+                    // Round 4, F-006: the fork's `reload()` now notifies
+                    // the delegate via `set_load_status`, so the engine
+                    // reports `LoadStarted` for a reload — which clears
+                    // the content-script guard. The app-side workaround
+                    // (clearing `injected_for` here) is RETIRED; setting
+                    // `loading` here is kept so Stop stays live if the
+                    // reload's first response never arrives (F-008).
                     self.webview.reload();
                     self.status = "Reloading…".to_string();
                     Task::none()
@@ -944,11 +905,17 @@ mod app {
                     } else {
                         match self.webview.load(&url) {
                             Ok(()) => {
+                                // Round 4, F-008: mark the load in
+                                // flight NOW (see load_loopback) so Stop
+                                // is live even if the server never
+                                // responds and LoadStarted never fires.
+                                self.loading = true;
                                 self.awaiting_load = true;
                                 self.loading_since = Some(std::time::Instant::now());
-                                self.address = url;
+                                self.address = url.clone();
                                 self.address_editing = false;
                                 self.content_focused = true;
+                                self.status = format!("Loading {url} …");
                             },
                             Err(e) => self.status = format!("Cannot load {url}: {e}"),
                         }
@@ -965,7 +932,21 @@ mod app {
                     Task::none()
                 },
                 Message::OpenPrint => {
-                    self.open_internal("frost://print");
+                    // F-003: capture the CURRENT page first — opening
+                    // frost://print would replace it, and the preview
+                    // must be of the page the user was reading. The
+                    // print page opens from the Tick once the PNG
+                    // bytes arrive (or the capture errors).
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.webview.request_screenshot_png(tx);
+                    self.print_shot_rx = Some(rx);
+                    self.print_shot_pending = true;
+                    self.status = "Capturing print preview…".to_string();
+                    if let Ok(mut shared) = self.server.shared.lock() {
+                        shared.print_preview_label =
+                            format!("Preview of {}", self.address);
+                        shared.print_saved_path = None;
+                    }
                     Task::none()
                 },
                 Message::OpenFile => {

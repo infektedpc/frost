@@ -75,7 +75,8 @@ had a chance to run it on his box.
 - F-005 (`WebView::refresh_viewport()`) landed in the fork but was
   PROVED INSUFFICIENT as the full-repaint repair — the Round 2 resize
   jiggle is restored and stays. The real fix is fork patch F-007
-  (force a reflow at an unchanged viewport).
+  (Round 4: the partial paint was never a reflow problem — it was
+  partial present; F-007 restores full present and the jiggle retires).
 - Known limits (see README Round 3): tiny instant-loading local HTML
   pages may never paint their body (keytest page is the standing
   repro); Ctrl+A select-all does not work in page text inputs under
@@ -86,18 +87,60 @@ had a chance to run it on his box.
   across a restart; menu unclipped; Markdown renders; file browser
   end to end; print/exit pages load and exit quits the app.
 
-## Round 4 — Inspector v1
+## Round 4 — finish the Round 3 leftovers (DONE 2026-11-14)
+
+No new features — this round finishes what Round 3 left open:
+
+- **F-007 — the partial-paint root cause, found and fixed.** The
+  keytest page never painted its body because the fork's damage-rects
+  patch set WebRender `max_partial_present_rects: 1` (partial present)
+  while Frost's engine reads the GL back buffer wholesale — the full
+  scene rendered once and was lost. The fork now uses full present
+  (`0`, the upstream default; commit `f4886bf57`). The Round 2 resize
+  jiggle is RETIRED: keytest paints fully on load AND reload with no
+  jiggle. F-005 stays as a harmless viewport re-send.
+- **F-006 — fork-level reload fix** (commit `fba674cc3`): `reload()`
+  now notifies the delegate via `set_load_status`, so the engine
+  reports `LoadStarted` on reload and the sample banner re-runs. The
+  app-side Reload workaround is retired.
+- **F-003 — printing for real, as far as Servo 0.8.0 allows.** Servo
+  has NO print pipeline (no `WebView::print`, no PDF path), so
+  paginated printing and print-to-PDF are genuinely unbuildable. What
+  shipped: a real print preview — the engine captures the current
+  page as a PNG (`request_screenshot_png`, via `take_screenshot`)
+  before `frost://print` opens, the server serves it as
+  `/print/preview.png`, and "Save as PNG" writes it to ~/Downloads
+  for printing from any viewer. The page says plainly it is a
+  viewport screenshot, not paginated print layout.
+- **Ctrl+A select-all fixed (app-side).** The key path preferred the
+  key event's produced text, and iced/winit reports Ctrl+A's text as
+  `"\x01"` — Servo got `Key::Character("\x01")` and the shortcut
+  matcher (which compares against `'A'`) never matched. Control/Meta
+  chords now use the logical key and ignore produced text
+  (`keymap.rs`). Gate: type "hello", Ctrl+A, type "X" → `val="X"`.
+- **F-008 — Stop aborts a pending navigation** (commit `f9462dbb7`,
+  stretch): `handle_stop_msg` also drains the webview's pending
+  session-history changes and closes their pipelines, mirroring the
+  script-side `handle_abort_load_url_msg`. No new message type.
+- Gate: keytest paints on load + reload (no jiggle); banner survives
+  reload; print preview renders and saves; Ctrl+A replaces; Stop
+  aborts a hanging load; settings, file browser, menu, back/forward
+  still work.
+
+## Round 5 — Inspector v1
 
 - Fork patch F-002: constellation DOM snapshot hook.
 - `frost://inspect`: DOM tree, computed style, box model, element picker
   with highlight overlay.
 - Gate: inspect example.org, pick an element, see its real style + box.
 
-## Round 5 — Print
+## Later rounds (in rough order)
 
-- Print: `frost://print` preview; print-to-PDF if F-003 lands, otherwise
-  paginated-image export.
-- (F-001 — the Stop button — was pulled forward and landed in Round 2.)
+- Frostbite tab hibernation, Snowplow network-layer blocking, Deep Freeze
+  offline archive, command palette, Snowdrift workspaces, split-view,
+  session restore, PDF viewer, spellcheck (F-004). (Print-to-PDF stays
+  out until Servo gains a real print pipeline — F-003's preview + PNG
+  save is the honest scope.)
 
 ## Later rounds (in rough order)
 
@@ -164,7 +207,7 @@ changes. Frostbite freezes the workspace you leave.
 | Limited print support | Fork patch F-003 or paginated-image export from the render path. |
 | No PDF viewer | Later round: render PDFs via the engine (pdf.js-style, Servo-rendered) or a native viewer page. |
 | No spellcheck | Fork patch F-004 or a pure-Rust spellcheck in the UI layer. |
-| No `WebView::stop` | Fork patch F-001 — LANDED in Round 2 (real `stop()`; the Stop button is enabled while loading). Limitation: a navigation stuck at the constellation is not aborted (needs an `AbortLoadUrl` message). |
+| No `WebView::stop` | Fork patch F-001 — LANDED in Round 2 (real `stop()`; the Stop button is enabled while loading). F-008 LANDED in Round 4: Stop now also aborts a navigation stuck at the constellation (pending-change abort folded into `handle_stop_msg`). |
 | No WebGL in the sandbox feature set | Deliberate Round 1 cut (no libclang for mozangle bindgen, no gstreamer). Revisit when the build machine has them; Joel's box may already. |
 | No media (audio/video) in the sandbox feature set | Same cut (no gstreamer). Same revisit. |
 

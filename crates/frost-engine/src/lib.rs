@@ -374,6 +374,39 @@ impl FrostWebView {
         self.inner.evaluate_javascript(script.to_string(), |_| {});
     }
 
+    /// Capture the current page as PNG bytes (Round 4, F-003 print
+    /// preview). Servo 0.8.0 has no print pipeline — no `WebView::print`,
+    /// no PDF path, only debug tree dumps — so a screenshot of the
+    /// current viewport IS the preview. Async: the callback fires once
+    /// rendering is up to date; the result is PNG bytes or an error
+    /// string, delivered on the caller's channel (polled by the app's
+    /// Tick). `None` rect means the whole webview.
+    pub fn request_screenshot_png(
+        &self,
+        tx: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    ) {
+        self.inner.take_screenshot(None, move |result| {
+            let out = match result {
+                Ok(img) => {
+                    let (w, h) = (img.width(), img.height());
+                    let mut bytes = Vec::new();
+                    let mut encoder = png::Encoder::new(&mut bytes, w, h);
+                    encoder.set_color(png::ColorType::Rgba);
+                    encoder.set_depth(png::BitDepth::Eight);
+                    match encoder
+                        .write_header()
+                        .and_then(|mut writer| writer.write_image_data(&img.into_raw()))
+                    {
+                        Ok(()) => Ok(bytes),
+                        Err(e) => Err(format!("PNG encode failed: {e}")),
+                    }
+                },
+                Err(e) => Err(format!("screenshot failed: {e:?}")),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
     /// Re-send the current viewport and rebuild the root display list,
     /// without resizing (Round 3, fork patch F-005). This is the proper
     /// full-repaint trigger: it replaces the Round 2 resize jiggle (see

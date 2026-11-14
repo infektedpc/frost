@@ -3,11 +3,12 @@
 #
 # What it does:
 #   1. Shallow-clones servo/servo at tag v0.8.0 into ./servo/
-#   2. Applies the five proven 0.8.0 engine patches from ./patches/,
+#   2. Applies the eight proven 0.8.0 engine patches from ./patches/,
 #      one commit per patch (the three servo-de patches + Frost's own
-#      F-001 stop patch, which the engine's stop() depends on, and the
+#      F-001 stop patch, which the engine's stop() depends on, the
 #      F-005 viewport-refresh patch, which the engine's refresh_viewport()
-#      depends on).
+#      depends on, and the Round 4 patches: F-006 reload notification,
+#      F-007 full present, F-008 stop-aborts-pending).
 #
 # Usage (from the frost repo root):
 #   ./clone-fork.sh
@@ -53,7 +54,7 @@ git config user.email "infektedpc@gmail.com"
 
 echo "Fork point: $(git rev-parse HEAD) ($(git log --oneline -1))"
 
-for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8 servo-stop-0.8 servo-refresh-viewport-0.8; do
+for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8 servo-stop-0.8 servo-refresh-viewport-0.8 servo-reload-notify-0.8 servo-full-present-0.8 servo-stop-abort-pending-0.8; do
     echo "Applying $patch..."
     git apply --check "$PATCHES_DIR/$patch.patch"
     git apply "$PATCHES_DIR/$patch.patch"
@@ -73,6 +74,15 @@ for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8
             ;;
         servo-refresh-viewport-0.8)
             git commit -qm "fork: F-005 — add WebView::refresh_viewport() (Round 3)"
+            ;;
+        servo-reload-notify-0.8)
+            git commit -qm "F-006: notify the delegate on reload (set_load_status)"
+            ;;
+        servo-full-present-0.8)
+            git commit -qm "F-007: full present instead of partial present (fix blank tiny pages)"
+            ;;
+        servo-stop-abort-pending-0.8)
+            git commit -qm "F-008: Stop also aborts a pending navigation"
             ;;
     esac
 done

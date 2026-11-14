@@ -1,0 +1,106 @@
+diff --git a/components/paint/painter.rs b/components/paint/painter.rs
+index 5e9cc0e90..709c2cb91 100644
+--- a/components/paint/painter.rs
++++ b/components/paint/painter.rs
+@@ -111,10 +111,11 @@ pub(crate) struct Painter {
+     /// The device dirty rects reported by WebRender for the most recent
+     /// `render()` call (`RenderResults::dirty_rects`). `None` until the
+     /// first frame has been rendered; an empty list means WebRender
+-    /// changed nothing in that frame. Only populated when partial
+-    /// present is enabled (see `WebRenderOptions::compositor_config`
+-    /// in [`Painter::new`]); with the default full-present config
+-    /// this stays `None`.
++    /// changed nothing in that frame. Frost runs WebRender in full
++    /// present mode (see `WebRenderOptions::compositor_config` in
++    /// [`Painter::new`], F-007), so this is normally empty — there is
++    /// no partial damage to report, the whole frame is presented;
++    /// Frost's engine ignores it and reads the full framebuffer.
+     last_dirty_rects: Option<Vec<DeviceIntRect>>,
+ 
+     /// The GL bindings for webrender
+@@ -271,20 +272,33 @@ impl Painter {
+                 render_backend_hooks: Some(Box::new(BoostWebRenderThread)),
+                 scene_builder_hooks: Some(Box::new(BoostWebRenderThread)),
+                 shared_font_namespace: Some(painter_id.into()),
+-                // Round 17 (WayServo): enable partial present so
+-                // WebRender reports the device dirty rects for each
+-                // frame in `RenderResults::dirty_rects` instead of
+-                // redrawing the whole framebuffer every time. With
+-                // `max_partial_present_rects: 1` the renderer returns
+-                // a single combined dirty rect (or none at all when
+-                // nothing changed, which the embedder uses as a signal
+-                // to skip presenting). `draw_previous_partial_present_regions`
+-                // is false: the embedder keeps its own full-frame
+-                // backing buffers, so it only needs this frame's delta.
+-                // `partial_present` is None: no backbuffer-age queries;
+-                // `buffer_age` is always 0 at the `render()` call site.
++                // Frost F-007: full present, NOT partial present.
++                // Upstream Servo leaves `compositor_config` at its
++                // default (`max_partial_present_rects: 0` — "a full
++                // screen present occurs at the end of the frame").
++                // The WayServo damage-rects patch set it to 1 so
++                // WebRender only repaints dirty regions and reports
++                // them in `RenderResults::dirty_rects` — but that
++                // contract requires the embedder to keep its own
++                // full-frame backing buffers and composite the delta
++                // onto them. Frost does not: its engine reads the GL
++                // back buffer wholesale every tick and uploads it as
++                // the frame, and `Painter::render` clears that buffer
++                // first. With partial present the full scene rendered
++                // exactly once (and that frame was swallowed by the
++                // app's repaint jiggle); every later frame was white
++                // except the dirty regions — tiny instant-loading
++                // pages (keytest.html) never painted their body,
++                // only the focused input's caret region kept
++                // re-rendering. `0` restores the upstream full
++                // present: WebRender repaints the whole scene every
++                // frame, which is what Frost's read path needs.
++                // `last_dirty_rects` then reports no partial damage
++                // (empty — the whole frame is presented); Frost's
++                // engine ignores it (it reads the full frame), so
++                // that is fine.
+                 compositor_config: CompositorConfig::Draw {
+-                    max_partial_present_rects: 1,
++                    max_partial_present_rects: 0,
+                     draw_previous_partial_present_regions: false,
+                     partial_present: None,
+                 },
+@@ -763,6 +777,13 @@ impl Painter {
+ 
+             let scaled_webview_rect = webview_renderer.rect /
+                 webview_renderer.device_pixels_per_page_pixel_not_including_pinch_zoom();
++            // Frost F-007 diagnostic: the root wrapper pushes the
++            // pipeline as an iframe in this rect; a zero or wrong rect
++            // here clips the whole page out of the scene.
++            debug!(
++                "frost-diag: root wrapper pipeline={pipeline_id:?} rect={:?} scaled={:?}",
++                webview_renderer.rect, scaled_webview_rect
++            );
+             builder.push_iframe(
+                 LayoutRect::from_untyped(&scaled_webview_rect.to_untyped()),
+                 LayoutRect::from_untyped(&scaled_webview_rect.to_untyped()),
+@@ -1086,6 +1107,24 @@ impl Painter {
+         let items_data = display_list_data.items_data;
+         let spatial_tree = display_list_data.spatial_tree;
+ 
++        // Frost F-007 diagnostic: what does each display list carry?
++        // A complete list for a small page is kilobytes; an empty or
++        // zero-viewport one points at the layout side, a complete one
++        // that still renders blank points at the scene/present side.
++        // (Logged here, before `from_data` moves the byte vecs.)
++        debug!(
++            "frost-diag: display list pipeline={:?} epoch={:?} \
++             first_reflow={} viewport={:?} device={:?} \
++             items_bytes={} spatial_bytes={}",
++            display_list_info.pipeline_id,
++            display_list_info.epoch,
++            display_list_info.first_reflow,
++            display_list_info.viewport_details.size,
++            display_list_info.viewport_details.device_size,
++            items_data.len(),
++            spatial_tree.len(),
++        );
++
+         let built_display_list = BuiltDisplayList::from_data(
+             DisplayListPayload {
+                 items_data,

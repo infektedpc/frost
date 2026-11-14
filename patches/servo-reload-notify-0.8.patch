@@ -1,0 +1,19 @@
+diff --git a/components/servo/webview.rs b/components/servo/webview.rs
+index b7237f36b..326277d86 100644
+--- a/components/servo/webview.rs
++++ b/components/servo/webview.rs
+@@ -556,8 +556,13 @@ impl WebView {
+     }
+ 
+     /// Reload the currently loaded page in this [`WebView`].
++    ///
++    /// Frost F-006: go through [`Self::set_load_status`] so the
++    /// delegate is notified that a load started (0.8.0 set the field
++    /// directly, so a reload after a completed load never fired
++    /// `LoadStarted` and embedders had to work around it app-side).
+     pub fn reload(&self) {
+-        self.inner_mut().load_status = LoadStatus::Started;
++        self.clone().set_load_status(LoadStatus::Started);
+         self.servo()
+             .constellation_proxy()
+             .send(EmbedderToConstellationMessage::Reload(self.id()))

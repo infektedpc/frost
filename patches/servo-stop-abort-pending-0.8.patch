@@ -1,0 +1,33 @@
+diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
+index fc171c3e4..8b56cbb43 100644
+--- a/components/constellation/constellation.rs
++++ b/components/constellation/constellation.rs
+@@ -4973,6 +4973,28 @@ where
+             ScriptThreadMessage::Stop(pipeline_id),
+             "Got stop event after closure",
+         );
++        // Frost F-008 (Round 4): Stop also aborts a pending navigation.
++        // A load stuck at the constellation — a pending session-history
++        // change whose pipeline never committed — is otherwise
++        // unstoppable from the embedder: `Stop` only reaches the CURRENT
++        // pipeline, and the embedder cannot name the pending pipeline
++        // (it never learns its id). So drain the webview's pending
++        // changes for the top-level browsing context and close their
++        // pipelines, mirroring `handle_abort_load_url_msg` (the
++        // script-side abort). Without this, Stop during a pending
++        // navigation leaves the change queued, and the next load is not
++        // taken (a pending page is never overridden).
++        if let Some(webview) = self.webviews.get_mut(&webview_id) {
++            let pending =
++                webview.remove_pending_changes_for_browsing_context_id(browsing_context_id);
++            for change in pending {
++                self.close_pipeline(
++                    change.new_pipeline_id,
++                    DiscardBrowsingContext::No,
++                    ExitPipelineMode::Normal,
++                );
++            }
++        }
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#window-post-message-steps>

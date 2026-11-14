@@ -5,12 +5,14 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 3 — internal pages + extensions v1 are live.** The
-loopback server serves `frost://settings` (theme, homepage, search
-engine — all wired for real and persisted), `frost://print`,
-`frost://exit`, `frost://open`, and `frost://extensions`; a sample
-content-script extension runs on example.org; Markdown files render
-instead of Servo's "Unknown content type" page. See [ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 4 — the Round 3 leftovers are finished.** F-007 fixed
+the partial paint at its root (full present instead of partial
+present — the resize jiggle is retired); F-006 notifies the delegate
+on reload (the app-side workaround is retired); F-003 ships a real
+print preview (viewport screenshot + Save as PNG — Servo 0.8.0 has no
+print pipeline, so paginated print/PDF is genuinely unbuildable);
+Ctrl+A select-all works in page text inputs; F-008 lets Stop abort a
+navigation stuck at the constellation. See [ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -20,7 +22,7 @@ frost/
 ├── rust-toolchain.toml   # Rust 1.99.1 (matches the Servo fork's pin)
 ├── FORK.md               # the Servo fork: point, patches, planned patches
 ├── clone-fork.sh         # recreate servo/ from scratch (shallow v0.8.0 + patches)
-├── patches/              # the five proven 0.8.0 engine patches (vendored)
+├── patches/              # the eight proven 0.8.0 engine patches (vendored)
 ├── servo/                # the Servo fork (NESTED repo, gitignored, not in the zip)
 ├── crates/
 │   ├── frost/            # libcosmic app: toolbar, address bar, hamburger menu
@@ -34,9 +36,10 @@ frost/
 ## The fork
 
 Frost builds against its own Servo fork at `servo/`, not upstream. The
-fork point is **v0.8.0** (`4e136d8e…`) plus five engine patches as fork
+fork point is **v0.8.0** (`4e136d8e…`) plus eight engine patches as fork
 commits (keypress charCode, damage rects, dmabuf export, F-001 stop,
-F-005 refresh-viewport). Full detail in [FORK.md](FORK.md). To recreate it on another machine:
+F-005 refresh-viewport, F-006 reload-notify, F-007 full-present,
+F-008 stop-aborts-pending). Full detail in [FORK.md](FORK.md). To recreate it on another machine:
 
 ```bash
 ./clone-fork.sh
@@ -272,3 +275,92 @@ Not proven / known limits:
 - Mouse-wheel scrolling still unproven under Xvfb (carried from
   Round 2). wgpu adapter on Haswell, real mouse/keyboard, and drag
   latency are Joel's-box verdicts.
+
+## Round 4 — what is proven, what is not
+
+Proven (sandbox, 2026-11-14, under Xvfb + software GL; gates re-ran
+live against the shipped tree):
+
+- `cargo check --workspace --all-targets` green; unit tests green
+  (`cargo test --workspace` — count in the delivery note).
+- **F-007: keytest paints fully on load AND reload, with no jiggle.**
+  The 529 B keytest page — the standing repro since Round 3 — shows
+  its heading, input, and "no keys yet" div on first load and after
+  Reload, with no interaction beforehand. The reload was confirmed
+  genuine (a new pipeline in the engine log). The Round 2 resize
+  jiggle is RETIRED: `start_repaint_jiggle`, `advance_repaint_jiggle`,
+  and the `RepaintPhase` machinery are deleted; the Tick renders on
+  `frame_dirty && !awaiting_load`. Real pages still paint fully.
+- **F-006: the delegate sees the load start on reload.** Reloading
+  example.org re-runs the sample banner (the content-script guard
+  clears via `LoadStarted`, not the app-side workaround — which is
+  retired).
+- **F-003: print preview is real.** Opening Print from a page
+  captures the page's viewport as a PNG and opens `frost://print`
+  showing it, with "Save as PNG" writing the file to ~/Downloads
+  (path shown on the page). The page says plainly it is a viewport
+  screenshot, not paginated print layout — Servo 0.8.0 has no print
+  pipeline, so paginated printing and print-to-PDF are genuinely
+  unbuildable without a layout-level print mode.
+- **Ctrl+A select-all works in page text inputs.** The key path now
+  ignores produced text for Control/Meta chords (iced/winit reports
+  Ctrl+A's text as `"\x01"`, which Servo's shortcut matcher never
+  matched). Gate: type "hello", Ctrl+A, type "X" → the input holds
+  `"X"`, not `"helloX"`.
+- **F-008: Stop aborts a hanging load.** A load against a server that
+  never responds stops on Stop, and a subsequent navigation proceeds
+  cleanly (the pending change is drained, not left queued). The fork
+  change alone was not enough to reach: Servo only reports
+  `LoadStatus::Started` when a new Document is initialized (first
+  response bytes), so a never-responding server never fires it and
+  the Stop button — live only while `loading` — stayed dead. The app
+  now sets `loading = true` when a navigation is requested
+  (`main.rs`: address-bar submit, Back, Forward, Reload,
+  `load_loopback`), so Stop is live from the request, not the first
+  response. Gate (2026-11-14, build 5): hang server on
+  127.0.0.1:18099 — status went "Loading http://127.0.0.1:18099/ …"
+  → "Stopping…" on Stop → back to "Example Domain" (the current
+  page's title; a never-started load has no Document to report
+  `Stopped`, so the status settles on the page it is still showing
+  — "Stopped." is the status for stopping a load that had started).
+  The abort itself is proven by the follow-up: example.org then
+  loaded cleanly, banner re-ran, webview not wedged.
+- Regression: settings load and save; the banner survives reload;
+  file browser end to end; menu all four entries visible;
+  back/forward/reload work.
+
+Not proven / known limits:
+
+- Mouse-wheel scrolling still unproven under Xvfb (carried from
+  Round 2). wgpu adapter on Haswell, real mouse/keyboard, and drag
+  latency are Joel's-box verdicts.
+- Full present (F-007) repaints the whole scene every frame — more
+  paint work per frame under SwiftShader/llvmpipe than partial
+  present was, but partial present never saved Frost anything (the
+  engine reads the full framebuffer regardless).
+- **File-browser history quirk (pre-existing, Round 2/3 code, not a
+  Round 4 regression):** Back across file-browser folder clicks
+  stays on the same folder, and Forward after such a Back goes
+  nowhere — the `frost://open` intercept re-loads the URL it just
+  intercepted, which disturbs the engine's history (duplicate entry
+  / forward stack cleared). Back/forward on normal pages work. Use
+  the "↑ Up" link to go up a folder.
+- **Print page, transient cosmetic wart:** right after Save, the
+  "Page:" line can briefly read "Not found / frost://print/save"
+  (the save URL is the current page for a moment); it corrects
+  itself to "Print page / frost://print" once the print page
+  reloads. The preview and the saved path are correct throughout.
+- **Print save robustness gap (known, not fixed this round):** the
+  `frost://print/save` intercept writes the PNG to `~/Downloads`
+  but does not `create_dir_all` first — if `~/Downloads` does not
+  exist the save fails (loudly: the page shows the error, it does
+  not fail silently). On a normal desktop `~/Downloads` always
+  exists, so this only bites a bare sandbox/home. Fix for a future
+  round: `std::fs::create_dir_all` the downloads dir before the
+  write in the print/save intercept (`server.rs`).
+- **Harness lesson (Round 4):** link clicks that "do nothing" were
+  mis-aimed synthetic clicks — the harness was reading Y positions
+  ~20 px too high off downscaled screenshots. Measure the link's
+  exact pixel rows (blue-pixel bands or an enlarged crop) before
+  clicking; hit-testing itself is correct (`elementFromPoint`
+  matches `getBoundingClientRect`).
