@@ -67,6 +67,10 @@ cp "$ROOT/packaging/frost.desktop" "$STAGE/usr/share/applications/frost.desktop"
 cp "$ROOT/packaging/frost.svg" "$STAGE/usr/share/icons/hicolor/scalable/apps/frost.svg"
 chmod 644 "$STAGE/usr/share/applications/frost.desktop" "$STAGE/usr/share/icons/hicolor/scalable/apps/frost.svg"
 
+# The workspace umask leaves new dirs at 2770; dpkg-deb requires the
+# control directory (and installed dirs should be) 0755.
+find "$STAGE" -type d -exec chmod 755 {} +
+
 cat > "$STAGE/DEBIAN/control" <<'EOF'
 Package: frost
 Version: 0.4.0
