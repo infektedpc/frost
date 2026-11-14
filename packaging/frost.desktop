@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Frost
+Comment=A web browser built on Servo
+Exec=frost
+Icon=frost
+Terminal=false
+Categories=Network;WebBrowser;

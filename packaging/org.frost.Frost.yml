@@ -1,0 +1,61 @@
+# org.frost.Frost — Flatpak manifest for Frost (UNBUILT and UNVERIFIED).
+#
+# Status: written 2026-11-14, NEVER built or tested. The sandbox has no
+# flatpak tooling at all (no flatpak, flatpak-builder, bwrap, or ostree),
+# so this manifest is a starting point for Joel's machine only.
+#
+# To build (on a machine with flatpak + flatpak-builder, e.g. Joel's
+# Debian 13 box — see packaging/build-flatpak.sh):
+#   flatpak-builder --install-deps-from=flathub --share=network \
+#       --force-clean build-dir packaging/org.frost.Frost.yml
+#
+# Dependencies of this manifest:
+# - The GitHub repo https://github.com/infektedpc/frost.git must exist and
+#   hold the Round 4 tree (it does — created 2026-11-14; the manifest
+#   clones branch `main`). If the code is ever pushed to a different
+#   remote, update the `url` below.
+# - Network access DURING the build: clone-fork.sh clones servo/servo at
+#   v0.8.0 from GitHub and cargo fetches crates + the libcosmic git dep.
+#   That is why flatpak-builder must be run with --share=network.
+# - Rust toolchain: the repo pins Rust 1.99.1 (rust-toolchain.toml, to
+#   match the Servo fork). The freedesktop SDK's cargo may be older; if
+#   the build fails on toolchain/edition errors, install rustup 1.99.1
+#   in the build (rustup toolchain install 1.99.1) or build with
+#   --share=network and let rustup fetch it. The manifest below uses the
+#   SDK's cargo as-is and does NOT install rustup — adjust if needed.
+# - The build is a RELEASE build (cargo build --release -p frost). The
+#   .deb, by contrast, ships a stripped debug build because a release
+#   build was not feasible in the sandbox; a Flatpak built on Joel's box
+#   has no such limit, but a full Servo release build still takes a long
+#   time (budget hours, not minutes).
+# - The Servo fork is recreated inside the build by ./clone-fork.sh
+#   (shallow clone of servo/servo v0.8.0 + the eight vendored patches in
+#   patches/), exactly as a normal source build does. The fork is NOT
+#   fetched as a separate module.
+app-id: org.frost.Frost
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: frost
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --share=network
+  - --device=dri
+  - --filesystem=xdg-download
+  - --persist=.config/frost
+modules:
+  - name: frost
+    buildsystem: simple
+    build-commands:
+      - ./clone-fork.sh
+      - cargo build --release -p frost
+      - install -Dm755 target/release/frost /app/bin/frost
+      - install -Dm644 packaging/frost.desktop /app/share/applications/org.frost.Frost.desktop
+      - sed -i 's/^Icon=frost$/Icon=org.frost.Frost/' /app/share/applications/org.frost.Frost.desktop
+      - install -Dm644 packaging/frost.svg /app/share/icons/hicolor/scalable/apps/org.frost.Frost.svg
+    sources:
+      - type: git
+        url: https://github.com/infektedpc/frost.git
+        branch: main

@@ -100,6 +100,37 @@ falls back to its wgpu renderer first, which accepts the visual. Proven
 on Joel's box 2026-11-12 (the Round 1 window launched with the patch)
 and in the sandbox under Xvfb.
 
+## Packaging
+
+### .deb (Debian 13, amd64)
+
+`packaging/build-deb-0.4.0.sh` builds `frost-0.4.0_amd64.deb` (binary
+`/usr/bin/frost`, desktop file, snowflake icon). It uses `dpkg-deb
+--build` only and never installs anything itself; on the target machine:
+
+```bash
+sudo dpkg -i frost-0.4.0_amd64.deb
+sudo apt-get install -f   # only if a dependency is missing
+```
+
+**Plain truth about 0.4.0:** it ships the Round 4 tree as a **stripped
+debug build** (~300 MB), not a release build — a full release build of
+the Servo fork + workspace was not feasible in the sandbox. It is fully
+functional, just larger and slower than a release build would be. The
+note is in the package Description too; remove it only when a real
+release build replaces the binary. The packaged binary was gated from
+a clean extraction: window launches, example.org paints fully, the
+hamburger menu shows all four entries, `frost://settings` loads.
+
+### Flatpak (manifest only — UNBUILT, UNVERIFIED)
+
+`packaging/org.frost.Frost.yml` + `packaging/build-flatpak.sh` build a
+Flatpak **on Joel's machine** (the sandbox has no flatpak tooling at
+all, so the manifest was never built or tested there). It clones the
+GitHub repo (`infektedpc/frost`, branch `main`) and recreates the Servo
+fork with `./clone-fork.sh`, then does a **release** build. It needs
+network during the build (`--share=network`) and hours, not minutes.
+
 ## Pushing to GitHub
 
 No remote exists yet — the sandbox has no logged-in `gh`. When you are
