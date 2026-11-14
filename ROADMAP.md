@@ -50,18 +50,41 @@ had a chance to run it on his box.
   toolbar + rendered example.org; address-bar navigation, back/forward,
   reload, menu (all four entries), resize, and click-a-link gates pass.
 
-## Round 3 — Internal pages + extensions v1
+## Round 3 — Internal pages + extensions v1 ✅ (2026-11-13, sandbox gates passed, finish pass re-ran live)
 
 - Embedder loopback server serves `frost://settings`, `frost://print`,
-  `frost://exit` (later: a real scheme handler). `frost://open` already
-  works as an app-side listing (Round 2); the server takes over serving
-  it when it lands.
-- Settings page: theme, homepage, default search engine, privacy toggles.
-- Extension host v1: load a manifest from disk, inject content scripts on
-  navigation, `frost.storage` + `frost.tabs` bridge live.
-- `frost://extensions` management page.
-- Gate: a sample extension (e.g. a dark-mode content script) runs on a
-  real page.
+  `frost://exit`, `frost://open`, `frost://extensions`, and
+  `frost://md` (Markdown files render as formatted HTML instead of
+  Servo's "Unknown content type" page). The address bar shows the
+  `frost://` URL, never a `data:` URL.
+- Settings page: theme (applies immediately), homepage, default search
+  engine, "ask before quitting" — persisted to
+  `$XDG_CONFIG_HOME/frost/settings.json` and honored on next launch
+  (proven: saved homepage + Light theme survived a restart); invalid
+  homepages are rejected with a plain message.
+- Extension host v1: load a manifest from disk, inject content scripts
+  on navigation (re-injected after reload — the `Reload` message
+  clears the injection guard, since Servo 0.8.0 `WebView::reload()`
+  never notifies the delegate); a sample banner extension runs on
+  example.org; a bad manifest is skipped without crashing;
+  `frost://extensions` lists loaded and failed extensions. The
+  `frost.*` bridge exists host-side (`FrostApi` trait: in-memory
+  storage, tab query/create against a single-tab stand-in); page JS
+  does not see a `frost.*` object yet — that is a later round.
+- Menu height fixed: all four entries fully visible, no clipping.
+- F-005 (`WebView::refresh_viewport()`) landed in the fork but was
+  PROVED INSUFFICIENT as the full-repaint repair — the Round 2 resize
+  jiggle is restored and stays. The real fix is fork patch F-007
+  (force a reflow at an unchanged viewport).
+- Known limits (see README Round 3): tiny instant-loading local HTML
+  pages may never paint their body (keytest page is the standing
+  repro); Ctrl+A select-all does not work in page text inputs under
+  the harness; transient blank frames can appear mid-typing and
+  recover on their own.
+- Gate: sample extension runs on a real page (banner visible on
+  example.org, survives reload); settings change visibly + persist
+  across a restart; menu unclipped; Markdown renders; file browser
+  end to end; print/exit pages load and exit quits the app.
 
 ## Round 4 — Inspector v1
 

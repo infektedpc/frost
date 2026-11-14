@@ -61,7 +61,13 @@ and load state.
    `FrostInputEvent` and go in through `webview.send_input`. Keyboard
    mapping is a Round 2 concern; note the servo-de `+8` xkb fix was for
    Wayland seat input (evdev keycodes) and does NOT apply here — Frost
-   keys come from winit/libcosmic.
+   keys come from winit/libcosmic. Round 3 prefers the key event's
+   produced text for page text input (typing works, proven by the
+   keytest and settings fields), but modifier chords do not reach the
+   page the same way: Ctrl+A select-all produced no selection in a
+   page input under the harness, so typed text appended instead of
+   replacing. Unproven whether that is the produced-text path or a
+   harness artifact — a real keyboard is the verdict.
 
 ### The partial first paint and the resize jiggle (Round 2, still the repair in Round 3)
 
@@ -95,6 +101,18 @@ harmless viewport re-send; the jiggle stays as the reliable repair. A
 fork patch that forces a reflow at an unchanged viewport is the real
 follow-up (FORK.md, candidate F-007).
 
+Standing counterexample (finish pass, 2026-11-13): a tiny
+instant-loading local HTML page (`file://…/keytest.html`, 529 B, a
+script focuses an input on load) never paints its body — not on load,
+not on reload. The page itself is alive (title known, input focusable,
+typed text lands in it), and interaction paints only the tiles it
+touches (typed `abc` appeared alone on a blank page). It painted fully
+exactly once, transiently, after a click. The same held across all
+three finish attempts. Real pages (network, loopback, file listings,
+Markdown) paint fully. The jiggle repairs loads whose display list is
+partial; this page's display list is complete but its first paint never
+reaches the back buffer — F-007 is the candidate fix.
+
 Later rounds may switch the context to a GPU path (the dmabuf fork patch
 exists for exactly this), but the `render() -> Frame` contract does not
 change — the UI never sees how the pixels were produced.
@@ -110,7 +128,7 @@ loads it like any other URL.
 | URL | Page | Round |
 |---|---|---|
 | `frost://settings` | Settings (theme, homepage, search engine, privacy) | 3 |
-| `frost://print` | Print preview + print-to-PDF | 3–4 (needs fork patch F-003 if Servo's print pipeline cannot be driven headlessly) |
+| `frost://print` | Print page: names the page to print and says plainly that printing is not wired up yet | 3 (preview + print-to-PDF need fork patch F-003; Round 4–5) |
 | `frost://open` | Open a local file (file picker page, then the file renders in a tab) | 2 — working now (see below); the Round 3 loopback server takes over serving it |
 | `frost://exit` | Confirm-exit page (with "don't ask again") | 3 |
 | `frost://inspect` | The HTML inspector (DOM tree, computed style, box model, picker) | 4 (needs fork patch F-002 for the DOM snapshot hook) |
@@ -130,8 +148,12 @@ intercepts those navigations — on the `UrlChanged` engine event, and
 also by polling `webview.url()` each tick in case the engine emits no
 event for an unknown-scheme load — and re-lists the folder. File links
 are plain `file://` URLs, which Servo loads natively, so clicking a
-file opens it in the browser. Settings and Print are still placeholder
-`data:` pages until the Round 3 server lands.
+file opens it in the browser. Settings and Print were placeholder
+`data:` pages in Round 2; the Round 3 server serves them for real now
+(`frost://settings`, `frost://print`). Print is still an honest
+placeholder in content — it names the page and says printing is not
+wired up yet (F-003, planned) — there is no print preview or printer
+output in this build.
 
 ## Extensions
 
