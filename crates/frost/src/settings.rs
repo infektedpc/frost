@@ -59,32 +59,6 @@ pub struct ChromeColors {
     pub muted: [u8; 3],
 }
 
-impl ChromeColors {
-    /// `#rrggbb` for use in internal-page CSS.
-    pub fn css_background(&self) -> String {
-        format!(
-            "#{:02x}{:02x}{:02x}",
-            self.background[0], self.background[1], self.background[2]
-        )
-    }
-
-    /// `#rrggbb` for use in internal-page CSS.
-    pub fn css_text(&self) -> String {
-        format!(
-            "#{:02x}{:02x}{:02x}",
-            self.text[0], self.text[1], self.text[2]
-        )
-    }
-
-    /// `#rrggbb` for use in internal-page CSS.
-    pub fn css_muted(&self) -> String {
-        format!(
-            "#{:02x}{:02x}{:02x}",
-            self.muted[0], self.muted[1], self.muted[2]
-        )
-    }
-}
-
 /// Default search engine, used when the address bar gets a search query
 /// instead of a URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,31 +79,12 @@ impl SearchEngine {
         ]
     }
 
-    pub fn id(&self) -> &'static str {
-        match self {
-            SearchEngine::DuckDuckGo => "duckduckgo",
-            SearchEngine::Google => "google",
-            SearchEngine::Brave => "brave",
-            SearchEngine::Bing => "bing",
-        }
-    }
-
     pub fn label(&self) -> &'static str {
         match self {
             SearchEngine::DuckDuckGo => "DuckDuckGo",
             SearchEngine::Google => "Google",
             SearchEngine::Brave => "Brave Search",
             SearchEngine::Bing => "Bing",
-        }
-    }
-
-    pub fn from_id(id: &str) -> Option<Self> {
-        match id {
-            "duckduckgo" => Some(SearchEngine::DuckDuckGo),
-            "google" => Some(SearchEngine::Google),
-            "brave" => Some(SearchEngine::Brave),
-            "bing" => Some(SearchEngine::Bing),
-            _ => None,
         }
     }
 
@@ -160,43 +115,24 @@ pub fn percent_encode_query(query: &str) -> String {
     out
 }
 
-/// Percent-decode a query-string value (`+` becomes a space).
-pub fn percent_decode_query(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
-                if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-                i += 1;
-            },
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            },
-            b => {
-                out.push(b);
-                i += 1;
-            },
-        }
+/// Whether a homepage value is a loadable http(s) URL. (Round 7: moved
+/// here from the deleted loopback server, which used it to validate the
+/// settings page's homepage field.)
+pub fn is_loadable_homepage(value: &str) -> bool {
+    match url::Url::parse(value) {
+        Ok(u) => matches!(u.scheme(), "http" | "https") && u.host_str().is_some(),
+        Err(_) => false,
     }
-    String::from_utf8_lossy(&out).into_owned()
 }
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub theme: ThemeChoice,
     pub homepage: String,
     pub search_engine: SearchEngine,
-    /// Whether the menu's Exit entry opens the frost://exit
-    /// confirmation page (true) or quits immediately (false).
+    /// Whether the menu's Exit entry opens the confirmation dialog
+    /// (true) or quits immediately (false).
     pub confirm_exit: bool,
 }
 
@@ -274,15 +210,24 @@ mod tests {
             SearchEngine::Bing.search_url("x"),
             "https://www.bing.com/search?q=x"
         );
-        assert_eq!(SearchEngine::from_id("google"), Some(SearchEngine::Google));
-        assert_eq!(SearchEngine::from_id("nope"), None);
     }
 
     #[test]
     fn query_percent_codec_round_trips() {
-        assert_eq!(percent_decode_query("hello+world%21"), "hello world!");
-        assert_eq!(percent_decode_query("a%2Fb"), "a/b");
-        assert_eq!(percent_decode_query("plain"), "plain");
+        assert_eq!(percent_encode_query("hello world!"), "hello%20world%21");
+        assert_eq!(percent_encode_query("a/b"), "a%2Fb");
+        assert_eq!(percent_encode_query("plain"), "plain");
+    }
+
+    #[test]
+    fn loadable_homepage_needs_http_host() {
+        assert!(is_loadable_homepage("https://example.org"));
+        assert!(is_loadable_homepage("http://example.com/page"));
+        assert!(!is_loadable_homepage("https://"));
+        assert!(!is_loadable_homepage("frost://settings"));
+        assert!(!is_loadable_homepage("example.org"));
+        assert!(!is_loadable_homepage("file:///home/user/index.html"));
+        assert!(!is_loadable_homepage(""));
     }
 
     #[test]
@@ -313,7 +258,7 @@ mod tests {
         let light = ThemeChoice::Light.chrome_colors();
         assert_ne!(dark.background, light.background);
         assert_ne!(dark.text, light.text);
-        assert_eq!(dark.css_background(), "#2b2a33");
-        assert_eq!(light.css_background(), "#f2f2f5");
+        assert_eq!(dark.background, [0x2b, 0x2a, 0x33]);
+        assert_eq!(light.background, [0xf2, 0xf2, 0xf5]);
     }
 }

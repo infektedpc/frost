@@ -251,42 +251,78 @@ pending session-history changes) is what makes the resulting Stop
 actually abort a stuck navigation; the app-side flag is what makes
 Stop reachable for one. See FORK.md.
 
-## Internal pages
+## Menu pages: native windows (Round 7)
 
-Every menu action that is not navigation opens as a page *inside* the
-browser, not as a native dialog. The pages are served from the embedder's
-own loopback HTTP server, following the servo-de `/daemon/*` proxy
-pattern: the engine runs a tiny HTTP server on 127.0.0.1 and the webview
-loads it like any other URL.
+Rounds 3–6 served every menu action as a page *inside* the browser,
+from the embedder's own loopback HTTP server on 127.0.0.1 (the
+servo-de `/daemon/*` proxy pattern). **Round 7 (Joel's direction,
+2026-11-14) deleted that server entirely** — `server.rs` is gone, and
+each menu item now pops up its own libcosmic window, drawn with iced
+widgets in the same process (`crates/frost/src/app/windows.rs`). The
+table below is the history of what the server served, and what
+replaced it:
 
-| URL | Page | Round |
+| Was (`frost://`) | Now (native window) | Round |
 |---|---|---|
-| `frost://settings` | Settings (theme, homepage, search engine, privacy) | 3 |
-| `frost://print` | Print page: a real preview of the current page (viewport screenshot) + "Save as PNG" to ~/Downloads; says plainly it is not paginated print layout (Servo 0.8.0 has no print pipeline — F-003) | 4 |
-| `frost://open` | Open a local file (file picker page, then the file renders in a tab) | 2 — working now (see below); the Round 3 loopback server takes over serving it |
-| `frost://exit` | Confirm-exit page (with "don't ask again") | 3 |
-| `frost://inspector` | The HTML inspector (DOM tree, computed style, box model; snapshot model — see Inspector section) | 5 (no fork patch — script-injection via `evaluate_javascript`) |
-| `frost://extensions` | Extension list, permissions, enable/disable | 3 |
+| `frost://settings` | Settings window: theme, homepage, search engine, "Ask before quitting" (draft + Save; theme applies on Save) | 3 → 7 |
+| `frost://print` | Print window: viewport-screenshot preview + "Save as PNG" to ~/Downloads; still says plainly Servo 0.8.0 has no print pipeline (F-003) | 4 → 7 |
+| `frost://open` | Open file window: app-side listing from `$HOME`, dirs first, sizes; folder clicks navigate, file clicks open via `file://`; Markdown renders natively (pulldown-cmark → iced widgets) | 2 → 7 |
+| `frost://exit` | Exit confirmation dialog (only when "Ask before quitting" is on) | 3 → 7 |
+| `frost://inspector` | Inspector window: the Round 5 snapshot model, unchanged — see Inspector section | 5 → 7 |
+| `frost://extensions` | Extensions section inside the Settings window (loaded + failed lists) | 3 → 7 |
 
-`frost://` URLs are intercepted by the engine before the network stack
-sees them (a custom scheme handler in the fork or, first, the loopback
-server — the loopback server is the Round 3 implementation; a real scheme
-handler is the later, cleaner one).
+Typing a `frost://` URL in the address bar now fails plainly with an
+honest status message and leaves the current page alone.
+`resolve_address` no longer treats `frost` as a loadable scheme.
+Search-engine routing for bare queries and `file://` opening are
+unchanged.
 
-**Round 2 already ships a working `frost://open` without the server:**
-the app generates the directory listing as HTML (`crates/frost/src/
-file_browser.rs`, starting at `$HOME`, hidden entries skipped,
-directories first) and loads it through the engine as a `data:` page.
-Folder links point at `frost://open?path=<url-encoded path>`; the app
-intercepts those navigations — on the `UrlChanged` engine event, and
-also by polling `webview.url()` each tick in case the engine emits no
-event for an unknown-scheme load — and re-lists the folder. File links
-are plain `file://` URLs, which Servo loads natively, so clicking a
-file opens it in the browser. Settings and Print were placeholder
-`data:` pages in Round 2; the Round 3 server serves them for real now
-(`frost://settings`, `frost://print`). Print is a real preview in
-Round 4 (F-003): the app captures the current page as a PNG before
-opening the page, the server serves it as `/print/preview.png`, and
+Multi-window mechanics (libcosmic 1.0.0 / iced 0.14, vendored
+checkout `ecc5fe4`): the `multi-window` feature is enabled on the
+libcosmic dep — an empty flag that turns on the two-arg `title(id)` /
+`set_window_title(title, id)` and `view_window(id)`. Popups open via
+`window::open(Settings)` with `exit_on_close_request: false` (closing
+a popup must never quit the browser) and `set_window_title` batched
+with the open task; the app subscribes with `event::listen_with` and
+routes Opened / Closed / CloseRequested per window id. Windows are
+single-instance per kind — opening one that is already open just
+focuses it (`window::gain_focus`). `handle_iced_event` and
+`on_window_resize` are gated on the main window id, so popup
+coordinates never reach the page. The main window's `view()` is
+unchanged; `view_window(id)` dispatches to `view_popup(id)` for any
+other window, and an unknown id gets an empty container, never a
+panic. The `app` module moved from an inline block in `main.rs` to
+`crates/frost/src/app.rs` so `windows.rs` can live under it as a
+child module (`src/app/windows.rs`) and see `Frost`'s private fields.
+
+**Popup transparency is load-bearing.** iced's wgpu compositor picks
+one alpha mode at startup from the main window's surface
+(PreMultiplied — libcosmic creates the main window transparent, so
+its surface is a 32-bit visual) and applies that mode to every
+window's surface. A popup opened opaque gets a 24-bit visual whose
+surface supports only [Opaque, Inherit], and `surface.configure`
+with PreMultiplied panics fatally, killing the browser (found
+2026-11-15 on the first Settings-window open). Every popup is
+therefore opened with `transparent: true`; its content paints fully
+opaque, so it looks identical.
+
+**Round 2 already shipped a working `frost://open` without the
+server:** the app generated the directory listing as HTML
+(`crates/frost/src/file_browser.rs`, starting at `$HOME`, hidden
+entries skipped, directories first) and loaded it through the engine
+as a `data:` page. Folder links pointed at
+`frost://open?path=<url-encoded path>`; the app intercepted those
+navigations — on the `UrlChanged` engine event, and also by polling
+`webview.url()` each tick — and re-listed the folder. File links are
+plain `file://` URLs, which Servo loads natively. In Round 7 that
+listing became a native window (`file_browser.rs` rewritten to a
+native API: `list_dir`, `DirEntry`, `human_size`, `read_markdown`,
+`markdown_blocks`); folder navigation is window state now, not
+webview history, so it can never disturb Back/Forward on pages.
+Settings and Print were placeholder `data:` pages in Round 2; the
+Round 3 server served them for real, and Round 7 turned them into
+windows. Print is a real preview since Round 4 (F-003): the app
+captures the current page as a PNG before opening the window, and
 "Save as PNG" writes it to ~/Downloads. It says plainly it is a
 viewport screenshot, not paginated print layout — Servo 0.8.0 has no
 print pipeline, so there is no print-to-PDF or printer output.
@@ -334,19 +370,19 @@ FORK.md):
   pattern as `request_screenshot_png` works. Only `JSValue::String` is
   accepted back (a pure `js_string_result` helper, unit-tested).
 - **Snapshot model (the single-webview answer).** Frost has one webview,
-  so navigating to `frost://inspector` would replace the page being
+  so an inspector that lived in it would replace the page being
   inspected. The menu entry / F12 captures the DOM FIRST (walker runs
-  in the current page), stores the snapshot in the loopback server's
-  shared state, and only then opens `frost://inspector`, which fetches
-  `/inspector/snapshot.json` and renders the tree. The page is labeled
-  "Snapshot of <url>, captured <time>, N nodes — not a live view", with
-  "Back to the page" and "Re-capture" links; "Re-capture" sets a flag
-  and 303s back to the inspected page, and the app captures again once
-  it loads. Opening `frost://inspector` with no snapshot shows an honest
-  "No page inspected yet" page. A failed capture leaves the current
-  page up and reports in the status line.
-- The inspector page renders the tree with JS +/− toggles (not
-  `<details>` — the toggle is Frost's own code); clicking a node fills
+  in the current page), and only then opens the Inspector window on
+  the snapshot (Rounds 3–6 stored it in the loopback server's shared
+  state and opened `frost://inspector`; Round 7 holds it in the
+  `InspectorWindow` state — same model, no server). The window is
+  labeled "Snapshot of <url>, captured <time>, N nodes — not a live
+  view", with "Back to the page" and "Re-capture" buttons;
+  "Re-capture" re-runs the walker on the live page (which never left
+  the main window) and replaces the snapshot in place. A failed
+  capture leaves the current page up and reports in the status line.
+- The Inspector window renders the tree with +/− toggles (iced
+  buttons; the toggle is Frost's own code); clicking a node fills
   the details pane (tag, full attributes, text, computed style, box).
 - What v1 does NOT do: no live editing, no live updates, no
   click-to-inspect from the page (that needs a docked panel inside the

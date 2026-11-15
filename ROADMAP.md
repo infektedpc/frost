@@ -176,6 +176,29 @@ No new features — this round finishes what Round 3 left open:
   work. The sandbox cannot catch a one-frame flash directly
   (SwiftShader paints ~1 s/frame) — Joel's box is the real verdict.
 
+## Round 7 — native windows, loopback server deleted (DONE 2026-11-15)
+
+- **Joel's direction: menu pages pop up in their own libcosmic
+  windows; Frost runs no internal web server.** `server.rs` and all
+  `frost://` handling are deleted. Settings, Print, Open file,
+  Inspector, and Exit are native windows
+  (`crates/frost/src/app/windows.rs`); Extensions moved into the
+  Settings window; Markdown renders natively in the Open window
+  (pulldown-cmark → iced widgets). Typing a `frost://` URL fails
+  plainly with an honest status message. No fork patch.
+- **Multi-window mechanics:** the `multi-window` libcosmic feature is
+  enabled; popups open with `window::open(Settings)` +
+  `exit_on_close_request: false`, `set_window_title` batched with the
+  open task; `event::listen_with` routes Opened / Closed /
+  CloseRequested per window id. Single-instance per kind (re-open
+  focuses). The `app` module moved to `src/app.rs` so `windows.rs`
+  can live under it (`src/app/windows.rs`).
+- Gate: build green (serialized); tests 45 (baseline 52/52 +
+  new file-browser + windows tests); one firsthand-read screenshot
+  per new window; loopback-gone gate (no server listening, `frost://`
+  fails plainly); regressions (settings persist, banner,
+  back/forward, F12 Inspector, print Save, strip-upload scrolling).
+
 ## Later rounds (in rough order)
 
 - Frostbite tab hibernation, Snowplow network-layer blocking, Deep Freeze

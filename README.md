@@ -5,15 +5,16 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 6 — flashing fix.** Joel's verdict on the 0.4.0 .deb:
-the browser works, but drawing flashes a lot, mainly on load and
-scroll — not on a still page. The cause was in the app's upload path,
-not the engine: every new frame minted a fresh iced texture handle,
-and iced only uploads raster images synchronously under 2 MiB — a
-3.5 MB frame went to a worker thread and drew NOTHING for one frame.
-The fix splits each frame into horizontal strips under the 2 MiB
-line, so every strip draws the same frame it arrives. No fork patch.
-See [ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 7 — native windows, loopback server deleted.** Joel's
+direction (2026-11-14): the hamburger menu's pages should pop up in
+their own libcosmic windows, so Frost runs no internal web server at
+all. `server.rs` and every `frost://` page are gone; Settings, Print,
+Open file, Inspector, and Exit are now separate native windows
+(`crates/frost/src/app/windows.rs`), Extensions live in the Settings
+window, and Markdown renders natively in the Open window. Typing a
+`frost://` URL fails plainly. The Round 6 strip-upload flashing fix
+is untouched — it lives in the main-window render path. See
+[ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -607,3 +608,156 @@ Not proven / known limits:
   exact pixel rows (blue-pixel bands or an enlarged crop) before
   clicking; hit-testing itself is correct (`elementFromPoint`
   matches `getBoundingClientRect`).
+
+## Round 7 — native windows, loopback server deleted (what is proven, what is not)
+
+Joel (2026-11-14): the hamburger menu's pages should pop up in their
+own windows, drawn with libcosmic, so Frost runs no internal web
+server. The `frost://` loopback server (`crates/frost/src/server.rs`,
+~700 lines) is deleted, and every menu page is rebuilt as a native
+libcosmic window in `crates/frost/src/app/windows.rs`. No fork patch;
+the fork is untouched at `f9462dbb7`.
+
+What replaced each `frost://` page:
+
+- `frost://settings` → **Settings window** (640×620): theme
+  Dark/Light, homepage, default search engine (DuckDuckGo default),
+  "Ask before quitting" — the same options, the same JSON settings
+  file, honored on relaunch. Edits go to a draft; **Save** validates
+  the homepage (`is_loadable_homepage`, moved from `server.rs`),
+  persists, and applies the theme. Reset restores defaults and
+  applies immediately. One interaction change: the theme now applies
+  on Save, not instantly per click as the old page's theme links did.
+- `frost://print` → **Print window** (960×720): the same WebView
+  screenshot preview (`Handle::from_bytes`) + "Save as PNG" to
+  `~/Downloads` (path shown), with the same honest note that Servo
+  0.8.0 has no print pipeline (no print-to-PDF/printer output). A
+  failed capture opens the window on the error instead of a blank
+  page. The printed page's label/title/URL are frozen at print-open
+  time, so the header never flickers after a Save (the Round 4/5
+  wart is gone with the page it lived on).
+- `frost://open` → **Open file window** (880×640): the real file
+  browser (`crates/frost/src/file_browser.rs`, rewritten to a native
+  API — `list_dir`, `DirEntry`, `human_size`, `read_markdown`,
+  `markdown_blocks`), listing from `$HOME`, dirs first, sizes shown,
+  folder clicks navigate, file clicks open via `file://` in the main
+  window. Markdown renders **natively**: pulldown-cmark events become
+  styled native widgets (headings, paragraphs, code, lists, quotes,
+  rules; inline emphasis is flattened to plain text, math source is
+  kept as text) — nothing was silently dropped.
+- `frost://inspector` → **Inspector window** (1100×720): the Round 5
+  snapshot model is unchanged — menu/F12 captures the DOM first, the
+  window shows the tree labeled "Snapshot of <url>, captured <time>,
+  N nodes — not a live view", node click fills the details pane
+  (attributes, computed style, viewport box), collapse toggles work,
+  "Back to the page" + "Re-capture" (re-capture replaces the snapshot
+  in place; the live page never left the main window). Same cap (8000
+  nodes / 64 deep). No live editing, no live updates, no
+  click-to-inspect — same limits as v1.
+- `frost://exit` → **Exit dialog** (420×200): "Quit Frost?" / Cancel,
+  shown only when "Ask before quitting" is on; otherwise the menu's
+  Exit quits directly.
+- `frost://extensions` → **Extensions section inside the Settings
+  window**: the loaded extensions (name, version, enabled) and the
+  failed ones (directory + error), plus the load-path note. The
+  extension host v1 + sample banner on example.org keep working
+  exactly as before.
+
+Typing a `frost://` URL in the address bar now fails plainly with an
+honest status message ("Frost no longer has internal pages — Settings,
+Print, Open file, and Inspector open in their own windows from the ☰
+menu.") and leaves the current page alone — never a dead page, never
+a hang. `resolve_address` no longer treats `frost` as a loadable
+scheme. Search-engine routing for bare queries and `file://` opening
+are unchanged.
+
+How multi-window works (libcosmic 1.0.0 / iced 0.14, vendored
+checkout `ecc5fe4`): the `multi-window` feature is now enabled on the
+libcosmic dep (it is an empty flag that turns on the two-arg
+`title(id)` / `set_window_title(title, id)` and `view_window(id)`).
+Popups open via `window::open(Settings)` with
+`exit_on_close_request: false` (closing a popup must never quit the
+browser) and `set_window_title` batched with the open task; the app
+subscribes with `event::listen_with` and routes Opened / Closed /
+CloseRequested per window id. Windows are single-instance per kind —
+opening one that is already open just focuses it (`window::gain_focus`).
+`handle_iced_event` and `on_window_resize` are gated on the main window id, so popup
+coordinates never reach the page. The main window's `view()` is
+unchanged; `view_window(id)` dispatches to `view_popup(id)` for any
+other window, and an unknown id gets an empty container, never a
+panic. The `app` module moved from an inline block in `main.rs` to
+`crates/frost/src/app.rs` so `windows.rs` can live under it as a
+child module (`src/app/windows.rs`) and see `Frost`'s private fields.
+
+**Popup transparency is load-bearing, not cosmetic.** iced's wgpu
+compositor picks ONE alpha mode at startup from the main window's
+surface (PreMultiplied — libcosmic creates the main window
+transparent, so its surface is a 32-bit visual) and applies that
+same mode to every window's surface. A popup opened with iced's
+default `transparent: false` gets a 24-bit visual whose surface
+supports only [Opaque, Inherit], and `surface.configure` with
+PreMultiplied panics fatally — the first Settings-window open in
+this round crashed the whole browser that way (wgpu validation
+error in `Surface::configure`, `Requested alpha mode PreMultiplied
+is not in the list of supported alpha modes: [Opaque, Inherit]`).
+Every popup is therefore opened with `transparent: true`, giving it
+the same 32-bit visual as the main window; the popup content paints
+fully opaque, so the windows look identical. This is an iced/libcosmic
+platform quirk, not a Frost bug — it will bite any second window on
+any X11 setup where the main window is transparent.
+
+**Settings hit-testing is correct; an earlier "−24 px offset" was a
+harness misread, not a bug.** During gating, clicks aimed at the
+theme-row buttons kept missing — but the buttons render at y≈184–215
+(pixel-measured) and the clicks were landing at y≈225–227, below
+them. Clicks at the buttons' true rendered positions fire first try
+(theme, search, toggle, Save, field, extensions — all verified). A
+`scrollable` wrapper was briefly removed from the Settings view on
+that false lead and then restored; the Settings content scrolls if
+the extensions list ever outgrows the window.
+
+Proven (sandbox, 2026-11-15, under Xvfb + software GL; gates re-ran
+live against the shipped tree):
+
+- `cargo build -p frost --features ui-libcosmic` green (serialized,
+  `CARGO_BUILD_JOBS=1`, ~40 min); `cargo test --workspace --lib
+  --bins` green — 45 tests (baseline 52/52 after Round 6; new
+  tests: file-browser listing sort/hidden + markdown blocks +
+  markdown round-trip + human sizes, windows capture-time format +
+  print-save write + node labels + visible-rows collapse).
+- Visual gates, screenshots read firsthand (paths in the delivery
+  note): Settings window with all four options; Print window preview
+  + Save writes a PNG; Open window lists `$HOME`, folder + file
+  clicks work; Inspector window shows the real example.org tree with
+  node details; Exit dialog appears and respects Ask-before-quitting
+  off. Loopback-gone gate: no server listening, `frost://` fails
+  plainly.
+- Regression: settings save + persist across relaunch (homepage
+  example.com applied on relaunch), banner on example.org and
+  correctly absent on example.com, back/forward on pages and across
+  file-browser folders, F12 Inspector capture, print Save,
+  strip-upload scrolling (tall page scrolls fully painted, no blank
+  frames).
+
+Not proven / known limits:
+
+- Mouse-wheel scrolling still unproven under Xvfb (carried from
+  Round 2). Real mouse/keyboard, drag latency, and whether the
+  flashing is gone on real hardware are Joel's-box verdicts.
+- Theme applies on Save, not instantly per click (see above) — a
+  minor interaction change from the old settings page.
+- Two cosmetic warts: the main window's status bar keeps
+  "Capturing print preview…" / "Capturing page structure…" after
+  the capture finishes (the status is never cleared once the popup
+  opens; it clears on the next navigation), and the Settings window
+  has no in-content Close button (it closes via the OS close button
+  / CloseRequested only).
+- The Round 4/5 warts that lived in the loopback pages (file-browser
+  history quirk, print "Page:" flicker, print-save `create_dir_all`
+  gap) are gone with the pages; the print save now recreates
+  `~/Downloads` if missing, and the Open window's folder navigation
+  is window state, not webview history, so Back/Forward on pages are
+  never disturbed by it.
+- The harness lesson from Round 6 still applies: serialize links
+  (`CARGO_BUILD_JOBS=1`, `--lib --bins` for the full suite) — three
+  parallel ~2 GB debug links OOM-kill the run.

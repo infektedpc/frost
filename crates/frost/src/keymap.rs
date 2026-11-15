@@ -582,7 +582,8 @@ pub fn map_key(key: &IcedKey) -> FrostKey {
 /// but the webview was fed only the logical key — page text inputs got
 /// `;` instead of `:`, so no `http(s)` URL could ever be typed into a
 /// page (found 2026-11-13: the settings homepage kept submitting
-/// `https;//example.com` and the server rightly rejected it).
+/// `https;//example.com` and the settings validation rightly
+/// rejected it).
 ///
 /// Prefer `text` for printable (`Character`) keys only. Named keys keep
 /// their logical key: `text` for Enter is `"\r"`, which Servo must not

@@ -36,4 +36,4 @@ pulldown-cmark = "0.13"
 # (`GpuImageCopyBuffer`) that no published web-sys has. HEAD resolves.
 # API note: the app skeleton in src/main.rs was written against the v0.12
 # example; if HEAD changed the Application API, the check will say so.
-libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "ecc5fe4164e1c9024b932382d24ea41f24147e75", default-features = false, features = ["winit", "tokio"], optional = true }
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "ecc5fe4164e1c9024b932382d24ea41f24147e75", default-features = false, features = ["winit", "tokio", "multi-window"], optional = true }
