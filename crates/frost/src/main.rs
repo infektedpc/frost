@@ -2,8 +2,12 @@
 //!
 //! Round 2 wires the engine in for real:
 //!
-//! * The content area shows the live Servo frame, uploaded into an iced
-//!   texture whenever the engine reports `FrameReady` (or while loading).
+//! * The content area shows the live Servo frame, uploaded into iced
+//!   textures whenever the engine reports `FrameReady` (or while loading).
+//!   Round 6: the frame goes up as horizontal strips, each under iced's
+//!   2 MiB synchronous-upload line — one whole-frame image per render
+//!   flashed dark for a frame on every load/scroll repaint (see
+//!   `Frame::split_strips`).
 //! * The toolbar navigates for real: back / forward (disabled when the
 //!   engine says there is nothing to go to), reload, stop (live since fork
 //!   patch F-001), address bar (Enter navigates; bare hostnames get
@@ -87,7 +91,7 @@ mod app {
     use cosmic::{executor, iced, ApplicationExt, Element};
     use frost_engine::{
         Engine, EngineEvent, FrostCode, FrostInputEvent, FrostKeyState,
-        FrostMouseButtonAction, FrostWebView,
+        FrostMouseButtonAction, FrostWebView, MAX_SYNC_UPLOAD_BYTES,
     };
     use frost_extensions::{ExtensionHost, ExtensionManifest, StubHost};
     use frost_inspector::{snapshot_from_json, DOM_WALK_SCRIPT};
@@ -150,8 +154,22 @@ mod app {
         core: Core,
         engine: Engine,
         webview: FrostWebView,
-        /// Latest uploaded frame, if one has painted yet.
-        frame: Option<Handle>,
+        /// Latest uploaded frame, as horizontal strips, if one has
+        /// painted yet. Each entry is an iced image handle plus the
+        /// strip's height in pixels; the strips tile the content area
+        /// top to bottom (see `Frame::split_strips`).
+        ///
+        /// Round 6: a frame is NEVER uploaded as one image. iced 0.14
+        /// uploads a raster image synchronously only when it is under
+        /// 2 MiB; a larger image is handed to a worker thread and is
+        /// NOT drawn on the frame it first appears — the widget draws
+        /// nothing for it, so the content area showed the chrome
+        /// background for one frame per new handle. Frost's full frame
+        /// (1280x684x4 = 3.5 MB) is over that line, so every frame
+        /// during load and scroll flashed dark, then popped back. The
+        /// strips are each under the line, so every strip takes the
+        /// synchronous path and is drawn the same frame it arrives.
+        frame_strips: Vec<(Handle, f32)>,
         /// A new frame is waiting to be uploaded.
         frame_dirty: bool,
         /// A load is in progress (Stop enabled, status shows it).
@@ -741,7 +759,7 @@ mod app {
                     core,
                     engine,
                     webview,
-                    frame: None,
+                    frame_strips: Vec::new(),
                     frame_dirty: false,
                     loading: true,
                     address: homepage.clone(),
@@ -884,13 +902,28 @@ mod app {
                     // Render ONLY when the engine flagged a new frame AND
                     // no load is in flight (see awaiting_load): a
                     // mid-load frame would show a half-loaded page.
+                    // Round 6: the frame is split into strips under
+                    // iced's 2 MiB synchronous-upload line (see
+                    // `Frame::split_strips` and the `frame_strips`
+                    // field): one whole-frame image per render flashed
+                    // dark for a frame on every load/scroll repaint.
                     if self.frame_dirty && !self.awaiting_load {
                         if let Some(frame) = self.webview.render() {
-                            self.frame = Some(Handle::from_rgba(
-                                frame.width,
-                                frame.height,
-                                frame.rgba,
-                            ));
+                            self.frame_strips = frame
+                                .split_strips(MAX_SYNC_UPLOAD_BYTES)
+                                .into_iter()
+                                .map(|strip| {
+                                    let height = strip.height as f32;
+                                    (
+                                        Handle::from_rgba(
+                                            strip.width,
+                                            strip.height,
+                                            strip.rgba,
+                                        ),
+                                        height,
+                                    )
+                                })
+                                .collect();
                             self.frame_dirty = false;
                         }
                     }
@@ -1243,21 +1276,35 @@ mod app {
                 widget::column::with_children(vec![]).into()
             };
 
-            // Web content area: the live Servo frame, or a loading note
-            // until the first frame paints.
-            let content: Element<Message> = match &self.frame {
-                Some(handle) => Image::new(handle.clone())
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .content_fit(ContentFit::Fill)
-                    .into(),
-                None => container(text("Loading…").size(16))
+            // Web content area: the live Servo frame as horizontal
+            // strips (Round 6), or a loading note until the first
+            // frame paints. The strips tile the area exactly — each is
+            // the frame's full width at its own height, no scaling, no
+            // seams — so the column is the whole frame at 1:1.
+            let content: Element<Message> = if self.frame_strips.is_empty() {
+                container(text("Loading…").size(16))
                     .style(move |_| chrome_container_style(colors))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .center_x(Length::Fill)
                     .center_y(Length::Fill)
-                    .into(),
+                    .into()
+            } else {
+                widget::column::with_children(
+                    self.frame_strips
+                        .iter()
+                        .map(|(handle, height)| {
+                            Image::new(handle.clone())
+                                .width(Length::Fill)
+                                .height(Length::Fixed(*height))
+                                .content_fit(ContentFit::Fill)
+                                .into()
+                        })
+                        .collect::<Vec<Element<'_, Message>>>(),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
             };
 
             let status = container(text(&self.status).size(13))

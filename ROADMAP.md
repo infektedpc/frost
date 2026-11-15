@@ -155,6 +155,27 @@ No new features — this round finishes what Round 3 left open:
   still work. Tests 49/49 green (frost 29, engine 4, extensions 8,
   inspector 8).
 
+## Round 6 — flashing fix (DONE 2026-11-15)
+
+- **Root cause: iced's 2 MiB synchronous-upload line, not the engine.**
+  Every new frame minted a fresh texture handle; a 3.5 MB frame went
+  to a worker thread and drew nothing for one frame — the flash Joel
+  saw on load and scroll. The engine was exonerated by a headless
+  probe (`frameprobe.rs`, kept as a diagnostic example): all 24
+  scroll renders were full frames.
+- **Fix (app-side, no fork patch):** `Frame::split_strips` tiles each
+  frame into horizontal strips under 1.9 MB; the app draws one image
+  per strip, so every strip takes the synchronous path and draws the
+  same frame it arrives. F-007 (full present) stays.
+- Gate: build green (38m 33s); tests **52/52** (frost 29, engine 7
+  incl. 3 new strip tests, extensions 8, inspector 8); example.org
+  paints fully on load; tall-page scroll fully painted at every
+  sampled step (incl. a rapid-fire burst mid-scroll); reload repaints
+  fully; settings persist across relaunch, banner, back/forward,
+  menu, Inspector (menu + F12), file browser, print Save all still
+  work. The sandbox cannot catch a one-frame flash directly
+  (SwiftShader paints ~1 s/frame) — Joel's box is the real verdict.
+
 ## Later rounds (in rough order)
 
 - Frostbite tab hibernation, Snowplow network-layer blocking, Deep Freeze

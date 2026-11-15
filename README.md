@@ -5,15 +5,15 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 5 — Inspector v1.** A working HTML inspector: open it
-from the hamburger menu (or F12) and Frost captures the current page's
-DOM with an in-page walker script — no fork patch, because the fork's
-`WebView::evaluate_javascript` already returns values — then shows the
-snapshot at `frost://inspector` (expandable tree, click a node for its
-attributes/text/computed style/box, "Back to the page", "Re-capture").
-The three Round 4 warts are fixed in the same round: the file-browser
-history quirk, the print-save `~/Downloads` gap, and the "Not found"
-flash after Save. See [ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 6 — flashing fix.** Joel's verdict on the 0.4.0 .deb:
+the browser works, but drawing flashes a lot, mainly on load and
+scroll — not on a still page. The cause was in the app's upload path,
+not the engine: every new frame minted a fresh iced texture handle,
+and iced only uploads raster images synchronously under 2 MiB — a
+3.5 MB frame went to a worker thread and drew NOTHING for one frame.
+The fix splits each frame into horizontal strips under the 2 MiB
+line, so every strip draws the same frame it arrives. No fork patch.
+See [ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -412,6 +412,112 @@ Not proven / known limits:
   code — the inspector page reads them from the served JSON instead.
   The fields stay as the snapshot record; the warning is noted, not
   hidden.
+
+## Round 6 — flashing fix (what is proven, what is not)
+
+Joel's verdict on the 0.4.0 .deb (2026-11-14 ~07:43): "the browser
+works but its drawing isnt entirely smooth theres alot of flashing
+going on." Asked (2026-11-14 ~18:41) whether it flashes all the time
+or mainly on load/scroll, he answered: mainly on load and scroll,
+not on a still page. That pointed the fix at the load/scroll paint
+path.
+
+**Root cause, proven by code reading + a headless probe.** Round 4's
+F-007 (full present) was the prime suspect — it repaints the whole
+scene every frame — but the engine was exonerated first: a headless
+probe (`crates/frost-engine/examples/frameprobe.rs`) scrolled a
+4000 px test page 12 steps down and back up and logged every render;
+all 24 renders were full frames (223–923 distinct colors, center
+pixel tracking the bands), never a solid or blank frame. `render()`
+returns complete pixels during scroll. The fault is in the app's
+upload path, in iced 0.14 (vendored in the libcosmic checkout Frost
+builds against):
+
+1. `Handle::from_rgba` mints a unique id per call, so the app's
+   one-new-handle-per-frame meant a brand-new texture every frame.
+2. iced's wgpu image cache uploads a raster image synchronously
+   ONLY when it is under `MAX_SYNC_SIZE` = 2 MiB; anything larger
+   goes to a worker thread and `upload_raster` returns `None`.
+3. The image pipeline adds no instances when `upload_raster`
+   returns `None` — the widget draws NOTHING for that frame, so the
+   content area shows the chrome background.
+4. The worker requests a redraw when the upload lands, so the frame
+   appears one draw later — but by then the app has usually replaced
+   it with a newer handle during load/scroll.
+5. Frost's full frame is 1280x684x4 = 3,502,080 B > 2 MiB, so EVERY
+   frame during load and scroll cost one blank draw. A still page
+   reuses the same handle (already uploaded), so it never flashes —
+   exactly Joel's symptom. The atlas-full theory was checked and
+   ruled out (`Atlas::allocate` grows a layer instead of failing).
+
+**Fix (app-side, no fork patch — no F-number): split the frame into
+horizontal strips, each under iced's 2 MiB synchronous-upload line.**
+`Frame::split_strips` (`frost-engine`, `MAX_SYNC_UPLOAD_BYTES` =
+1.9 MB with margin) tiles the frame exactly — same width, heights
+summing to the frame height, rows in order — and the app uploads one
+`Handle` per strip, drawn as a column of images at 1:1. Every strip
+takes the synchronous path and is drawn the same frame it arrives:
+no worker hop, no one-frame delay, no blank draw. The strip count
+adapts to the viewport (1280x684 → 2 strips; 1920x984 → 4). Unit
+tests prove the tiling and the under-the-limit invariant for the
+sizes Frost renders at. F-007 (full present) stays — reverting it
+would bring back the partial-paint loss. `frameprobe.rs` remains in
+the tree as a diagnostic example (same status as `smoke.rs`).
+
+Proven (sandbox, 2026-11-15, under Xvfb :97 + software GL; gates
+re-ran live against the shipped tree):
+
+- **Build green** (`cargo build -p frost --features ui-libcosmic`,
+  38m 33s; one warning — the known Round 5 `InspectorSnapshot`
+  dead-code cosmetic).
+- **Tests 52/52** (`cargo test --workspace --lib --bins`: frost bin
+  29, engine 7, extensions 8, inspector 8 — the engine's 3 new
+  `split_strips` tests all pass). Note: the first full-workspace
+  run was OOM-killed at the frameprobe example link (three parallel
+  2 GB debug links); the rerun with `CARGO_BUILD_JOBS=1` and
+  `--lib --bins` (skips the example links) passed cleanly.
+- **Load paints fully** (`r6-09-launch-r6.jpg`): example.org with
+  the banner, no blank intermediate frame.
+- **Scroll paints fully at every step** (`r6-10`–`r6-14`): tall
+  10-band test page, PageDown ×2, Space, plus a rapid-fire burst
+  during a scroll — every sampled frame is fully painted (BAND
+  1/2 → 2/3 → 3/4 → 5/6 → burst 5/6 → 6/7), no blank or dark
+  content area anywhere. The strip seam is invisible (strips tile
+  exactly).
+- **Reload repaints fully** (`r6-15-reload1/2-r6.jpg`): back at
+  scroll-top, BAND 1/2 fully painted 2 s and 10 s after the click.
+- **Regression — all pass:** settings save + persist across
+  relaunch (homepage set to example.com in the UI, `settings.json`
+  on disk, relaunch loads example.com — `r6-17/18/19`); banner on
+  example.org (`r6-20/22`) and correctly absent on example.com
+  (`r6-19/23`); Back/Forward on normal pages (`r6-21/22/23`) and
+  across file-browser folders (`r6-28/29/30`); all five menu
+  entries open (`r6-16` menu shot; Settings `r6-17`, Print `r6-36`,
+  Inspector `r6-24`, Open `r6-26`, Exit confirmation `r6-39`,
+  Quit exits cleanly); Inspector snapshot via menu (`r6-24`, 33
+  nodes on example.com) and via F12 (`r6-25`, fresh capture
+  4:51:59 AM); file-browser folder click into workspace (`r6-27`)
+  and file click opening AGENTS.md as rendered Markdown
+  (`r6-35`); print Save writes
+  `~/Downloads/frost-print-1794718653.png` (141,710 B) and the
+  page shows the saved path with the header still "Example Domain"
+  — no "Not found" flash (`r6-37`).
+
+Not proven / known limits:
+
+- Mouse-wheel scrolling still unproven under Xvfb (carried from
+  Round 2 — the harness's `xwheel` sends XSendEvent button 4/5,
+  which moves nothing through the real app). Keyboard scroll
+  (PageDown/Space) is the gated path. wgpu adapter on Haswell, real
+  mouse/keyboard, and drag latency are Joel's-box verdicts.
+- The sandbox cannot catch a one-frame flash directly: SwiftShader
+  paints at ~0.5–1 s/frame, so the worker upload completes inside
+  the same paint window and burst screenshots never saw a blank
+  frame even on the Round 5 binary. The fix is proven by the
+  mechanism (code-reading of iced's cache + the headless engine
+  probe) and by the strip invariant in unit tests, plus the visual
+  gates below showing full paints at every step. The real verdict is
+  Joel's box.
 
 ## Round 4 — what is proven, what is not
 

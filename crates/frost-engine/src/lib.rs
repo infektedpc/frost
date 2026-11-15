@@ -71,6 +71,26 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
+/// Largest single image iced 0.14 uploads synchronously. iced's wgpu
+/// image cache (`upload_raster`) uploads a raster image inline only
+/// when its byte length is under `MAX_SYNC_SIZE` (2 MiB); anything
+/// larger is handed to a worker thread and is NOT drawn on the frame
+/// it first appears — the widget draws nothing for it that frame.
+/// Frost's full frame (1280x684x4 = 3.5 MB) is over that line, so
+/// every new frame cost one blank draw: the content area showed the
+/// chrome background while loading and scrolling, then popped back.
+/// That is the flashing Joel reported (Round 6). Frames are therefore
+/// split into strips under this cap (see [`Frame::split_strips`]).
+/// The cap sits below iced's 2 MiB line with margin, so a strip is
+/// always on the synchronous path.
+pub const MAX_SYNC_UPLOAD_BYTES: usize = 1_900_000;
+
+/// iced 0.14's synchronous-upload threshold, in bytes. A raster image
+/// whose RGBA byte length is at or above this is uploaded by iced's
+/// worker thread and skipped on its first draw. Kept here so the
+/// strip invariant is tested against the real number, not the cap.
+pub const ICED_SYNC_UPLOAD_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
 impl Frame {
     /// True when every pixel is the same color (used by the smoke test to
     /// catch a blank/never-painted frame).
@@ -88,6 +108,42 @@ impl Frame {
             .map(|px| [px[0], px[1], px[2], px[3]])
             .collect::<HashSet<_>>()
             .len()
+    }
+
+    /// Byte length of the RGBA pixel data (`width * height * 4`).
+    pub fn byte_len(&self) -> usize {
+        self.rgba.len()
+    }
+
+    /// Split the frame into horizontal strips, each no larger than
+    /// `max_bytes` (see [`MAX_SYNC_UPLOAD_BYTES`]). The strips tile
+    /// the frame exactly: same width, heights summing to the frame
+    /// height, rows in order, no gaps or overlaps. A frame already
+    /// under the cap comes back as a single strip. A degenerate
+    /// (zero-size) frame splits into no strips.
+    pub fn split_strips(&self, max_bytes: usize) -> Vec<Frame> {
+        if self.width == 0 || self.height == 0 || self.rgba.is_empty() {
+            return Vec::new();
+        }
+        let row_bytes = self.width as usize * 4;
+        // Rows per strip, floored so a strip never exceeds the cap.
+        // A single row wider than the cap still fits one row per strip
+        // (absurd widths aside, that is the tightest possible split).
+        let rows_per_strip = (max_bytes / row_bytes).max(1);
+        let mut strips = Vec::new();
+        let mut y = 0u32;
+        while y < self.height {
+            let rows = rows_per_strip.min((self.height - y) as usize) as u32;
+            let start = (y as usize) * row_bytes;
+            let end = start + (rows as usize) * row_bytes;
+            strips.push(Frame {
+                width: self.width,
+                height: rows,
+                rgba: self.rgba[start..end].to_vec(),
+            });
+            y += rows;
+        }
+        strips
     }
 }
 
@@ -564,6 +620,101 @@ mod tests {
         };
         assert!(!mixed.is_solid_color());
         assert_eq!(mixed.distinct_colors(), 2);
+    }
+
+    /// A frame whose rows are painted with their row index, so a strip
+    /// can be checked for exact row coverage.
+    fn row_painted_frame(width: u32, height: u32) -> Frame {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for _ in 0..width {
+                rgba.extend_from_slice(&[y as u8, 0, 0, 255]);
+            }
+        }
+        Frame {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    fn assert_strips_tile(frame: &Frame, strips: &[Frame]) {
+        assert_eq!(
+            strips.iter().map(|s| s.height).sum::<u32>(),
+            frame.height,
+            "strip heights must sum to the frame height"
+        );
+        assert!(strips.iter().all(|s| s.width == frame.width));
+        // Rows in order, no gaps or overlaps: strip i starts at the
+        // row the previous strips covered.
+        let mut y = 0u32;
+        for strip in strips {
+            for row in 0..strip.height {
+                let px = &strip.rgba[(row as usize) * (strip.width as usize) * 4..][..4];
+                assert_eq!(
+                    px[0], y as u8,
+                    "strip row {row} must carry source row {y}"
+                );
+                y += 1;
+            }
+        }
+        assert_eq!(y, frame.height);
+    }
+
+    #[test]
+    fn split_strips_tiles_and_stays_under_iced_sync_limit() {
+        // The sizes Frost actually renders at, plus odd shapes.
+        for (w, h) in [
+            (1280, 684),
+            (1920, 984),
+            (800, 600),
+            (1280, 800),
+            (100, 100),
+            (1, 1),
+            (640, 341),
+            (1280, 1),
+            (3, 7),
+        ] {
+            let frame = row_painted_frame(w, h);
+            let strips = frame.split_strips(MAX_SYNC_UPLOAD_BYTES);
+            assert!(!strips.is_empty(), "{w}x{h}: no strips");
+            assert_strips_tile(&frame, &strips);
+            for strip in &strips {
+                assert!(
+                    strip.byte_len() < ICED_SYNC_UPLOAD_LIMIT_BYTES,
+                    "{w}x{h}: strip {}x{} is {} bytes, over iced's sync limit",
+                    strip.width,
+                    strip.height,
+                    strip.byte_len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_strips_is_one_strip_when_small() {
+        let frame = row_painted_frame(100, 50);
+        let strips = frame.split_strips(MAX_SYNC_UPLOAD_BYTES);
+        assert_eq!(strips.len(), 1);
+        assert_eq!(strips[0].width, 100);
+        assert_eq!(strips[0].height, 50);
+        assert_eq!(strips[0].rgba, frame.rgba);
+    }
+
+    #[test]
+    fn split_strips_handles_degenerate_frames() {
+        let empty = Frame {
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+        };
+        assert!(empty.split_strips(MAX_SYNC_UPLOAD_BYTES).is_empty());
+        let no_rows = Frame {
+            width: 10,
+            height: 0,
+            rgba: Vec::new(),
+        };
+        assert!(no_rows.split_strips(MAX_SYNC_UPLOAD_BYTES).is_empty());
     }
 
     #[test]

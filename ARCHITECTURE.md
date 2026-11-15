@@ -166,6 +166,70 @@ Later rounds may switch the context to a GPU path (the dmabuf fork patch
 exists for exactly this), but the `render() -> Frame` contract does not
 change — the UI never sees how the pixels were produced.
 
+### The flashing on load and scroll (Round 6, 2026-11-14; app-side, no fork patch)
+
+Joel's verdict on the 0.4.0 .deb (2026-11-14 ~07:43): "the browser
+works but its drawing isnt entirely smooth theres alot of flashing
+going on." He added (2026-11-14 ~18:41) that the flashing is mainly
+on load and scroll, not on a still page. Round 4's F-007 (full
+present) was the prime suspect — it repaints the whole scene every
+frame — but the investigation proved the engine innocent:
+
+- A headless probe (`crates/frost-engine/examples/frameprobe.rs`)
+  rendered the engine's frames during a 12-step scroll down and back
+  up a 4000 px test page: all 24 renders were full frames
+  (223–923 distinct colors, center pixel tracking the bands), never
+  a solid or blank frame. `render()` returns complete pixels during
+  scroll; the engine does not produce blank frames.
+- The fault is in the APP's upload path, in iced 0.14 (vendored in
+  the libcosmic checkout Frost builds against). `Handle::from_rgba`
+  mints a fresh unique id per call (`iced/core/src/image.rs`), so
+  the app's one-new-handle-per-frame meant a brand-new texture every
+  frame. iced's wgpu image cache (`upload_raster`,
+  `iced/wgpu/src/image/cache.rs`) uploads a raster image
+  synchronously only when it is under `MAX_SYNC_SIZE` (2 MiB);
+  anything larger is handed to a worker thread and `upload_raster`
+  returns `None` — and the image pipeline (`State::prepare`,
+  `iced/wgpu/src/image/mod.rs`) adds no instances for it, so the
+  widget draws NOTHING for that frame: the content area shows the
+  chrome background. The worker requests a redraw when the upload
+  lands, so the frame appears one draw later — but by then the app
+  has usually replaced it with a newer handle. Frost's full frame
+  (1280x684x4 = 3.5 MB) is over the line, so every frame during load
+  and scroll cost one blank (dark) draw: the page vanished while
+  scrolling/loading and popped back when activity paused. A still
+  page reuses the same handle — already uploaded — so it never
+  flashes. That matches Joel's symptom exactly, including "not on a
+  still page".
+- The atlas-full theory was checked and ruled out: `Atlas::allocate`
+  grows a new layer instead of failing for Frost's size, so no
+  `OutOfMemory` blank comes from there.
+
+**Round 6 fix (app-side, no fork patch): split the frame into
+horizontal strips, each under iced's 2 MiB synchronous-upload line.**
+`Frame::split_strips` (`frost-engine`, `MAX_SYNC_UPLOAD_BYTES` =
+1.9 MB with margin) tiles the frame exactly — same width, heights
+summing to the frame height, rows in order — and the app uploads
+one `Handle` per strip, drawn as a column of images at 1:1. Every
+strip takes the synchronous path and is drawn the same frame it
+arrives: no worker hop, no one-frame delay, no blank draw. The
+strip count adapts to the viewport (1280x684 → 2 strips; a
+1920x984 content area → 4). Unit tests prove the tiling and the
+under-the-limit invariant for the sizes Frost renders at. No fork
+change, so no F-number; F-007 (full present) stays — reverting it
+would bring back the partial-paint loss.
+**Gates (sandbox, 2026-11-15, Xvfb :97 + software GL):** build green
+(38m 33s); tests **52/52** (frost bin 29, engine 7 incl. the 3 new
+strip tests, extensions 8, inspector 8); example.org paints fully on
+load; a 10-band tall page scrolls fully painted at every sampled
+step (PageDown ×2, Space, rapid-fire burst mid-scroll — no blank
+frame); reload repaints fully. Regression: settings persist across
+relaunch, banner on example.org (absent on example.com), Back/Forward
+on pages and across file-browser folders, all five menu entries,
+Inspector via menu + F12, file-browser folder/file clicks, print Save
+to ~/Downloads. Screenshots `r6-09`–`r6-39` in
+`~/workspace/harness-tmp/frost/`.
+
 ### The loading flag and Stop (Round 4, F-008 app-side)
 
 The Stop button (✕) is live only while `self.loading` is true, and
