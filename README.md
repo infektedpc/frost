@@ -5,15 +5,14 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 7 — native windows, loopback server deleted.** Joel's
-direction (2026-11-14): the hamburger menu's pages should pop up in
-their own libcosmic windows, so Frost runs no internal web server at
-all. `server.rs` and every `frost://` page are gone; Settings, Print,
-Open file, Inspector, and Exit are now separate native windows
-(`crates/frost/src/app/windows.rs`), Extensions live in the Settings
-window, and Markdown renders natively in the Open window. Typing a
-`frost://` URL fails plainly. The Round 6 strip-upload flashing fix
-is untouched — it lives in the main-window render path. See
+**Status: Round 8 — Firefox-style hamburger dropdown.** Joel's
+direction (2026-11-15, with a Firefox application-menu screenshot):
+the hamburger menu should drop down like Firefox's — a compact
+panel anchored top-right under the ☰ button, not the full-width bar
+of Rounds 2–7. Same five items, same native windows, same behavior;
+the panel is 300 px wide with separators, F12 next to Inspector,
+hover highlight, and closes on pick / Escape / click-outside / ☰
+again. No fork patch; the fork is untouched at `f9462dbb7`. See
 [ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
@@ -791,3 +790,139 @@ Not proven / known limits:
 - The harness lesson from Round 6 still applies: serialize links
   (`CARGO_BUILD_JOBS=1`, `--lib --bins` for the full suite) — three
   parallel ~2 GB debug links OOM-kill the run.
+
+## Round 8 — Firefox-style hamburger dropdown (what is proven, what is not)
+
+Joel (2026-11-15, with a screenshot of Firefox's application menu):
+Frost's menu was a full-width bar that dropped down across the entire
+window under the toolbar — a plain list of teal links spanning the
+whole width. He wants it like Firefox's: a compact panel anchored at
+the top-right, directly under the ☰ button. Menu only — nothing the
+menu items do changes, no new items, no fork patch (the fork is
+untouched at `f9462dbb7`), no server, no .deb.
+
+What the panel is (`crates/frost/src/app.rs`, `MENU_ITEMS` table so
+the spec and the rendering cannot drift; `crates/frost/src/settings.rs`
+gains `menu_hover` / `menu_border` on `ChromeColors`):
+
+- 300 px wide, 8 px from the right edge, 4 px below the toolbar
+  (`menu_panel_geometry` from the live window width). At 800 px wide
+  it still anchors top-right (panel x 492); on a window narrower
+  than the panel it shrinks instead of running off-screen (x never
+  negative — unit-tested down to 20 px wide).
+- Dark/light panel with a visible border, floating over the page —
+  it reads as a panel, not a toolbar row. It follows the current
+  Frost theme (Dark/Light) the same way the Settings window does
+  (verified visually in both themes).
+- Same five items, same behavior (each opens its existing native
+  libcosmic window): Settings, Print page…, Open file…, Inspector,
+  Exit. No new items — Frost has no tabs/bookmarks/history, and none
+  were invented. Separators after Settings and after Inspector.
+- The keyboard shortcut is shown right-aligned only next to
+  Inspector (F12); the other items have no shortcut, and none was
+  invented. Hover highlight on the item under the pointer.
+- Closes when an item is picked, when Escape is pressed, when the
+  user clicks outside the panel, and when ☰ is clicked again. The
+  ☰ button shows a pressed/active state while the menu is open.
+  While the menu is open the page takes no keys, and an outside
+  click does not click through to the page or toolbar underneath
+  (like Firefox). The content area no longer subtracts menu height —
+  the panel floats over the content instead of pushing it down
+  (`content_rect` in Round 8; Rounds 2–7 subtracted `MENU_HEIGHT`).
+
+How it is built (no built-in dropdown exists to reach for): the
+libcosmic book study (2026-11-15, full report in the delivery note's
+harness files) found **no dropdown/popover/context-menu widget for
+desktop apps** — the only anchored floating panel the book documents
+is the applet popup, which is for panel applets, not app windows, and
+`menu::bar` is a top menu bar, not a hamburger dropdown. So the panel
+is a custom overlay drawn in `view()` with manual dismissal, which is
+the expected approach: the main column (titlebar / toolbar / content /
+status) is the base layer of an iced `Stack`; when the menu is open,
+two layers float over it — a transparent full-window click-catcher
+(any press outside the panel closes the menu) and then the dropdown
+panel itself. The Stack dispatches events top-first, so the panel's
+own entries still win where they overlap the catcher. Each entry is a
+`mouse_area`, not a button — the raw iced button's custom `.style()`
+closure cannot be used under cosmic's Theme (its button class does
+not accept an arbitrary style fn), and cosmic's own buttons are
+label-only, so a row with a right-aligned shortcut cannot live inside
+one; the hover highlight comes from `menu_hovered` (`MenuHover`).
+
+Proven (sandbox, 2026-11-15, under Xvfb + software GL; gates ran
+live against the shipped tree, screenshots read firsthand):
+
+- `cargo build -p frost --features ui-libcosmic` green (serialized,
+  `CARGO_BUILD_JOBS=1`, 42m 36s); `cargo test --workspace --lib
+  --bins` green — **49 tests** (baseline 45/45 from Round 7 + 4 new
+  menu tests: panel anchors right at 1280 and 800, panel never
+  overflows narrow windows, five items with F12 only on Inspector,
+  panel style follows the theme).
+- Menu open: compact panel top-right under ☰, all five items,
+  separators, F12 next to Inspector, dark panel with border — not
+  full-width. Clicking each of the five entries opens its native
+  window (Settings, Print, Open file, Inspector, Exit dialog) and
+  closes the menu. Escape closes it; click outside closes it (no
+  click-through to the page); clicking ☰ again toggles it closed.
+  At 800 px wide the panel still anchors top-right, no overflow.
+  Light theme: the panel follows the theme (light panel, dark text).
+- Regression: settings save + persist across relaunch (homepage
+  example.com applied on relaunch, then restored to example.org),
+  banner on example.org and correctly absent on example.com,
+  Back/Forward, Print Save writes a PNG, Inspector F12 captures a
+  real 35-node snapshot, strip-scroll fully painted (BAND 1–2, 4,
+  9–10, including a rapid PageDown burst — the Round 6 fix is
+  untouched), `frost://` fails plainly, no listener.
+
+Not proven / known limits:
+
+- Mouse-wheel scrolling still unproven under Xvfb (carried from
+  Round 2). Real mouse/keyboard, drag latency, and whether the
+  Round 6 flashing fix holds on Joel's real box are his-box verdicts.
+- The Round 7 warts carry over unchanged: the status bar keeps
+  "Capturing print preview…" / "Capturing page structure…" after the
+  capture finishes (clears on the next navigation), the Settings
+  window has no in-content Close button, and the theme applies on
+  Save, not instantly per click.
+
+Harness notes from this round (for the next round's builder):
+
+- **The "Exit doesn't open" false alarm was a harness misread, not
+  a bug** — the same class of error as Round 7's "Settings hit-test
+  bug". Clicks aimed at Exit at y=311 kept closing the menu without
+  opening the dialog — but the Exit row renders at y≈292
+  (pixel-measured from the screenshot: the panel spans y≈94–312 and
+  the Exit text is at y≈290); y=311 is the panel's bottom padding,
+  which takes no clicks, so the press fell through to the
+  click-catcher. Clicks at the row's true position fire first try.
+  Measure the row from the screenshot; never trust the displayed
+  image's apparent scale.
+- **A hung search can wedge later navigations.** During gating, a
+  DuckDuckGo search load hung 4.5 minutes, then failed with a hyper
+  `ConnectionReset` (sandbox proxy); while it was hung, later
+  navigations (file://, example.com) never started — no GET in the
+  log at all. A fresh instance navigates fine. That is Servo
+  serializing navigations behind an in-flight load plus a sandbox
+  network stall, not a Frost bug — but if a navigation stalls in a
+  gate, check the log for the in-flight load before assuming the app
+  is broken, and prefer direct URLs over search routing in gates.
+  (Also: the gate log is block-buffered when redirected to a file —
+  lines can lag minutes behind real time and only flush on exit, so
+  a quiet log does not mean a quiet engine.)
+- **Closing popups under bare Xvfb:** `xclose` (new harness tool,
+  `harness-tmp/frost/xclose.c`) sends a bare `WM_DELETE_WINDOW`
+  client message — the same message a real WM's close button sends —
+  and popups close cleanly with Frost alive. `xdotool windowclose`
+  is not installed in this sandbox, and its close path killed the
+  app in the Round 7 packaging gate (winit GetGeometry panic on the
+  destroyed window id) — do not use a kill-based close.
+- **Two first-draft harness bugs, fixed before gating:** the first
+  `r8-launch.sh` referenced `~/workspace/harness-tmp/frost-libs`,
+  which does not exist, and passed a `--sample-banner-only` flag
+  that `main.rs` never parses (it takes no arguments at all). The
+  launcher now mirrors the proven `r7-launch.sh` env
+  (mesa-egl / vulkan-lvp / libs-shim) with `FROST_EXTENSIONS_DIR`
+  carrying the sample banner. `r7-type.py` (not raw `xinject type`)
+  is the way to type shifted punctuation such as `:` — raw type
+  produced `;` instead, which turned `frost://settings` into a
+  search for `frost;//settings`.

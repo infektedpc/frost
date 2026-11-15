@@ -327,6 +327,47 @@ captures the current page as a PNG before opening the window, and
 viewport screenshot, not paginated print layout — Servo 0.8.0 has no
 print pipeline, so there is no print-to-PDF or printer output.
 
+## Hamburger menu: Firefox-style dropdown panel (Round 8)
+
+Rounds 2–7 showed the hamburger menu as a full-width bar under the
+toolbar — a row of links spanning the whole window that pushed the
+content down (`MENU_HEIGHT`, subtracted in `content_rect`). **Round 8
+(Joel's direction, 2026-11-15, from a Firefox application-menu
+screenshot) replaced it with a Firefox-style dropdown panel:**
+compact (300 px), anchored top-right directly under the ☰ button,
+floating over the page with a border, instead of consuming layout
+space. `content_rect` no longer subtracts anything for the menu.
+
+There is no built-in dropdown to reach for: the libcosmic book
+(15 pages, studied 2026-11-15) documents no dropdown/popover/
+context-menu widget for desktop apps — the only anchored floating
+panel is the applet popup, which is for panel applets, and
+`menu::bar` is a top menu bar, not a hamburger dropdown. So the
+panel is a custom overlay in `view()`: an iced `Stack` whose base
+layer is the main column (titlebar / toolbar / content / status),
+with two layers over it while the menu is open — a transparent
+full-window click-catcher (any press outside the panel closes the
+menu and does not click through to the page or toolbar underneath)
+and then the panel itself. The Stack dispatches events top-first,
+so the panel's entries win where they overlap the catcher. The
+panel is built from the `MENU_ITEMS` table (label, shortcut,
+message) so the spec and the rendering cannot drift; separators
+fall after Settings and after Inspector. Its geometry comes from
+`menu_panel_geometry(window_width)`: fixed 300 px wide, 8 px from
+the right edge, 4 px below the toolbar; a window narrower than the
+panel shrinks the panel instead of letting it run off-screen.
+Each entry is a `mouse_area`, not a button (the raw iced button's
+custom `.style()` closure cannot be used under cosmic's Theme, and
+cosmic's buttons are label-only — a row with a right-aligned
+shortcut cannot live inside one); hover highlight comes from
+`menu_hovered` (`MenuHover`), and the panel/border/hover colors
+come from `ChromeColors` (`menu_hover`, `menu_border`), so the
+panel follows the Dark/Light theme. Escape closes the menu before
+F12/page keys are considered, and keys are blocked while the menu
+is open (typing at a menu-covered page would land invisibly).
+The five entries and their messages are unchanged from Round 7 —
+each opens its existing native window.
+
 ## Extensions
 
 `frost-extensions` defines the contract now so Round 3+ wires it in

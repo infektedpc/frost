@@ -35,15 +35,45 @@ use windows::{InspectorWindow, OpenWindow, PopupMessage, PrintWindow, SettingsWi
 const TITLEBAR_HEIGHT: f32 = 40.0;
 const TOOLBAR_HEIGHT: f32 = 48.0;
 const STATUS_HEIGHT: f32 = 28.0;
-/// Height of the hamburger menu (5 entries since Round 5). Round 2
-/// used 136 and the 4th entry (Exit) was clipped ~4 px at the
-/// bottom edge; 148 fits four fully, 185 fits five.
-const MENU_HEIGHT: f32 = 185.0;
+/// Hamburger menu dropdown panel (Round 8): a compact Firefox-style
+/// panel anchored top-right under the ☰ button, floating over the
+/// page — NOT the full-width bar of Rounds 2–7, which pushed the
+/// content down and spanned the whole window.
+const MENU_PANEL_WIDTH: f32 = 300.0;
+/// Right-edge margin of the dropdown panel.
+const MENU_PANEL_MARGIN: f32 = 8.0;
+/// Gap between the toolbar and the top of the dropdown panel.
+const MENU_PANEL_GAP: f32 = 4.0;
 const INITIAL_WINDOW: (f32, f32) = (1280.0, 800.0);
 const HOME_URL: &str = "https://example.org";
 /// Engine pump rate. The tick spins Servo, drains its events, and
 /// re-renders only while loading or when a frame was flagged ready.
 const TICK: Duration = Duration::from_millis(16);
+
+/// The hamburger menu's entries, in order: (label, shortcut, message).
+/// Firefox shows one shortcut (F12 for Inspector); the other entries
+/// have no shortcut — do not invent any. The view builds the panel
+/// from this table, so the spec and the rendering cannot drift.
+/// Separators fall after "Settings" and after "Inspector" (groups:
+/// Settings | Print page… / Open file… / Inspector | Exit).
+const MENU_ITEMS: [(&str, Option<&str>, Message); 5] = [
+    ("Settings", None, Message::OpenSettings),
+    ("Print page…", None, Message::OpenPrint),
+    ("Open file…", None, Message::OpenFile),
+    ("Inspector", Some("F12"), Message::OpenInspector),
+    ("Exit", None, Message::Exit),
+];
+
+/// (x, width) of the dropdown panel for a window of the given width:
+/// fixed MENU_PANEL_WIDTH wide, MENU_PANEL_MARGIN from the right
+/// edge. A window narrower than the panel shrinks the panel instead
+/// of letting it run off-screen; x never goes negative.
+fn menu_panel_geometry(window_width: f32) -> (f32, f32) {
+    let width =
+        MENU_PANEL_WIDTH.min((window_width - 2.0 * MENU_PANEL_MARGIN).max(1.0));
+    let x = (window_width - width - MENU_PANEL_MARGIN).max(0.0);
+    (x, width)
+}
 
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -70,6 +100,12 @@ pub enum Message {
     AddressChanged(String),
     AddressSubmitted,
     ToggleMenu,
+    /// Close the hamburger dropdown without picking anything
+    /// (Escape, or a press outside the panel).
+    CloseMenu,
+    /// The pointer entered (Some(i)) or left (None) a menu entry:
+    /// drives the hover highlight.
+    MenuHover(Option<usize>),
     OpenSettings,
     OpenPrint,
     OpenInspector,
@@ -120,6 +156,10 @@ pub struct Frost {
     title: Option<String>,
     /// Whether the hamburger menu is open.
     menu_open: bool,
+    /// Index of the menu entry under the pointer, for the hover
+    /// highlight (Round 8). None when the pointer is not over an
+    /// entry; cleared whenever the menu closes.
+    menu_hovered: Option<usize>,
     can_back: bool,
     can_forward: bool,
     window_size: Size,
@@ -199,17 +239,18 @@ pub struct Frost {
 }
 
 impl Frost {
-    /// The content area's rectangle in window coordinates.
+    /// The content area's rectangle in window coordinates. Round 8:
+    /// the hamburger menu is a floating panel over the content, so
+    /// it no longer consumes layout space (Rounds 2–7 subtracted
+    /// MENU_HEIGHT here).
     fn content_rect(&self) -> Rectangle {
-        let menu = if self.menu_open { MENU_HEIGHT } else { 0.0 };
         Rectangle {
             x: 0.0,
-            y: TITLEBAR_HEIGHT + TOOLBAR_HEIGHT + menu,
+            y: TITLEBAR_HEIGHT + TOOLBAR_HEIGHT,
             width: self.window_size.width,
             height: (self.window_size.height
                 - TITLEBAR_HEIGHT
                 - TOOLBAR_HEIGHT
-                - menu
                 - STATUS_HEIGHT)
                 .max(1.0),
         }
@@ -231,6 +272,60 @@ impl Frost {
             self.webview.resize(w, h);
             self.frame_dirty = true;
         }
+    }
+
+    /// Close the hamburger dropdown (and forget which entry was
+    /// hovered). Every close path goes through here.
+    fn close_menu(&mut self) {
+        self.menu_open = false;
+        self.menu_hovered = None;
+    }
+
+    /// The hamburger dropdown panel (Round 8): a compact panel
+    /// anchored top-right under the ☰ button, floating over the
+    /// page. Positioned by `menu_panel_geometry` from the live
+    /// window width, so it stays glued to the right edge at any
+    /// window size.
+    fn menu_panel(&self, colors: ChromeColors) -> Element<'_, Message> {
+        let (x, width) = menu_panel_geometry(self.window_size.width);
+        let mut children: Vec<Element<'_, Message>> = Vec::new();
+        for (i, (label, shortcut, message)) in MENU_ITEMS.iter().enumerate() {
+            // Separators between groups: after Settings, after Inspector.
+            if i == 1 || i == 4 {
+                children.push(
+                    container(widget::Space::new().height(Length::Fixed(1.0)))
+                        .style(move |_| menu_separator_style(colors))
+                        .width(Length::Fill)
+                        .padding([4, 0])
+                        .into(),
+                );
+            }
+            children.push(menu_item(
+                colors,
+                i,
+                self.menu_hovered == Some(i),
+                label,
+                *shortcut,
+                message.clone(),
+            ));
+        }
+        let panel = container(widget::column::with_children(children).spacing(2))
+            .style(move |_| menu_panel_style(colors))
+            .padding(6)
+            .width(Length::Fixed(width));
+        // The wrapper fills the window; left padding puts the
+        // panel's left edge at x, so its right edge sits
+        // MENU_PANEL_MARGIN from the window's right edge.
+        container(panel)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(iced::Padding::from([
+                TITLEBAR_HEIGHT + TOOLBAR_HEIGHT + MENU_PANEL_GAP,
+                0.0,
+                0.0,
+                x,
+            ]))
+            .into()
     }
 
     /// Translate an absolute window point into content-area coordinates,
@@ -397,6 +492,16 @@ impl Frost {
                 repeat,
                 ..
             }) => {
+                // Round 8: Escape closes the dropdown menu, and the
+                // key never reaches the page. Checked before F12
+                // and before the content-focus gate.
+                if !repeat
+                    && self.menu_open
+                    && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                {
+                    self.close_menu();
+                    return Task::none();
+                }
                 // Round 5: F12 opens the Inspector — a browser
                 // shortcut, not a page key. Checked before the
                 // content-focus gate, so it works from the address
@@ -411,7 +516,10 @@ impl Frost {
                         return window::gain_focus(id);
                     }
                     self.capture_inspector();
-                } else if self.content_focused {
+                } else if self.content_focused && !self.menu_open {
+                    // Round 8: while the menu is open the page
+                    // takes no keys — typing at a menu-covered page
+                    // would land invisibly.
                     self.send_key(
                         FrostKeyState::Down,
                         &key,
@@ -430,7 +538,7 @@ impl Frost {
                 modifiers,
                 ..
             }) => {
-                if self.content_focused {
+                if self.content_focused && !self.menu_open {
                     self.send_key(
                         FrostKeyState::Up,
                         &key,
@@ -584,6 +692,7 @@ impl cosmic::Application for Frost {
                 status: format!("Loading {homepage} …"),
                 title: None,
                 menu_open: false,
+                menu_hovered: None,
                 can_back: false,
                 can_forward: false,
                 window_size,
@@ -861,13 +970,25 @@ impl cosmic::Application for Frost {
                 Task::none()
             },
             Message::ToggleMenu => {
-                self.menu_open = !self.menu_open;
-                self.resize_webview();
+                // Round 8: the menu floats over the content, so
+                // opening it does not resize the webview.
+                if self.menu_open {
+                    self.close_menu();
+                } else {
+                    self.menu_open = true;
+                }
+                Task::none()
+            },
+            Message::CloseMenu => {
+                self.close_menu();
+                Task::none()
+            },
+            Message::MenuHover(hovered) => {
+                self.menu_hovered = hovered;
                 Task::none()
             },
             Message::OpenSettings => {
-                self.menu_open = false;
-                self.resize_webview();
+                self.close_menu();
                 self.open_settings_window()
             },
             Message::OpenPrint => {
@@ -876,8 +997,7 @@ impl cosmic::Application for Frost {
                 // The Print window opens from the Tick once the PNG
                 // bytes arrive (or the capture errors). A Print
                 // window that is already open is just focused.
-                self.menu_open = false;
-                self.resize_webview();
+                self.close_menu();
                 if let Some(id) = self.popup_id(windows::PopupKind::Print) {
                     return window::gain_focus(id);
                 }
@@ -901,8 +1021,7 @@ impl cosmic::Application for Frost {
                 // open the Inspector window on the snapshot (see
                 // capture_inspector). An Inspector window that is
                 // already open is just focused.
-                self.menu_open = false;
-                self.resize_webview();
+                self.close_menu();
                 if let Some(id) = self.popup_id(windows::PopupKind::Inspector) {
                     window::gain_focus(id)
                 } else {
@@ -911,14 +1030,12 @@ impl cosmic::Application for Frost {
                 }
             },
             Message::OpenFile => {
-                self.menu_open = false;
-                self.resize_webview();
+                self.close_menu();
                 let home = file_browser::home_dir();
                 self.open_file_window(&home)
             },
             Message::Exit => {
-                self.menu_open = false;
-                self.resize_webview();
+                self.close_menu();
                 if self.settings.confirm_exit {
                     self.open_exit_window()
                 } else {
@@ -1032,6 +1149,13 @@ impl cosmic::Application for Frost {
                 b
             }
         };
+        // ☰ button: the suggested (accent) style while the menu is
+        // open is the pressed/active state; standard otherwise.
+        let menu_button = if self.menu_open {
+            button::suggested("☰").on_press(Message::ToggleMenu)
+        } else {
+            button::standard("☰").on_press(Message::ToggleMenu)
+        };
         let toolbar_row = widget::row::with_children(vec![
             back.into(),
             forward.into(),
@@ -1042,7 +1166,7 @@ impl cosmic::Application for Frost {
                 .on_submit(|_| Message::AddressSubmitted)
                 .width(iced::Length::Fill)
                 .into(),
-            button::standard("☰").on_press(Message::ToggleMenu).into(),
+            menu_button.into(),
         ])
         .spacing(8)
         .padding(8)
@@ -1052,27 +1176,10 @@ impl cosmic::Application for Frost {
             .width(Length::Fill)
             .height(Length::Fixed(TOOLBAR_HEIGHT));
 
-        // Hamburger menu: fixed height when open so the content area
-        // below it has an exact, known rectangle.
-        let menu: Element<Message> = if self.menu_open {
-            container(
-                widget::column::with_children(vec![
-                    button::text("Settings").on_press(Message::OpenSettings).into(),
-                    button::text("Print page…").on_press(Message::OpenPrint).into(),
-                    button::text("Inspector").on_press(Message::OpenInspector).into(),
-                    button::text("Open file…").on_press(Message::OpenFile).into(),
-                    button::text("Exit").on_press(Message::Exit).into(),
-                ])
-                .spacing(4),
-            )
-            .style(move |_| chrome_container_style(colors))
-            .padding(8)
-            .width(Length::Fill)
-            .height(Length::Fixed(MENU_HEIGHT))
-            .into()
-        } else {
-            widget::column::with_children(vec![]).into()
-        };
+        // Round 8: the hamburger menu is a floating dropdown panel
+        // (see menu_panel), not a row in this column. The column is
+        // titlebar / toolbar / content / status; the panel floats
+        // over the content via the Stack below.
 
         // Web content area: the live Servo frame as horizontal
         // strips (Round 6), or a loading note until the first
@@ -1111,19 +1218,38 @@ impl cosmic::Application for Frost {
             .height(Length::Fixed(STATUS_HEIGHT))
             .padding(6);
 
-        container(
-            widget::column::with_children(vec![
-                titlebar.into(),
-                toolbar.into(),
-                menu,
-                content,
-                status.into(),
-            ]),
-        )
-        .style(move |_| chrome_container_style(colors))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        // Round 8: the main column (titlebar / toolbar / content /
+        // status) is the Stack's base layer. When the menu is open,
+        // two layers float over it: a transparent full-window
+        // click-catcher (any press outside the panel closes the
+        // menu, and — like Firefox — does not click through to the
+        // page or toolbar underneath), then the dropdown panel
+        // itself, anchored top-right under the ☰ button. The Stack
+        // dispatches events top-first, so the panel's own buttons
+        // still win where they overlap the catcher.
+        let main_column = widget::column::with_children(vec![
+            titlebar.into(),
+            toolbar.into(),
+            content,
+            status.into(),
+        ]);
+        let mut stack = cosmic::iced::widget::Stack::new().push(main_column);
+        if self.menu_open {
+            let catcher = mouse_area(
+                widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .on_press(Message::CloseMenu);
+            stack = stack.push(catcher);
+            stack = stack.push(self.menu_panel(colors));
+        }
+
+        container(stack.width(Length::Fill).height(Length::Fill))
+            .style(move |_| chrome_container_style(colors))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// Views for the popup windows (Round 7, libcosmic
@@ -1155,6 +1281,127 @@ fn chrome_container_style(colors: ChromeColors) -> cosmic::iced::widget::contain
             colors.text[1],
             colors.text[2],
         )),
+        ..Default::default()
+    }
+}
+
+/// A `[u8; 3]` theme color as an iced `Color`.
+fn rgb(color: [u8; 3]) -> cosmic::iced::Color {
+    cosmic::iced::Color::from_rgb8(color[0], color[1], color[2])
+}
+
+/// One dropdown entry: label left, shortcut (F12) right-aligned in
+/// the theme's muted color. The whole row is the click target.
+/// Round 8 note: this is a `mouse_area`, not a button — the raw
+/// iced button's custom `.style()` closure cannot be used under
+/// cosmic's Theme (its button class does not accept an arbitrary
+/// style fn), and cosmic's own buttons are label-only, so a row
+/// with a right-aligned shortcut cannot live inside one. The hover
+/// highlight comes from `menu_hovered` (see `MenuHover`): the entry
+/// under the pointer renders with the theme's hover fill.
+fn menu_item<'a>(
+    colors: ChromeColors,
+    index: usize,
+    hovered: bool,
+    label: &'a str,
+    shortcut: Option<&'a str>,
+    message: Message,
+) -> Element<'a, Message> {
+    let mut row_items: Vec<Element<'_, Message>> =
+        vec![text(label).size(14).into()];
+    if let Some(shortcut) = shortcut {
+        row_items.push(widget::Space::new().width(Length::Fill).into());
+        row_items.push(
+            container(text(shortcut).size(13))
+                .style(move |_| menu_shortcut_style(colors))
+                .into(),
+        );
+    }
+    let row = widget::row::with_children(row_items)
+        .align_y(iced::Alignment::Center)
+        .spacing(8);
+    let style = if hovered {
+        menu_item_hover_style(colors)
+    } else {
+        menu_item_rest_style(colors)
+    };
+    mouse_area(
+        container(row)
+            .style(move |_| style)
+            .width(Length::Fill)
+            .padding([8, 10]),
+    )
+    .on_press(message)
+    .on_enter(Message::MenuHover(Some(index)))
+    .on_exit(Message::MenuHover(None))
+    .into()
+}
+
+/// A dropdown entry at rest: transparent (the panel shows through),
+/// rounded corners.
+fn menu_item_rest_style(colors: ChromeColors) -> cosmic::iced::widget::container::Style {
+    cosmic::iced::widget::container::Style {
+        text_color: Some(rgb(colors.text)),
+        border: cosmic::iced::Border {
+            color: cosmic::iced::Color::TRANSPARENT,
+            width: 0.0,
+            radius: 6.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// A dropdown entry under the pointer: the theme's hover fill, same
+/// rounded corners as at rest.
+fn menu_item_hover_style(colors: ChromeColors) -> cosmic::iced::widget::container::Style {
+    cosmic::iced::widget::container::Style {
+        background: Some(cosmic::iced::Background::Color(rgb(colors.menu_hover))),
+        text_color: Some(rgb(colors.text)),
+        border: cosmic::iced::Border {
+            color: cosmic::iced::Color::TRANSPARENT,
+            width: 0.0,
+            radius: 6.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// Style for the dropdown panel itself: the theme background, a
+/// visible 1 px border, rounded corners, and a drop shadow — so it
+/// reads as a floating panel over the page, not a toolbar row.
+fn menu_panel_style(colors: ChromeColors) -> cosmic::iced::widget::container::Style {
+    cosmic::iced::widget::container::Style {
+        background: Some(cosmic::iced::Background::Color(rgb(colors.background))),
+        text_color: Some(rgb(colors.text)),
+        border: cosmic::iced::Border {
+            color: rgb(colors.menu_border),
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: cosmic::iced::Shadow {
+            color: cosmic::iced::Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+            offset: cosmic::iced::Vector::new(0.0, 4.0),
+            blur_radius: 16.0,
+        },
+        ..Default::default()
+    }
+}
+
+/// A 1 px separator line between menu groups, in the theme's border
+/// color on a transparent background.
+fn menu_separator_style(colors: ChromeColors) -> cosmic::iced::widget::container::Style {
+    cosmic::iced::widget::container::Style {
+        background: Some(cosmic::iced::Background::Color(rgb(colors.menu_border))),
+        ..Default::default()
+    }
+}
+
+/// The shortcut label (F12) in the theme's muted color. The label
+/// sits in its own container because a bare text widget takes the
+/// button's text color; the container's text color wins.
+fn menu_shortcut_style(colors: ChromeColors) -> cosmic::iced::widget::container::Style {
+    cosmic::iced::widget::container::Style {
+        text_color: Some(rgb(colors.muted)),
         ..Default::default()
     }
 }
@@ -1254,7 +1501,55 @@ fn load_extensions() -> (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::SearchEngine;
+    use crate::settings::{SearchEngine, ThemeChoice};
+
+    #[test]
+    fn menu_panel_anchors_right_at_1280_and_800() {
+        // 300 px panel, 8 px from the right edge.
+        assert_eq!(menu_panel_geometry(1280.0), (972.0, 300.0));
+        assert_eq!(menu_panel_geometry(800.0), (492.0, 300.0));
+    }
+
+    #[test]
+    fn menu_panel_never_overflows_narrow_windows() {
+        for width in [320.0, 250.0, 100.0, 20.0] {
+            let (x, w) = menu_panel_geometry(width);
+            assert!(x >= 0.0, "x {x} at window width {width}");
+            assert!(w >= 1.0, "width {w} at window width {width}");
+            assert!(
+                x + w <= width,
+                "panel ({x} + {w}) runs off-screen at window width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_items_are_five_with_f12_only_on_inspector() {
+        assert_eq!(MENU_ITEMS.len(), 5);
+        let labels: Vec<&str> = MENU_ITEMS.iter().map(|(label, _, _)| *label).collect();
+        assert_eq!(
+            labels,
+            ["Settings", "Print page…", "Open file…", "Inspector", "Exit"]
+        );
+        for (label, shortcut, _) in MENU_ITEMS {
+            if label == "Inspector" {
+                assert_eq!(shortcut, Some("F12"));
+            } else {
+                assert_eq!(shortcut, None, "{label} must not invent a shortcut");
+            }
+        }
+    }
+
+    #[test]
+    fn menu_panel_style_follows_the_theme() {
+        for theme in [ThemeChoice::Dark, ThemeChoice::Light] {
+            let colors = theme.chrome_colors();
+            let style = menu_panel_style(colors);
+            assert_eq!(style.border.color, rgb(colors.menu_border));
+            assert_ne!(colors.menu_hover, colors.background);
+            assert_ne!(colors.menu_border, colors.background);
+        }
+    }
 
     #[test]
     fn resolve_address_keeps_urls_and_searches_the_rest() {

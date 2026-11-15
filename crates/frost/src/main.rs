@@ -56,9 +56,12 @@
 //!   (harmless viewport re-send).
 //!
 //! Chrome geometry is fixed by construction (Frost titlebar 40, toolbar
-//! 48, menu 148 when open, status 28), so the webview size and the click
-//! mapping are exact: the content area is the window minus the chrome,
-//! and mouse coordinates translate 1:1 into page coordinates.
+//! 48, status 28), so the webview size and the click mapping are exact:
+//! the content area is the window minus the chrome, and mouse
+//! coordinates translate 1:1 into page coordinates. The hamburger menu
+//! (Round 8) is a floating panel over the content — it consumes no
+//! layout space, so it does not figure in the chrome heights above
+//! (Rounds 2–7 subtracted a 148 px menu row here).
 //!
 //! Launch with:
 //!   cargo run -p frost

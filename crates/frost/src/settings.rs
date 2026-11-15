@@ -37,11 +37,15 @@ impl ThemeChoice {
                 background: [43, 42, 51],
                 text: [253, 251, 255],
                 muted: [168, 168, 178],
+                menu_hover: [64, 63, 73],
+                menu_border: [110, 109, 124],
             },
             ThemeChoice::Light => ChromeColors {
                 background: [242, 242, 245],
                 text: [26, 26, 26],
                 muted: [92, 92, 102],
+                menu_hover: [222, 222, 226],
+                menu_border: [190, 190, 196],
             },
         }
     }
@@ -57,6 +61,10 @@ pub struct ChromeColors {
     pub background: [u8; 3],
     pub text: [u8; 3],
     pub muted: [u8; 3],
+    /// Hover fill for one hamburger-menu entry (Round 8).
+    pub menu_hover: [u8; 3],
+    /// Panel border and separator lines of the hamburger menu (Round 8).
+    pub menu_border: [u8; 3],
 }
 
 /// Default search engine, used when the address bar gets a search query
