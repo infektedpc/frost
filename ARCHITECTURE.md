@@ -368,6 +368,59 @@ is open (typing at a menu-covered page would land invisibly).
 The five entries and their messages are unchanged from Round 7 —
 each opens its existing native window.
 
+## Command palette (Round 9)
+
+A VS Code-style command palette, opened with Ctrl+K (verified
+unused in Frost — only F12 and Escape were browser shortcuts) or
+from a "Command palette…" entry in the ☰ menu (Ctrl+K shown
+right-aligned). It reuses the Round 8 overlay pattern: an iced
+`Stack` whose base is the main column, with a dimmed full-window
+click-catcher (black, alpha 0.4 — the page is visibly dimmed and
+clicks outside close the palette without clicking through) and the
+panel on top. The panel is 560 px wide, centered, 100 px from the
+top (`palette_panel_geometry`); a narrow window shrinks it instead
+of letting it run off-screen. The top row is a libcosmic text input
+("Type a command", focused on open); below it, one `mouse_area`
+row per matching command (the same panel/hover styles as the menu,
+so it follows Dark/Light through `ChromeColors`).
+
+Matching is `fuzzy_match` — a subsequence match, case-insensitive
+("set" matches Open Settings and Open Inspector; "k" matches
+nothing and the panel shows "No matching commands"). The list is
+`palette_commands_for(can_back, can_forward, loading)`: only real,
+working actions wired to existing messages, with unavailable ones
+hidden rather than shown dead — Go back / Go forward only with
+history, Stop loading only while loading; always present are Reload,
+Open Settings, Print page…, Open file…, Open Inspector, Focus
+address bar, Quit Frost. `move_selection` wraps at both ends.
+Arrow Up/Down moves the highlight, Enter runs the highlighted
+command (resolving against the CURRENT filtered list), Escape
+closes, Ctrl+K toggles, clicking a row runs it. PaletteRun closes
+the palette, then dispatches the real message. Opening the palette
+closes the menu and vice versa; Escape closes whichever is open,
+palette first.
+
+The subtle part is the event path. While the palette is open the
+page takes no keys: the Ignored-path KeyPressed handler swallows
+everything except Escape/Up/Down/Enter and checks Ctrl+K first.
+But a focused text input changes which path a key takes. A focused
+text input swallows Escape — except libcosmic's text_input does NOT
+capture Escape or Up/Down (those arms return early without
+capturing), so they arrive Ignored and the handler sees them. It
+DOES capture every other KeyPressed while focused (the vendored
+`src/widget/text_input/input.rs` handler ends in an unconditional
+`shell.capture_event()`), including Ctrl+K — which therefore never
+reaches the Ignored-path toggle. Gated 2026-11-15: three Ctrl+K
+presses with the palette open (fast chord x2, slow chord x1) all
+left it open. The fix is in `handle_iced_event_captured`, which
+the subscription feeds with Captured keyboard events: it now
+toggles the palette on a Captured Ctrl+K exactly as the KeyPressed
+handler does for an Ignored one (an event is Captured or Ignored,
+never both, so it fires once). The same branch also makes Ctrl+K
+work from the address bar, which captures it the same way. Enter
+is captured too, but its `on_submit` publishes PaletteRunSelected,
+so it runs exactly once per press.
+
 ## Extensions
 
 `frost-extensions` defines the contract now so Round 3+ wires it in

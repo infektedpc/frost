@@ -44,6 +44,24 @@ const MENU_PANEL_WIDTH: f32 = 300.0;
 const MENU_PANEL_MARGIN: f32 = 8.0;
 /// Gap between the toolbar and the top of the dropdown panel.
 const MENU_PANEL_GAP: f32 = 4.0;
+/// Command palette (Round 9): a centered VS Code-style overlay
+/// panel. Fixed width, shrinking on narrow windows; the top gap
+/// puts it below the toolbar, floating over the page like the
+/// menu — it consumes no layout space.
+const PALETTE_PANEL_WIDTH: f32 = 560.0;
+const PALETTE_PANEL_MARGIN: f32 = 16.0;
+const PALETTE_PANEL_TOP: f32 = 100.0;
+/// Widget ids for programmatic focus (Round 9): the palette's
+/// query input (focused on open) and the address bar (focused by
+/// the palette's "Focus address bar" command, with select-all).
+/// Plain functions, not consts: this fork's `Id::new` is not a
+/// const fn. The same string always yields the same id.
+fn palette_input_id() -> cosmic::iced::widget::Id {
+    cosmic::iced::widget::Id::new("palette-input")
+}
+fn address_input_id() -> cosmic::iced::widget::Id {
+    cosmic::iced::widget::Id::new("address-bar")
+}
 const INITIAL_WINDOW: (f32, f32) = (1280.0, 800.0);
 const HOME_URL: &str = "https://example.org";
 /// Engine pump rate. The tick spins Servo, drains its events, and
@@ -52,15 +70,18 @@ const TICK: Duration = Duration::from_millis(16);
 
 /// The hamburger menu's entries, in order: (label, shortcut, message).
 /// Firefox shows one shortcut (F12 for Inspector); the other entries
-/// have no shortcut — do not invent any. The view builds the panel
+/// have no shortcut — do not invent any. Round 9 adds "Command
+/// palette…" (Ctrl+K, the palette's own shortcut) after Inspector,
+/// so the groups stay Settings | Print page… / Open file… /
+/// Inspector / Command palette… | Exit. The view builds the panel
 /// from this table, so the spec and the rendering cannot drift.
-/// Separators fall after "Settings" and after "Inspector" (groups:
-/// Settings | Print page… / Open file… / Inspector | Exit).
-const MENU_ITEMS: [(&str, Option<&str>, Message); 5] = [
+/// Separators fall after "Settings" and after "Command palette…".
+const MENU_ITEMS: [(&str, Option<&str>, Message); 6] = [
     ("Settings", None, Message::OpenSettings),
     ("Print page…", None, Message::OpenPrint),
     ("Open file…", None, Message::OpenFile),
     ("Inspector", Some("F12"), Message::OpenInspector),
+    ("Command palette…", Some("Ctrl+K"), Message::TogglePalette),
     ("Exit", None, Message::Exit),
 ];
 
@@ -75,6 +96,73 @@ fn menu_panel_geometry(window_width: f32) -> (f32, f32) {
     (x, width)
 }
 
+/// (x, width) of the command-palette panel for a window of the
+/// given width (Round 9): PALETTE_PANEL_WIDTH wide, centered, with
+/// PALETTE_PANEL_MARGIN kept on both sides. A window narrower than
+/// the panel shrinks the panel instead of letting it run
+/// off-screen; x never goes negative.
+fn palette_panel_geometry(window_width: f32) -> (f32, f32) {
+    let width = PALETTE_PANEL_WIDTH
+        .min((window_width - 2.0 * PALETTE_PANEL_MARGIN).max(1.0));
+    let x = ((window_width - width) / 2.0).max(0.0);
+    (x, width)
+}
+
+/// Subsequence match, case-insensitive (Round 9): every character
+/// of the query appears in the label, in order. An empty query
+/// matches everything, so the palette opens on the full list.
+fn fuzzy_match(query: &str, label: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let mut rest = label.chars();
+    query.chars().all(|qc| {
+        let qc = qc.to_ascii_lowercase();
+        rest.by_ref().any(|lc| lc.to_ascii_lowercase() == qc)
+    })
+}
+
+/// The palette's commands (Round 9): only actions that can act
+/// right now. "Go back" / "Go forward" appear only when there is
+/// history to move through, "Stop loading" only while a load is in
+/// flight — so no entry ever looks real while doing nothing. The
+/// rest are always available: every one of them is wired to an
+/// existing working message (no dead entries by construction).
+fn palette_commands_for(
+    can_back: bool,
+    can_forward: bool,
+    loading: bool,
+) -> Vec<(&'static str, Message)> {
+    let mut commands = Vec::new();
+    if can_back {
+        commands.push(("Go back", Message::Back));
+    }
+    if can_forward {
+        commands.push(("Go forward", Message::Forward));
+    }
+    commands.push(("Reload", Message::Reload));
+    if loading {
+        commands.push(("Stop loading", Message::Stop));
+    }
+    commands.push(("Open Settings", Message::OpenSettings));
+    commands.push(("Print page…", Message::OpenPrint));
+    commands.push(("Open file…", Message::OpenFile));
+    commands.push(("Open Inspector", Message::OpenInspector));
+    commands.push(("Focus address bar", Message::FocusAddress));
+    commands.push(("Quit Frost", Message::Exit));
+    commands
+}
+
+/// Move the palette highlight `delta` steps through `len` rows,
+/// wrapping around both ends (Round 9). No rows → 0.
+fn move_selection(selected: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len = len as isize;
+    (selected as isize + delta).rem_euclid(len) as usize
+}
+
 #[derive(Clone, Debug)]
 pub enum Message {
     /// Pump the engine (spin + drain events + maybe re-render).
@@ -84,6 +172,13 @@ pub enum Message {
     /// reach the page (Round 7 — popup windows have their own
     /// widgets, and their coordinates are not page coordinates).
     IcedEvent(window::Id, iced::Event),
+    /// A keyboard event a widget CAPTURED (Round 9): only the
+    /// palette input can capture keys while the palette is open,
+    /// and it swallows Escape — so Escape reaches the app only
+    /// through here. The handler ignores captured keys unless the
+    /// palette is open, so the address bar's captured keys still
+    /// never reach the page.
+    IcedEventCaptured(window::Id, iced::Event),
     /// A window opened (reported by `window::open`'s task).
     WindowOpened(window::Id),
     /// A window closed (the OS/window manager closed it).
@@ -106,6 +201,27 @@ pub enum Message {
     /// The pointer entered (Some(i)) or left (None) a menu entry:
     /// drives the hover highlight.
     MenuHover(Option<usize>),
+    /// Toggle the command palette (Ctrl+K, or the menu entry).
+    /// Opening it closes the menu; closing it leaves the page
+    /// as it was (Round 9).
+    TogglePalette,
+    /// Close the command palette without running anything
+    /// (Escape, or a press outside the panel).
+    ClosePalette,
+    /// The palette's query input changed: re-filter, highlight
+    /// back at the top (Round 9).
+    PaletteInputChanged(String),
+    /// The pointer entered a palette row: it becomes the
+    /// highlighted one (Round 9).
+    PaletteSelect(usize),
+    /// Run the i-th command of the CURRENT filtered list (Round 9).
+    PaletteRun(usize),
+    /// Run the currently highlighted command (Round 9 — the
+    /// palette input's on_submit).
+    PaletteRunSelected,
+    /// Focus the address bar, with its URL selected (Round 9 —
+    /// the palette's "Focus address bar" command).
+    FocusAddress,
     OpenSettings,
     OpenPrint,
     OpenInspector,
@@ -160,6 +276,16 @@ pub struct Frost {
     /// highlight (Round 8). None when the pointer is not over an
     /// entry; cleared whenever the menu closes.
     menu_hovered: Option<usize>,
+    /// Whether the command palette is open (Round 9).
+    palette_open: bool,
+    /// The palette's query text (Round 9): the filtered list is
+    /// derived from it on every render, so it is the only query
+    /// state the app keeps.
+    palette_query: String,
+    /// Index of the highlighted command in the CURRENT filtered
+    /// list (Round 9). Reset to 0 whenever the query changes;
+    /// clamped by the filtered length at use.
+    palette_selected: usize,
     can_back: bool,
     can_forward: bool,
     window_size: Size,
@@ -281,6 +407,80 @@ impl Frost {
         self.menu_hovered = None;
     }
 
+    /// Close the command palette (and forget its query and
+    /// highlight). Every close path goes through here (Round 9).
+    fn close_palette(&mut self) {
+        self.palette_open = false;
+        self.palette_query.clear();
+        self.palette_selected = 0;
+    }
+
+    /// The palette's command list right now (Round 9): the
+    /// available commands, filtered by the current query in
+    /// table order. The filtered list is derived on demand, so
+    /// the view and the run path can never disagree about it.
+    fn palette_filtered(&self) -> Vec<(&'static str, Message)> {
+        palette_commands_for(self.can_back, self.can_forward, self.loading)
+            .into_iter()
+            .filter(|(label, _)| fuzzy_match(&self.palette_query, label))
+            .collect()
+    }
+
+    /// The command-palette panel (Round 9): a centered overlay
+    /// panel, same pattern as the Round 8 menu (a `Stack` layer
+    /// floating over the content — the caller adds the dimmed
+    /// click-catcher under it). A text input on top, the filtered
+    /// command list below; the highlighted row uses the same hover
+    /// fill as a menu entry. The panel reuses the menu's panel
+    /// style, so it follows the Dark/Light theme the same way.
+    fn palette_panel(&self, colors: ChromeColors) -> Element<'_, Message> {
+        let (x, width) = palette_panel_geometry(self.window_size.width);
+        let filtered = self.palette_filtered();
+        let mut children: Vec<Element<'_, Message>> = Vec::new();
+        children.push(
+            text_input("Type a command", &self.palette_query)
+                .id(palette_input_id())
+                .on_input(Message::PaletteInputChanged)
+                .on_submit(|_| Message::PaletteRunSelected)
+                .width(Length::Fill)
+                .into(),
+        );
+        if filtered.is_empty() {
+            children.push(
+                container(text("No matching commands").size(14))
+                    .style(move |_| menu_shortcut_style(colors))
+                    .padding([8, 10])
+                    .into(),
+            );
+        } else {
+            for (i, (label, _)) in filtered.iter().enumerate() {
+                children.push(palette_row(
+                    colors,
+                    i,
+                    self.palette_selected == i,
+                    label,
+                ));
+            }
+        }
+        let panel = container(widget::column::with_children(children).spacing(4))
+            .style(move |_| menu_panel_style(colors))
+            .padding(8)
+            .width(Length::Fixed(width));
+        // The wrapper fills the window; left padding puts the
+        // panel's left edge at x (centered by the geometry), top
+        // padding drops it below the toolbar.
+        container(panel)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(iced::Padding::from([
+                PALETTE_PANEL_TOP,
+                0.0,
+                0.0,
+                x,
+            ]))
+            .into()
+    }
+
     /// The hamburger dropdown panel (Round 8): a compact panel
     /// anchored top-right under the ☰ button, floating over the
     /// page. Positioned by `menu_panel_geometry` from the live
@@ -290,8 +490,9 @@ impl Frost {
         let (x, width) = menu_panel_geometry(self.window_size.width);
         let mut children: Vec<Element<'_, Message>> = Vec::new();
         for (i, (label, shortcut, message)) in MENU_ITEMS.iter().enumerate() {
-            // Separators between groups: after Settings, after Inspector.
-            if i == 1 || i == 4 {
+            // Separators between groups: after Settings, after
+            // "Command palette…".
+            if i == 1 || i == 5 {
                 children.push(
                     container(widget::Space::new().height(Length::Fixed(1.0)))
                         .style(move |_| menu_separator_style(colors))
@@ -463,6 +664,13 @@ impl Frost {
                 }
             },
             iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                // Round 9: the wheel does not scroll the page
+                // behind the open palette (the click-catcher
+                // blocks presses, but a mouse_area never sees the
+                // wheel — so the wheel is gated here instead).
+                if self.palette_open {
+                    return Task::none();
+                }
                 if let Some(pos) = self.last_cursor {
                     if let Some(p) = self.content_point(pos) {
                         // Servo takes pixel deltas; a "line" is ~40 px.
@@ -492,6 +700,61 @@ impl Frost {
                 repeat,
                 ..
             }) => {
+                // Round 9: Ctrl+K toggles the command palette — a
+                // browser shortcut, like F12. Checked first, so it
+                // works from the page; from the address bar or the
+                // palette input it arrives as Captured instead
+                // (libcosmic's text_input captures every KeyPressed
+                // while focused) and the IcedEventCaptured handler
+                // toggles it there. Repeats are ignored (one toggle
+                // per press). Ctrl+K has no Frost meaning before
+                // this round and no page meaning Frost owes the
+                // page. The key never reaches the page.
+                if !repeat
+                    && modifiers.control()
+                    && !modifiers.logo()
+                    && !modifiers.alt()
+                    && matches!(&key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case("k"))
+                {
+                    return Task::done(cosmic::Action::App(Message::TogglePalette));
+                }
+                // Round 9: while the palette is open the page takes
+                // no keys at all. Escape closes it; Up/Down move
+                // the highlight (wrapping); Enter runs the
+                // highlighted command. The input's on_submit also
+                // fires Enter — only one path can fire per press:
+                // a captured Enter publishes on_submit and never
+                // reaches this handler, an uncaptured one lands
+                // here. Anything else is swallowed: typing goes to
+                // the input through its own capture.
+                if self.palette_open {
+                    if !repeat
+                        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                    {
+                        self.close_palette();
+                        return Task::none();
+                    }
+                    match key {
+                        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                            let len = self.palette_filtered().len();
+                            self.palette_selected =
+                                move_selection(self.palette_selected, len, 1);
+                            return Task::none();
+                        },
+                        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                            let len = self.palette_filtered().len();
+                            self.palette_selected =
+                                move_selection(self.palette_selected, len, -1);
+                            return Task::none();
+                        },
+                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                            return Task::done(cosmic::Action::App(
+                                Message::PaletteRunSelected,
+                            ));
+                        },
+                        _ => return Task::none(),
+                    }
+                }
                 // Round 8: Escape closes the dropdown menu, and the
                 // key never reaches the page. Checked before F12
                 // and before the content-focus gate.
@@ -538,7 +801,9 @@ impl Frost {
                 modifiers,
                 ..
             }) => {
-                if self.content_focused && !self.menu_open {
+                // Round 9: no key releases reach the page while the
+                // palette is open, either.
+                if self.content_focused && !self.menu_open && !self.palette_open {
                     self.send_key(
                         FrostKeyState::Up,
                         &key,
@@ -551,6 +816,59 @@ impl Frost {
                 }
             },
             _ => {},
+        }
+        Task::none()
+    }
+
+    /// A keyboard event a widget CAPTURED (Round 9): the only
+    /// capturer that matters is the palette's query input — a
+    /// focused text input swallows Escape (it just unfocuses
+    /// itself), so without this path the palette could never
+    /// close from a focused input. Every other captured key is
+    /// the widget's own business (typing in the address bar stays
+    /// in the address bar) and is ignored here. Only the main
+    /// window's events reach the app at all.
+    fn handle_iced_event_captured(
+        &mut self,
+        id: window::Id,
+        event: iced::Event,
+    ) -> Task<Message> {
+        if self.core.main_window_id() != Some(id) {
+            return Task::none();
+        }
+        // Round 9, fix: libcosmic's text_input captures EVERY
+        // KeyPressed while it is focused (vendored
+        // src/widget/text_input/input.rs — the handler ends in an
+        // unconditional shell.capture_event(), except for Escape
+        // and Up/Down, which return early without capturing). So
+        // a Ctrl+K pressed while the palette input — or the
+        // address bar — has focus never reaches the Ignored path
+        // where the toggle lives; it arrives here instead. Gated
+        // 2026-11-15: three Ctrl+K presses with the palette open
+        // (fast chord x2, slow chord x1) all left the palette
+        // open until this branch was added. Handle the toggle
+        // here, exactly as the KeyPressed handler does — an event
+        // is Captured or Ignored, never both, so it fires once.
+        if let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            repeat,
+            ..
+        }) = event
+        {
+            if !repeat
+                && modifiers.control()
+                && !modifiers.logo()
+                && !modifiers.alt()
+                && matches!(&key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case("k"))
+            {
+                return Task::done(cosmic::Action::App(Message::TogglePalette));
+            }
+            if self.palette_open
+                && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+            {
+                self.close_palette();
+            }
         }
         Task::none()
     }
@@ -693,6 +1011,9 @@ impl cosmic::Application for Frost {
                 title: None,
                 menu_open: false,
                 menu_hovered: None,
+                palette_open: false,
+                palette_query: String::new(),
+                palette_selected: 0,
                 can_back: false,
                 can_forward: false,
                 window_size,
@@ -748,7 +1069,24 @@ impl cosmic::Application for Frost {
                     iced::event::Status::Ignored => {
                         Some(Message::IcedEvent(id, event))
                     },
-                    iced::event::Status::Captured => None,
+                    iced::event::Status::Captured => match &event {
+                        // Round 9: libcosmic's text_input captures
+                        // EVERY KeyPressed while it is focused (its
+                        // handler ends in an unconditional
+                        // capture_event, except Escape and Up/Down,
+                        // which return early without capturing) —
+                        // so a Ctrl+K from the palette input or
+                        // the address bar arrives here, not on the
+                        // Ignored path. IcedEventCaptured handles
+                        // the palette toggle for those; Captured
+                        // mouse events stay dropped, so the address
+                        // bar's other captured keys still never
+                        // reach the page.
+                        iced::Event::Keyboard(_) => {
+                            Some(Message::IcedEventCaptured(id, event))
+                        },
+                        _ => None,
+                    },
                 },
             }),
         ])
@@ -890,6 +1228,9 @@ impl cosmic::Application for Frost {
             Message::CloseWindow(id) => self.close_window_by_id(id),
             Message::Popup(msg) => self.update_popup(msg),
             Message::IcedEvent(id, event) => self.handle_iced_event(id, event),
+            Message::IcedEventCaptured(id, event) => {
+                self.handle_iced_event_captured(id, event)
+            },
             Message::Back => {
                 // Round 4, F-008: mark loading NOW (see
                 // load_loopback) so Stop is live even if this
@@ -971,10 +1312,14 @@ impl cosmic::Application for Frost {
             },
             Message::ToggleMenu => {
                 // Round 8: the menu floats over the content, so
-                // opening it does not resize the webview.
+                // opening it does not resize the webview. Round 9:
+                // opening the menu closes the palette, and the
+                // palette's toggle does the reverse — the two
+                // overlays never share the screen.
                 if self.menu_open {
                     self.close_menu();
                 } else {
+                    self.close_palette();
                     self.menu_open = true;
                 }
                 Task::none()
@@ -987,8 +1332,75 @@ impl cosmic::Application for Frost {
                 self.menu_hovered = hovered;
                 Task::none()
             },
+            Message::TogglePalette => {
+                // Round 9: opening the palette closes the menu.
+                // The query input is focused on open, so typing
+                // lands in it at once; the page keeps whatever
+                // focus it had (the key handler gates page keys
+                // on !palette_open, so nothing leaks while the
+                // palette is up, and focus is exactly as it was
+                // once it closes).
+                if self.palette_open {
+                    self.close_palette();
+                    Task::none()
+                } else {
+                    self.close_menu();
+                    self.palette_open = true;
+                    self.palette_query.clear();
+                    self.palette_selected = 0;
+                    text_input::focus(palette_input_id())
+                }
+            },
+            Message::ClosePalette => {
+                self.close_palette();
+                Task::none()
+            },
+            Message::PaletteInputChanged(value) => {
+                self.palette_query = value;
+                self.palette_selected = 0;
+                Task::none()
+            },
+            Message::PaletteSelect(index) => {
+                self.palette_selected = index;
+                Task::none()
+            },
+            Message::PaletteRun(index) => {
+                // Resolve against the CURRENT filtered list (the
+                // view and this path derive it the same way, so
+                // the index always means the row the user saw),
+                // close the palette, then run the real message —
+                // the palette adds no behavior of its own.
+                let commands = self.palette_filtered();
+                match commands.get(index) {
+                    Some((_, message)) => {
+                        let message = message.clone();
+                        self.close_palette();
+                        self.update(message)
+                    },
+                    None => Task::none(),
+                }
+            },
+            Message::PaletteRunSelected => {
+                let index = self.palette_selected;
+                self.update(Message::PaletteRun(index))
+            },
+            Message::FocusAddress => {
+                // Round 9: the palette's "Focus address bar"
+                // command. The bar gets the URL selected, so
+                // typing replaces it at once; keys go to the bar,
+                // not the page, until Enter or a click elsewhere.
+                self.close_palette();
+                self.close_menu();
+                self.address_editing = true;
+                self.content_focused = false;
+                Task::batch([
+                    text_input::focus(address_input_id()),
+                    text_input::select_all(address_input_id()),
+                ])
+            },
             Message::OpenSettings => {
                 self.close_menu();
+                self.close_palette();
                 self.open_settings_window()
             },
             Message::OpenPrint => {
@@ -998,6 +1410,7 @@ impl cosmic::Application for Frost {
                 // bytes arrive (or the capture errors). A Print
                 // window that is already open is just focused.
                 self.close_menu();
+                self.close_palette();
                 if let Some(id) = self.popup_id(windows::PopupKind::Print) {
                     return window::gain_focus(id);
                 }
@@ -1022,6 +1435,7 @@ impl cosmic::Application for Frost {
                 // capture_inspector). An Inspector window that is
                 // already open is just focused.
                 self.close_menu();
+                self.close_palette();
                 if let Some(id) = self.popup_id(windows::PopupKind::Inspector) {
                     window::gain_focus(id)
                 } else {
@@ -1031,11 +1445,13 @@ impl cosmic::Application for Frost {
             },
             Message::OpenFile => {
                 self.close_menu();
+                self.close_palette();
                 let home = file_browser::home_dir();
                 self.open_file_window(&home)
             },
             Message::Exit => {
                 self.close_menu();
+                self.close_palette();
                 if self.settings.confirm_exit {
                     self.open_exit_window()
                 } else {
@@ -1162,6 +1578,7 @@ impl cosmic::Application for Frost {
             button::standard("⟳").on_press(Message::Reload).into(),
             stop.into(),
             text_input("Address", &self.address)
+                .id(address_input_id())
                 .on_input(Message::AddressChanged)
                 .on_submit(|_| Message::AddressSubmitted)
                 .width(iced::Length::Fill)
@@ -1243,6 +1660,25 @@ impl cosmic::Application for Frost {
             .on_press(Message::CloseMenu);
             stack = stack.push(catcher);
             stack = stack.push(self.menu_panel(colors));
+        }
+        // Round 9: the command palette floats over the content the
+        // same way — a DIMMED full-window click-catcher (any press
+        // outside the panel closes the palette without clicking
+        // through to the page or toolbar; the dim is what makes
+        // the page read as blocked behind the panel), then the
+        // centered panel itself.
+        if self.palette_open {
+            let catcher = mouse_area(
+                container(
+                    widget::Space::new()
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                )
+                .style(|_| palette_dim_style()),
+            )
+            .on_press(Message::ClosePalette);
+            stack = stack.push(catcher);
+            stack = stack.push(self.palette_panel(colors));
         }
 
         container(stack.width(Length::Fill).height(Length::Fill))
@@ -1406,6 +1842,47 @@ fn menu_shortcut_style(colors: ChromeColors) -> cosmic::iced::widget::container:
     }
 }
 
+/// One palette row (Round 9): the command label, full-width click
+/// target. Same shape as a menu entry — a `mouse_area`, not a
+/// button (see `menu_item` for why) — with the same hover fill for
+/// the highlighted row. The pointer entering a row makes it the
+/// highlighted one, so mouse and keyboard selection never disagree.
+fn palette_row<'a>(
+    colors: ChromeColors,
+    index: usize,
+    selected: bool,
+    label: &'a str,
+) -> Element<'a, Message> {
+    let row = widget::row::with_children(vec![text(label).size(14).into()])
+        .align_y(iced::Alignment::Center);
+    let style = if selected {
+        menu_item_hover_style(colors)
+    } else {
+        menu_item_rest_style(colors)
+    };
+    mouse_area(
+        container(row)
+            .style(move |_| style)
+            .width(Length::Fill)
+            .padding([8, 10]),
+    )
+    .on_press(Message::PaletteRun(index))
+    .on_enter(Message::PaletteSelect(index))
+    .into()
+}
+
+/// The dim behind the palette (Round 9): a translucent black wash
+/// over the whole window, so the page reads as blocked while the
+/// palette is open. Same wash in both themes.
+fn palette_dim_style() -> cosmic::iced::widget::container::Style {
+    cosmic::iced::widget::container::Style {
+        background: Some(cosmic::iced::Background::Color(
+            cosmic::iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+        )),
+        ..Default::default()
+    }
+}
+
 /// Address-bar resolution: a URL with a loadable scheme is used
 /// as-is; a bare hostname (no spaces, has a dot) gets `https://`;
 /// anything else is a search query with the default search engine.
@@ -1524,19 +2001,111 @@ mod tests {
     }
 
     #[test]
-    fn menu_items_are_five_with_f12_only_on_inspector() {
-        assert_eq!(MENU_ITEMS.len(), 5);
+    fn menu_items_are_six_with_f12_and_ctrl_k() {
+        assert_eq!(MENU_ITEMS.len(), 6);
         let labels: Vec<&str> = MENU_ITEMS.iter().map(|(label, _, _)| *label).collect();
         assert_eq!(
             labels,
-            ["Settings", "Print page…", "Open file…", "Inspector", "Exit"]
+            [
+                "Settings",
+                "Print page…",
+                "Open file…",
+                "Inspector",
+                "Command palette…",
+                "Exit"
+            ]
         );
         for (label, shortcut, _) in MENU_ITEMS {
-            if label == "Inspector" {
-                assert_eq!(shortcut, Some("F12"));
-            } else {
-                assert_eq!(shortcut, None, "{label} must not invent a shortcut");
+            match label {
+                "Inspector" => assert_eq!(shortcut, Some("F12")),
+                "Command palette…" => assert_eq!(shortcut, Some("Ctrl+K")),
+                _ => assert_eq!(shortcut, None, "{label} must not invent a shortcut"),
             }
+        }
+    }
+
+    #[test]
+    fn fuzzy_match_is_ordered_case_insensitive_subsequence() {
+        assert!(fuzzy_match("", "Open Settings"));
+        assert!(fuzzy_match("set", "Open Settings"));
+        assert!(fuzzy_match("SET", "Open Settings"));
+        assert!(fuzzy_match("opst", "Open Settings"));
+        assert!(fuzzy_match("go", "Go back"));
+        assert!(fuzzy_match("go", "Go forward"));
+        assert!(fuzzy_match("rl", "Reload"));
+        assert!(!fuzzy_match("xyz", "Open Settings"));
+        // Out of order: no 'f' after the 'b' in "Go back".
+        assert!(!fuzzy_match("gfb", "Go back"));
+        assert!(!fuzzy_match("gfb", "Go forward"));
+        assert!(!fuzzy_match("settings open", "Open Settings"));
+    }
+
+    #[test]
+    fn palette_commands_hide_unavailable_actions() {
+        // Nothing to go back/forward to, nothing loading: only the
+        // always-available commands show.
+        let labels: Vec<&str> = palette_commands_for(false, false, false)
+            .iter()
+            .map(|(label, _)| *label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Reload",
+                "Open Settings",
+                "Print page…",
+                "Open file…",
+                "Open Inspector",
+                "Focus address bar",
+                "Quit Frost",
+            ]
+        );
+        // With history and a load in flight, the conditional
+        // commands appear in place.
+        let labels: Vec<&str> = palette_commands_for(true, true, true)
+            .iter()
+            .map(|(label, _)| *label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Go back",
+                "Go forward",
+                "Reload",
+                "Stop loading",
+                "Open Settings",
+                "Print page…",
+                "Open file…",
+                "Open Inspector",
+                "Focus address bar",
+                "Quit Frost",
+            ]
+        );
+    }
+
+    #[test]
+    fn move_selection_wraps_both_ends() {
+        assert_eq!(move_selection(0, 5, -1), 4);
+        assert_eq!(move_selection(4, 5, 1), 0);
+        assert_eq!(move_selection(2, 5, 1), 3);
+        assert_eq!(move_selection(2, 5, -1), 1);
+        assert_eq!(move_selection(0, 0, 1), 0);
+        assert_eq!(move_selection(0, 1, 1), 0);
+    }
+
+    #[test]
+    fn palette_panel_is_centered_and_never_overflows() {
+        // 560 px panel, centered.
+        assert_eq!(palette_panel_geometry(1280.0), (360.0, 560.0));
+        assert_eq!(palette_panel_geometry(800.0), (120.0, 560.0));
+        for width in [592.0, 400.0, 100.0, 20.0] {
+            let (x, w) = palette_panel_geometry(width);
+            assert!(x >= 0.0, "x {x} at window width {width}");
+            assert!(w >= 1.0, "width {w} at window width {width}");
+            assert!(
+                x + w <= width,
+                "panel ({x} + {w}) runs off-screen at window width {width}"
+            );
         }
     }
 

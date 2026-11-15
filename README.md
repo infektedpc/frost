@@ -5,14 +5,17 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 8 — Firefox-style hamburger dropdown.** Joel's
-direction (2026-11-15, with a Firefox application-menu screenshot):
-the hamburger menu should drop down like Firefox's — a compact
-panel anchored top-right under the ☰ button, not the full-width bar
-of Rounds 2–7. Same five items, same native windows, same behavior;
-the panel is 300 px wide with separators, F12 next to Inspector,
-hover highlight, and closes on pick / Escape / click-outside / ☰
-again. No fork patch; the fork is untouched at `f9462dbb7`. See
+**Status: Round 9 — Command palette.** Ctrl+K (or the ☰ menu's
+"Command palette…" entry) opens a VS Code-style palette: centered
+panel, text input on top, fuzzy-filtered command list below; arrows
+move the highlight, Enter runs, Escape / click-outside / Ctrl+K
+closes. Only real, working actions — unavailable ones (Go back /
+Go forward with no history, Stop loading with nothing loading) are
+hidden, never shown dead. Gating caught and fixed a real bug:
+libcosmic's text_input captures every KeyPressed while focused, so
+Ctrl+K with the palette input focused never reached the toggle —
+fixed in the Captured-event handler. Tests 53/53. No fork patch;
+the fork is untouched at `f9462dbb7`. See
 [ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
@@ -926,3 +929,160 @@ Harness notes from this round (for the next round's builder):
   is the way to type shifted punctuation such as `:` — raw type
   produced `;` instead, which turned `frost://settings` into a
   search for `frost;//settings`.
+
+## Round 9 — Command palette (what is proven, what is not)
+
+A VS Code-style command palette, opened with Ctrl+K (verified
+unused in Frost — only F12 and Escape were browser shortcuts) or
+from a "Command palette…" entry in the ☰ menu (Ctrl+K shown
+right-aligned, so it is discoverable). Palette only — no new
+features, no fork patch (the fork is untouched at `f9462dbb7`), no
+server, no .deb.
+
+What the palette is (`crates/frost/src/app.rs`, reusing the Round 8
+overlay pattern — `Stack` + dimmed full-window click-catcher +
+panel; `crates/frost/src/settings.rs` needed no new colors, the
+menu's panel/hover styles fit):
+
+- Centered panel, 560 px wide, 100 px from the top
+  (`palette_panel_geometry` from the live window width). A window
+  narrower than the panel shrinks it instead of running off-screen
+  (x never negative — unit-tested down to 20 px wide). The page
+  behind is dimmed (black, alpha 0.4) and blocked: clicks outside
+  close the palette without clicking through, and the wheel does
+  not scroll the page behind it.
+- Text input on top ("Type a command", focused on open), filtered
+  command list below. Fuzzy matching is a subsequence match,
+  case-insensitive (`fuzzy_match`): "set" leaves Open Settings and
+  Open Inspector; "k" matches nothing and the panel shows "No
+  matching commands". Arrow Up/Down moves the highlight (wraps at
+  both ends — `move_selection`), Enter runs the highlighted
+  command, Escape closes, Ctrl+K toggles, clicking a row runs it.
+- Commands are ONLY real, working actions wired to existing
+  messages — nothing is shown that does nothing. The list is
+  `palette_commands_for(can_back, can_forward, loading)`, with
+  unavailable actions hidden rather than shown dead: Go back /
+  Go forward only with history, Stop loading only while loading.
+  Always present: Reload, Open Settings, Print page…, Open file…,
+  Open Inspector, Focus address bar, Quit Frost. (Go back / Go
+  forward were not gated live this round — the gate instance had
+  no history to go back to; the hiding logic is unit-tested.)
+- Follows the Dark/Light theme like the Round 8 menu (same panel
+  and hover styles; the gate ran in Dark — Light follows the same
+  code path and was not re-screenshotted this round).
+- The palette must not break the menu: opening the palette closes
+  the menu and vice versa; Escape closes whichever is open,
+  palette first if both somehow open. The ☰ menu now has six
+  items (Command palette… sits after Inspector, before Exit, with
+  separators after Settings and after Command palette…).
+
+**The gate found a real bug, and it is fixed in this round.**
+Ctrl+K with the palette input focused did NOT toggle the palette
+closed — three presses (fast chord x2, slow chord x1) all left it
+open, while Escape and click-outside closed it fine. Root cause,
+proven from the vendored libcosmic source: libcosmic's text_input
+captures EVERY KeyPressed while it is focused (its handler ends in
+an unconditional `shell.capture_event()`, except for Escape and
+Up/Down, which return early without capturing) — so a Ctrl+K from
+the palette input never reaches the Ignored-path toggle. (The
+pre-fix comments blamed iced's text_input for swallowing Escape;
+the app actually uses libcosmic's text_input, which lets Escape
+through uncaptured — the comments are corrected in this round.)
+Fix: `handle_iced_event_captured` — which the subscription feeds
+with Captured keyboard events — now toggles the palette on a
+Captured Ctrl+K exactly as the KeyPressed handler does for an
+Ignored one. An event is Captured or Ignored, never both, so it
+fires once. The same branch makes Ctrl+K work from the address
+bar, which captures it the same way.
+
+Proven (sandbox, 2026-11-15, under Xvfb + software GL; gates ran
+live against the shipped tree, screenshots read firsthand):
+
+- `cargo build -p frost --features ui-libcosmic` green (serialized,
+  `CARGO_BUILD_JOBS=1`, 57m 49s for the fixed build — the first
+  build was 26m 05s; the link alone runs 40+ min on this box);
+  `cargo test --workspace --lib --bins` green — **53 tests**
+  (baseline 49/49 from Round 8 + 4 new palette tests: fuzzy_match,
+  palette_commands_hide_unavailable_actions,
+  move_selection_wraps_both_ends,
+  palette_panel_is_centered_and_never_overflows).
+- Palette open (Ctrl+K): centered panel with input + 7 commands
+  (Reload highlighted first; no Go back / Go forward with no
+  history, no Stop loading with nothing loading), page dimmed
+  behind it. Typing "set" narrows it to Open Settings + Open
+  Inspector; ArrowDown moves the highlight visibly to Open
+  Inspector; Enter runs it — the Inspector window opens with a
+  real 35-node example.org snapshot. Typing "k" shows "No
+  matching commands".
+- Escape closes the palette (the Captured-path Escape works with
+  the input focused); click outside closes it (no click-through);
+  Ctrl+K toggles it closed — verified on the fixed build after
+  the bug above (open shot + closed shot).
+- Menu entry "Command palette…" (Ctrl+K right-aligned) opens the
+  palette and closes the menu; opening the palette with Ctrl+K
+  while the menu is open closes the menu. Clicking the "Open
+  Settings" row opens the native Settings window and closes the
+  palette. Typing "addr" + Enter focuses the address bar with the
+  URL selected; typing a URL + Enter navigates (example.org loads
+  with the banner live).
+- Regression: settings save writes the JSON and persists across
+  relaunch (homepage example.com applied on relaunch, then
+  restored to example.org/Dark), banner on example.org and
+  correctly absent on example.com, Back/Forward (settled shots —
+  the address bar updates ~10–15 s before the content repaints
+  under SwiftShader, the known Round 6 observation), Print Save
+  writes a PNG (`frost-print-1794783773.png`, 183,217 B), Inspector
+  F12 captures a real 33-node example.com snapshot, strip-scroll
+  fully painted (BAND 1–2, 4, 8 including a rapid Space burst —
+  the Round 6 fix is untouched), `frost://settings` fails plainly
+  with the honest status message, `ss` shows no Frost listener,
+  the Round 8 menu still opens and closes on Escape.
+
+Not proven / known limits:
+
+- Mouse-wheel scrolling still unproven under Xvfb (carried from
+  Round 2). Real mouse/keyboard, drag latency, and whether the
+  Round 6 flashing fix holds on Joel's real box are his-box verdicts.
+- PageDown (keycode 105) did not scroll the tall test page in this
+  gate — Space scrolled it fine, so the page scrolls and paints;
+  the PageDown non-response is a harness keycode/focus quirk, not
+  a proven app bug, but it was not chased to a root cause.
+- The Round 7 warts carry over unchanged: the status bar keeps
+  "Capturing print preview…" / "Capturing page structure…" after
+  the capture finishes (clears on the next navigation), the Settings
+  window has no in-content Close button, and the theme applies on
+  Save, not instantly per click.
+- **Inspector "Back to the page" hit-test quirk (new wart, measured
+  this round):** the button's hit area sits ~15 px above its visual
+  rect — clicks at the button's visual center (140,165) did nothing
+  four times, while a click at its top edge (140,150) closed the
+  window. The button works; aim at its top edge under the harness.
+  The OS close (WM_DELETE_WINDOW via `xclose`) closes it cleanly.
+  This is a Round 7 window, untouched since — not a Round 9
+  regression — but it was not measured before this round.
+- The Inspector's "Re-capture" button was not re-clicked this
+  round (it shares the button mechanism with Back, which was
+  proven to work at its top edge).
+
+Harness notes from this round (for the next round's builder):
+
+- **Runtime restarts kill the build and Xvfb.** The first full
+  build was killed mid-link by a runtime restart (~7 min in) and
+  Xvfb :97 died with it — the rebuild (57m 49s) and an Xvfb
+  restart (`Xvfb :97 -screen 0 1280x800x24`) were needed before
+  gating. If a build session reports no confirmed result, check
+  the binary timestamp and whether cargo is still alive before
+  re-running — and check Xvfb before launching.
+- **F12 is keycode 96, not 123.** Sending 123 opened nothing; 96
+  opens the Inspector. (F1–F12 are 67–78, then F11=95, F12=96 on
+  evdev.)
+- **Back/Forward settle slowly under SwiftShader.** The address bar
+  updates immediately but the content repaints ~15–35 s later; a
+  shot taken at 8 s shows the new URL with the old page (and the
+  banner still visible). Wait 30+ s for the settled shot before
+  concluding the navigation is wrong; the gate log's GET lines
+  confirm the fetch happened.
+- **Ctrl+K chords need direct xinject keydown/key/keyup**
+  (`r9-chord.sh`: Control=37, k=45) — `r7-key.sh` does single keys
+  only. The toggle bug above was real, not a chord artifact: it
+  reproduced with fast chords and with a slow separated chord.

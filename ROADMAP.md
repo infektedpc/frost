@@ -199,13 +199,53 @@ No new features — this round finishes what Round 3 left open:
   fails plainly); regressions (settings persist, banner,
   back/forward, F12 Inspector, print Save, strip-upload scrolling).
 
-## Later rounds (in rough order)
+## Round 8 — Firefox-style hamburger dropdown (DONE 2026-11-15)
 
-- Frostbite tab hibernation, Snowplow network-layer blocking, Deep Freeze
-  offline archive, command palette, Snowdrift workspaces, split-view,
-  session restore, PDF viewer, spellcheck (F-004). (Print-to-PDF stays
-  out until Servo gains a real print pipeline — F-003's preview + PNG
-  save is the honest scope.)
+- **Joel's direction (from a Firefox application-menu screenshot):
+  the hamburger menu drops down like Firefox's** — a compact 300 px
+  panel anchored top-right under ☰, not the full-width bar of
+  Rounds 2–7. Same five items, same native windows; separators,
+  F12 next to Inspector, hover highlight, closes on pick / Escape /
+  click-outside / ☰ again. No fork patch.
+- Gate: build green (serialized); tests 49/49 (frost bin 26, engine
+  7, extensions 8, inspector 8); firsthand-read screenshots per
+  behavior; regressions (settings persist, banner, back/forward,
+  Print Save, F12 Inspector, strip-scroll, frost:// fails plainly,
+  no listener).
+
+## Round 9 — command palette (DONE 2026-11-15)
+
+- **VS Code-style palette, Ctrl+K or the ☰ menu's "Command
+  palette…" entry (Ctrl+K shown right-aligned).** Centered overlay
+  (560 px, input on top, filtered list below) reusing the Round 8
+  overlay pattern (Stack + dimmed click-catcher + panel); fuzzy
+  subsequence match, case-insensitive; arrows move the highlight
+  (wraps), Enter runs, Escape closes, click outside closes, row
+  click runs, Ctrl+K toggles. Only real, working actions, with
+  unavailable ones hidden (Go back/Go forward need history, Stop
+  loading needs a load in flight). Follows Dark/Light. Opening the
+  palette closes the menu and vice versa. No fork patch.
+- **Gate found and fixed a real bug:** libcosmic's text_input
+  captures every KeyPressed while focused, so a Ctrl+K with the
+  palette input focused never reached the toggle — fixed in the
+  Captured-event handler. Gate: build green (serialized); tests
+  53/53 (frost bin 30, engine 7, extensions 8, inspector 8);
+  firsthand-read screenshots per behavior (open, filter "set",
+  arrow, Enter runs Inspector, Escape, click-outside, toggle,
+  menu entry, palette-closes-menu, row click, Focus address bar);
+  regressions (settings save + persist, banner on .org / absent
+  on .com, back/forward, Print Save, F12 Inspector, strip-scroll,
+  frost:// fails plainly, no listener, menu opens/closes).
+
+## Later rounds (Joel's order, settled 2026-11-15 — easiest first)
+
+- Snowplow network-layer blocking, split view, Deep Freeze offline
+  archive, Frostbite tab hibernation (needs a tab system first),
+  Snowdrift workspaces (needs tabs + sessions + persistence —
+  biggest). Inspector v2 (docked panel, click-to-inspect, live
+  updates, console) stays unqueued. (Print-to-PDF stays out until
+  Servo gains a real print pipeline — F-003's preview + PNG save is
+  the honest scope.)
 
 ## Later rounds (in rough order)
 
