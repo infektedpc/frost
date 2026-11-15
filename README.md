@@ -124,6 +124,36 @@ release build replaces the binary. The packaged binary was gated from
 a clean extraction: window launches, example.org paints fully, the
 hamburger menu shows all four entries, `frost://settings` loads.
 
+### .deb 0.7.0 (Round 7, Debian 13, amd64)
+
+`packaging/build-deb-0.7.0.sh` builds `frost-0.7.0_amd64.deb` (SHA-256
+`acaf4e01f5f036b46349bfd1eb52ec5d0e39282743b76048408236903f3fa118`,
+64,676,464 B; stripped binary 318,681,992 B) from the Round 7 tree
+(HEAD `bad2374`, same proven build11c binary — no rebuild). Same
+contents: `/usr/bin/frost`, desktop file, snowflake icon. Same honest
+stripped-DEBUG note in the Description. Depends were re-derived from
+`ldd` + `/proc` maps of the running Round 7 binary; two changes vs
+0.4.0: `libvulkan1` added (the Round 7 binary loads system
+`libvulkan.so.1` and the lavapipe ICD in the gated run — wgpu takes
+the Vulkan path here, where 0.4.0's run took GL) and
+`libwayland-server0` added (`libwayland-server.so.0` is mapped by the
+running process). The packaged binary was gated from a clean
+extraction: launch + example.org full paint + banner, all five menu
+entries (Settings and Inspector opened as native windows, Inspector
+capturing a real 35-node snapshot), `frost://settings` failing plainly
+with the honest status message, and no loopback listener. Install the
+same way: `sudo dpkg -i frost-0.7.0_amd64.deb` (+ `sudo apt-get
+install -f` only if a dep is missing). Never installed with `dpkg -i`
+in the sandbox — the real install is Joel's-box verdict.
+
+Harness note (2026-11-15): under bare Xvfb, OS-closing the Settings
+popup with `xdotool windowclose` killed the whole app — winit panicked
+in `GetGeometry` on the destroyed window id. That is a bare-Xvfb
+harness artifact (no window manager); the designed close path is the
+WM close button on a real desktop, and the in-app "Back to the page"
+button closes Inspector cleanly. Do not treat the Xvfb panic as a
+packaging failure.
+
 ### Flatpak (manifest only — UNBUILT, UNVERIFIED)
 
 `packaging/org.frost.Frost.yml` + `packaging/build-flatpak.sh` build a
