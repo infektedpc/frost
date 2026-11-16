@@ -41,10 +41,20 @@
 //!   directories (manifest + content script), the host matches content
 //!   scripts against page URLs, and the engine evaluates them in the
 //!   page. A bad manifest is logged and skipped, never a crash.
-//! * Frost draws its own titlebar (the built-in libcosmic headerbar is
-//!   hidden — it renders the title but no window-control buttons on this
-//!   setup): "Frost — <page title>" with real minimize, maximize/restore,
-//!   and close buttons (text glyphs, real iced window commands).
+//! * Round 10: the window manager draws the titlebar by default
+//!   (`client_decorations: false`); Frost's own titlebar is now
+//!   only the GNOME fallback (Mutter refuses server-side
+//!   decorations, so there the WM bar would mean no titlebar at
+//!   all). The built-in libcosmic headerbar stays hidden in both
+//!   modes — it renders the title but no window-control buttons
+//!   on this setup. The fallback bar reads "Frost — <page title>"
+//!   with real minimize, maximize/restore, and close buttons
+//!   (text glyphs, real iced window commands). Either way the OS
+//!   window title is kept in step, so the WM shows the right
+//!   title in WM mode. The mode is picked once at startup from
+//!   `XDG_CURRENT_DESKTOP` (`XDG_SESSION_DESKTOP` as fallback):
+//!   GNOME (or any value containing it) gets Frost's own bar,
+//!   everything else — including unset — gets the WM bar.
 //! * Round 4, F-007: the Round 2 resize "jiggle" is RETIRED. Its root
 //!   cause was the fork's damage-rects patch setting WebRender
 //!   `max_partial_present_rects: 1` (partial present) while Frost's
@@ -55,8 +65,9 @@
 //!   post-load jiggle is needed. F-005's `refresh_viewport` stays
 //!   (harmless viewport re-send).
 //!
-//! Chrome geometry is fixed by construction (Frost titlebar 40, toolbar
-//! 48, status 28), so the webview size and the click mapping are exact:
+//! Chrome geometry is fixed by construction (toolbar 48, status 28,
+//! plus Frost's own titlebar 40 only in the GNOME fallback — 0 in
+//! WM mode), so the webview size and the click mapping are exact:
 //! the content area is the window minus the chrome, and mouse
 //! coordinates translate 1:1 into page coordinates. The hamburger menu
 //! (Round 8) is a floating panel over the content — it consumes no

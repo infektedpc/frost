@@ -5,18 +5,16 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 9 — Command palette.** Ctrl+K (or the ☰ menu's
-"Command palette…" entry) opens a VS Code-style palette: centered
-panel, text input on top, fuzzy-filtered command list below; arrows
-move the highlight, Enter runs, Escape / click-outside / Ctrl+K
-closes. Only real, working actions — unavailable ones (Go back /
-Go forward with no history, Stop loading with nothing loading) are
-hidden, never shown dead. Gating caught and fixed a real bug:
-libcosmic's text_input captures every KeyPressed while focused, so
-Ctrl+K with the palette input focused never reached the toggle —
-fixed in the Captured-event handler. Tests 53/53. No fork patch;
-the fork is untouched at `f9462dbb7`. See
-[ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 10 — WM titlebar with GNOME fallback.** The window
+manager draws the titlebar by default now (`client_decorations:
+false`); Frost's own 40 px titlebar row is gone on KDE and other
+decorating desktops, and the toolbar is the top row. On GNOME
+(Mutter refuses server-side decorations) Frost keeps drawing its
+own titlebar, chosen once at startup from `XDG_CURRENT_DESKTOP`
+(`XDG_SESSION_DESKTOP` as fallback). Either way the OS window
+title stays in step with the page title. Tests 56/56 (baseline
+53/53 + 3 new titlebar-mode tests). No fork patch; the fork is
+untouched at `f9462dbb7`. See [ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -1119,3 +1117,133 @@ Harness notes from this round (for the next round's builder):
   (`r9-chord.sh`: Control=37, k=45) — `r7-key.sh` does single keys
   only. The toggle bug above was real, not a chord artifact: it
   reproduced with fast chords and with a slow separated chord.
+
+## Round 10 — WM titlebar with GNOME fallback (what is proven, what is not)
+
+The window manager draws the titlebar by default now. Frost's
+own 40 px titlebar row — title text plus the minimize /
+maximize / close buttons, the drag-to-move press handling, the
+double-press to maximize — is gone on KDE and every other desktop
+whose window manager draws decorations, and the toolbar is the
+top row of the window. On GNOME (Mutter refuses server-side
+decorations, so the WM bar there would mean no titlebar at all)
+Frost keeps drawing its own titlebar, exactly as in Rounds 1–9.
+The choice is made once at startup from the desktop environment,
+before `cosmic::app::run` — no setting, no toggle, no runtime
+switch. No fork patch; the fork is untouched at `f9462dbb7`.
+
+What changed (`crates/frost/src/app.rs`):
+
+- `use_client_decorations(desktop: &str) -> bool` — the rule,
+  pure and unit-tested: `true` (Frost draws its own bar) only
+  when the desktop string contains "gnome" (case-insensitive,
+  so colon-separated values like "ubuntu:GNOME" match too);
+  `false` (the WM draws it) for KDE, Plasma, XFCE, COSMIC,
+  Hyprland, Sway, and unset/unknown. `detected_desktop()`
+  resolves the string: `XDG_CURRENT_DESKTOP` first,
+  `XDG_SESSION_DESKTOP` as the fallback, empty when neither is
+  set (which means the WM bar).
+- `run()` passes the flag both ways at once: libcosmic's
+  `Settings.client_decorations(...)` (the vendored setting —
+  `src/app/settings.rs`, `derive_setters::Setters` generates the
+  setter; the non-Wayland path in `src/app/mod.rs` turns it
+  into `iced.window.decorations = !client_decorations`, the
+  Wayland path into `SctkWindowSettings.client_decorations`) and
+  the app's `Flags`, which changed from `()` to `bool` — so the
+  view agrees with the window by construction, never by a second
+  env read.
+- The `Frost` struct carries `client_decorations: bool`, and the
+  geometry reads it through `titlebar_height()` (40 px in the
+  fallback, 0 in WM mode): `content_rect()`, the initial
+  webview height in `init()`, and the menu panel's top padding
+  (`titlebar_height() + TOOLBAR_HEIGHT + MENU_PANEL_GAP` — the
+  panel still sits 4 px under the toolbar, which is now the top
+  row). The view builds the titlebar row and its buttons as
+  before, but only pushes the row into the main column in
+  fallback mode; the TitlebarMinimize / TitlebarMaximize /
+  TitlebarClose / TitlebarDrag / TitlebarDoubleClick handlers
+  stay live behind the flag. `titlebar_text()` is unchanged and
+  still feeds `set_window_title` on every Tick, so the OS
+  window title stays correct in both modes — the WM shows it in
+  WM mode, Frost's own bar in fallback mode.
+- The built-in libcosmic headerbar stays hidden in both modes
+  (`core.window.show_headerbar = false`, as before): it renders
+  the title but no window-control buttons on this setup, so it
+  would only be an empty strip.
+
+Popups (Round 7 windows — Settings, Print, Open file, Inspector,
+Exit) already asked the window manager for titlebars: their
+`window::open` calls use `window::Settings` with
+`..Default::default()`, and iced's default `decorations` is
+`true`. No popup code changed. `transparent: true` stays, and it
+does not conflict with decorations: transparency is about the
+surface's alpha mode (the Round 7 finding — iced picks one alpha
+mode from the main window's surface, and an opaque popup's 24-bit
+visual panics on configure), while decorations are about the WM
+frame around that surface; the two are orthogonal. The WM close
+button on the popups now also fixes the Round 7 wart that the
+Settings window had no in-content Close button.
+
+Not proven / known limits:
+
+- Bare Xvfb has NO window manager, so the WM-drawn titlebar
+  itself — its look, and real min/max/close buttons — CANNOT be
+  verified in the sandbox: the window simply shows no titlebar
+  here, in either mode. What the sandbox proves is the app side
+  (the client row is gone/present as the mode says, the toolbar
+  is the top row in WM mode, the OS window title is set, the
+  geometry is right). Joel's KDE box is the real verdict for the
+  actual titlebar.
+- GNOME is a known limitation by design, not a bug to chase in
+  this round: the fallback exists because Mutter refuses
+  server-side decorations. The env check matters most on X11
+  (Frost's current path); on Wayland, sctk also negotiates
+  xdg-decoration with the compositor.
+- The Round 7 warts carry over except one: the Settings window
+  now has a WM close button, so its missing in-content Close
+  button no longer strands it. The stale "Capturing…" status and
+  theme-applies-on-Save are unchanged, and the Inspector "Back
+  to the page" hit area still sits ~15 px above its visual rect
+  (Round 9 wart, unchanged).
+
+Proven in the gate (2026-11-16, Xvfb :97, the binary built Nov 16
+02:21 UTC):
+
+- Build green in 42m 53s serialized; tests 56/56 (frost bin 33,
+  engine 7, extensions 8, inspector 8).
+- WM mode (`XDG_CURRENT_DESKTOP=KDE`): `r10-01-launch-wm.jpg` —
+  the toolbar is the top row, no client titlebar row, example.org
+  fully painted with the banner live; the OS window title is
+  "Frost — Example Domain" (proven by the harness focus tool
+  reading the window). `r10-02-menu-wm.jpg` — the six-item menu
+  panel anchors 4 px under the toolbar (top y≈52). Settings
+  opens (`r10-03`), saves the homepage to example.com with
+  "Settings saved." and matching JSON (`r10-04/05`), and closes
+  cleanly via the OS close (`r10-06`, Frost alive). Ctrl+K
+  palette (`r10-07`), F12 Inspector with a real 35-node snapshot
+  (`r10-08`), Print with a real preview and Save as PNG writing
+  `frost-print-1794796026.png` (212,613 B) (`r10-09`), Open file
+  with the real $HOME listing (`r10-10`), Quit Frost? dialog
+  with Cancel keeping Frost alive (`r10-11`). A 10-band tall page
+  paints fully at the top (`r10-12`) and at BAND 4 after Space
+  scrolling (`r10-13`); Back/Forward settle on the right pages
+  (`r10-14/15`); `frost://settings` fails plainly and leaves the
+  page alone (`r10-16`); `ss` shows no Frost listener (only
+  127.0.0.1:9999, the ps_server watchdog). Settings persist across
+  a relaunch — the new launch opens example.com (`r10-17`).
+- GNOME fallback (`XDG_CURRENT_DESKTOP=GNOME`):
+  `r10-18-launch-gnome.jpg` — Frost's own 40 px titlebar row is
+  back ("Frost — Example Domain" plus min/max/close), toolbar
+  below it; `r10-20-menu-gnome.jpg` — the menu panel anchors
+  under the toolbar in fallback mode too (top y≈92).
+- Session-desktop fallback (`XDG_CURRENT_DESKTOP` unset,
+  `XDG_SESSION_DESKTOP=GNOME`): `r10-19-launch-session-desktop.jpg`
+  — the own titlebar row is back, so the secondary check works.
+- Popup transparency: `transparent: true` + server-side
+  decorations do NOT conflict — all five popups opened, rendered,
+  and closed (Settings, Inspector, and Open file via the OS close;
+  Print via its in-content Close), with no configure panic.
+- A VM/runtime restart at ~02:23 UTC killed Xvfb :97 and the
+  running Frost mid-gate (after the first three WM screenshots);
+  the gates were re-run from a fresh launch on the same binary —
+  no code change, no rebuild.

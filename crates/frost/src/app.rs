@@ -26,11 +26,16 @@ use crate::settings::{is_loadable_homepage, ChromeColors, Settings as FrostSetti
 use windows::{InspectorWindow, OpenWindow, PopupMessage, PrintWindow, SettingsWindow};
 
 /// Chrome geometry, fixed by construction (see the module docs).
-/// Frost draws its OWN titlebar above the toolbar (40 px): the
-/// built-in libcosmic headerbar is hidden, because on this setup it
-/// renders the title but no window-control buttons at all (its
-/// min/max/close are icon-based and never appear — verified on
-/// Joel's box and in the sandbox). Frost's titlebar uses plain text
+/// Round 10: the window manager draws the titlebar by default
+/// (`client_decorations: false` — see `use_client_decorations`).
+/// Frost's OWN titlebar above the toolbar (40 px) is now only the
+/// GNOME fallback: GNOME/Mutter refuses server-side decorations,
+/// so there the WM bar would mean no titlebar at all. The
+/// built-in libcosmic headerbar stays hidden in both modes,
+/// because on this setup it renders the title but no
+/// window-control buttons at all (its min/max/close are
+/// icon-based and never appear — verified on Joel's box and in
+/// the sandbox). Frost's fallback titlebar uses plain text
 /// glyphs, so the buttons are always visible.
 const TITLEBAR_HEIGHT: f32 = 40.0;
 const TOOLBAR_HEIGHT: f32 = 48.0;
@@ -106,6 +111,46 @@ fn palette_panel_geometry(window_width: f32) -> (f32, f32) {
         .min((window_width - 2.0 * PALETTE_PANEL_MARGIN).max(1.0));
     let x = ((window_width - width) / 2.0).max(0.0);
     (x, width)
+}
+
+/// Round 10: which titlebar Frost gets. GNOME/Mutter refuses
+/// server-side decorations, so on GNOME the WM bar would mean no
+/// titlebar at all — Frost draws its own (`true`). Every other
+/// desktop (KDE, COSMIC, Sway, …) and an unset/unknown value get
+/// the window manager's bar (`false`). `desktop` is the resolved
+/// desktop-environment string (see `detected_desktop`); the
+/// check is a case-insensitive substring match, so
+/// colon-separated values like "ubuntu:GNOME" match too.
+fn use_client_decorations(desktop: &str) -> bool {
+    desktop.to_ascii_lowercase().contains("gnome")
+}
+
+/// Round 10: resolve the desktop environment for the titlebar
+/// rule — `XDG_CURRENT_DESKTOP` first, `XDG_SESSION_DESKTOP`
+/// as the fallback, empty when neither is set (which means the
+/// WM bar, per `use_client_decorations`).
+fn detected_desktop() -> String {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("XDG_SESSION_DESKTOP")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_default()
+}
+
+/// Round 10: height of Frost's own titlebar row for a mode —
+/// 40 px when Frost draws it (GNOME fallback), 0 when the
+/// window manager draws the titlebar. Pure, so the mode logic
+/// is unit-testable without a running app.
+fn titlebar_height_for(client_decorations: bool) -> f32 {
+    if client_decorations {
+        TITLEBAR_HEIGHT
+    } else {
+        0.0
+    }
 }
 
 /// Subsequence match, case-insensitive (Round 9): every character
@@ -289,6 +334,12 @@ pub struct Frost {
     can_back: bool,
     can_forward: bool,
     window_size: Size,
+    /// Round 10: whether Frost draws its own titlebar (GNOME
+    /// fallback) or the window manager does. Chosen once at
+    /// startup from the desktop environment (see
+    /// `use_client_decorations`); the view, content_rect, and
+    /// menu geometry all read it through `titlebar_height()`.
+    client_decorations: bool,
     /// Last cursor position, in absolute window coordinates.
     last_cursor: Option<Point>,
     /// Keyboard events go to the page only while this is set.
@@ -365,6 +416,13 @@ pub struct Frost {
 }
 
 impl Frost {
+    /// Height of Frost's own titlebar row in the current mode
+    /// (Round 10): 40 px in the GNOME fallback, 0 when the
+    /// window manager draws the titlebar.
+    fn titlebar_height(&self) -> f32 {
+        titlebar_height_for(self.client_decorations)
+    }
+
     /// The content area's rectangle in window coordinates. Round 8:
     /// the hamburger menu is a floating panel over the content, so
     /// it no longer consumes layout space (Rounds 2–7 subtracted
@@ -372,10 +430,10 @@ impl Frost {
     fn content_rect(&self) -> Rectangle {
         Rectangle {
             x: 0.0,
-            y: TITLEBAR_HEIGHT + TOOLBAR_HEIGHT,
+            y: self.titlebar_height() + TOOLBAR_HEIGHT,
             width: self.window_size.width,
             height: (self.window_size.height
-                - TITLEBAR_HEIGHT
+                - self.titlebar_height()
                 - TOOLBAR_HEIGHT
                 - STATUS_HEIGHT)
                 .max(1.0),
@@ -521,7 +579,7 @@ impl Frost {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(iced::Padding::from([
-                TITLEBAR_HEIGHT + TOOLBAR_HEIGHT + MENU_PANEL_GAP,
+                self.titlebar_height() + TOOLBAR_HEIGHT + MENU_PANEL_GAP,
                 0.0,
                 0.0,
                 x,
@@ -950,7 +1008,7 @@ impl Frost {
 
 impl cosmic::Application for Frost {
     type Executor = executor::Default;
-    type Flags = ();
+    type Flags = bool;
     type Message = Message;
 
     const APP_ID: &'static str = "dev.frost.Frost";
@@ -963,11 +1021,13 @@ impl cosmic::Application for Frost {
         &mut self.core
     }
 
-    fn init(mut core: Core, _flags: ()) -> (Self, Task<Message>) {
-        // Frost draws its own titlebar (see TITLEBAR_HEIGHT): the
-        // built-in libcosmic headerbar renders the title but no
-        // window-control buttons on this setup, so it is hidden
-        // rather than left as an empty strip.
+    fn init(mut core: Core, flags: bool) -> (Self, Task<Message>) {
+        // Round 10: `flags` is whether Frost draws its own
+        // titlebar (GNOME fallback) or the window manager does.
+        // The built-in libcosmic headerbar renders the title but
+        // no window-control buttons on this setup, so it stays
+        // hidden in both modes rather than left as an empty strip.
+        let client_decorations = flags;
         core.window.show_headerbar = false;
 
         // Settings first: they decide the homepage and the theme.
@@ -991,8 +1051,10 @@ impl cosmic::Application for Frost {
 
         let engine = Engine::new().expect("frost: could not create the Servo engine");
         let window_size = Size::new(INITIAL_WINDOW.0, INITIAL_WINDOW.1);
-        let content_height =
-            INITIAL_WINDOW.1 - TITLEBAR_HEIGHT - TOOLBAR_HEIGHT - STATUS_HEIGHT;
+        let content_height = INITIAL_WINDOW.1
+            - titlebar_height_for(client_decorations)
+            - TOOLBAR_HEIGHT
+            - STATUS_HEIGHT;
         let webview = engine
             .spawn_webview(&homepage, INITIAL_WINDOW.0 as u32, content_height as u32)
             .expect("frost: could not spawn the first webview");
@@ -1017,6 +1079,7 @@ impl cosmic::Application for Frost {
                 can_back: false,
                 can_forward: false,
                 window_size,
+                client_decorations,
                 last_cursor: None,
                 content_focused: true,
                 title_dirty: true,
@@ -1205,7 +1268,10 @@ impl cosmic::Application for Frost {
                         }
                     }
                 }
-                // Keep the OS window title in step with the titlebar.
+                // Keep the OS window title in step with the page
+                // title (Round 10): the window manager shows it
+                // in WM mode, Frost's own titlebar in the GNOME
+                // fallback — either way it must stay correct.
                 if self.title_dirty {
                     self.title_dirty = false;
                     if let Some(main_id) = self.core.main_window_id() {
@@ -1493,13 +1559,17 @@ impl cosmic::Application for Frost {
         // The buttons and the text field keep the global (dark)
         // styling in both modes — readable on either chrome.
         let colors = self.settings.theme.chrome_colors();
-        // Titlebar (Frost's own — the built-in libcosmic headerbar
-        // is hidden): browser name + current site title, and real
-        // minimize / maximize-restores / close buttons. Text glyphs,
-        // not icons, so the buttons are visible on any setup.
+        // Titlebar (Round 10: Frost's own, GNOME fallback only —
+        // the built-in libcosmic headerbar is hidden): browser
+        // name + current site title, and real minimize /
+        // maximize-restores / close buttons. Text glyphs, not
+        // icons, so the buttons are visible on any setup.
         // Pressing the title (not a button) drags the window;
         // double-press toggles maximize. The buttons sit outside
         // the drag area, so a click on one presses the button.
+        // The row is only in the column when
+        // `self.client_decorations` is set (see below); in WM
+        // mode the toolbar is the top row.
         let title = mouse_area(
             container(text(self.titlebar_text()).size(15))
                 .width(Length::Fill)
@@ -1635,8 +1705,9 @@ impl cosmic::Application for Frost {
             .height(Length::Fixed(STATUS_HEIGHT))
             .padding(6);
 
-        // Round 8: the main column (titlebar / toolbar / content /
-        // status) is the Stack's base layer. When the menu is open,
+        // Round 8: the main column (titlebar in the GNOME
+        // fallback, otherwise toolbar / content / status) is the
+        // Stack's base layer. When the menu is open,
         // two layers float over it: a transparent full-window
         // click-catcher (any press outside the panel closes the
         // menu, and — like Firefox — does not click through to the
@@ -1644,12 +1715,17 @@ impl cosmic::Application for Frost {
         // itself, anchored top-right under the ☰ button. The Stack
         // dispatches events top-first, so the panel's own buttons
         // still win where they overlap the catcher.
-        let main_column = widget::column::with_children(vec![
-            titlebar.into(),
-            toolbar.into(),
-            content,
-            status.into(),
-        ]);
+        // Round 10: the titlebar row joins the column only in
+        // the GNOME fallback — in WM mode the toolbar is the top
+        // row and the window manager draws the titlebar.
+        let mut column_children: Vec<Element<'_, Message>> = Vec::new();
+        if self.client_decorations {
+            column_children.push(titlebar.into());
+        }
+        column_children.push(toolbar.into());
+        column_children.push(content);
+        column_children.push(status.into());
+        let main_column = widget::column::with_children(column_children);
         let mut stack = cosmic::iced::widget::Stack::new().push(main_column);
         if self.menu_open {
             let catcher = mouse_area(
@@ -2001,6 +2077,32 @@ mod tests {
     }
 
     #[test]
+    fn gnome_falls_back_to_the_client_titlebar() {
+        // GNOME/Mutter refuses server-side decorations, so
+        // Frost draws its own titlebar there.
+        assert!(use_client_decorations("GNOME"));
+        assert!(use_client_decorations("ubuntu:GNOME"));
+        assert!(use_client_decorations("Gnome"));
+        assert!(use_client_decorations("GNOME-Classic"));
+    }
+
+    #[test]
+    fn other_desktops_and_unset_use_the_wm_titlebar() {
+        for desktop in ["KDE", "Plasma", "XFCE", "COSMIC", "Hyprland", "Sway", ""] {
+            assert!(
+                !use_client_decorations(desktop),
+                "{desktop:?} must use the WM titlebar"
+            );
+        }
+    }
+
+    #[test]
+    fn titlebar_height_is_40_in_the_fallback_and_0_in_wm_mode() {
+        assert_eq!(titlebar_height_for(true), TITLEBAR_HEIGHT);
+        assert_eq!(titlebar_height_for(false), 0.0);
+    }
+
+    #[test]
     fn menu_items_are_six_with_f12_and_ctrl_k() {
         assert_eq!(MENU_ITEMS.len(), 6);
         let labels: Vec<&str> = MENU_ITEMS.iter().map(|(label, _, _)| *label).collect();
@@ -2154,7 +2256,16 @@ mod tests {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let settings = Settings::default().size(Size::new(INITIAL_WINDOW.0, INITIAL_WINDOW.1));
-    cosmic::app::run::<Frost>(settings, ())?;
+    // Round 10: pick the titlebar mode once, before the app
+    // starts — GNOME falls back to Frost's own titlebar
+    // (Mutter refuses server-side decorations); everything
+    // else lets the window manager draw it. The same flag goes
+    // to libcosmic (client_decorations) and to the app as its
+    // Flags, so the view agrees with the window.
+    let client_decorations = use_client_decorations(&detected_desktop());
+    let settings = Settings::default()
+        .size(Size::new(INITIAL_WINDOW.0, INITIAL_WINDOW.1))
+        .client_decorations(client_decorations);
+    cosmic::app::run::<Frost>(settings, client_decorations)?;
     Ok(())
 }

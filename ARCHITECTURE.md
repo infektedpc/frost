@@ -421,6 +421,79 @@ work from the address bar, which captures it the same way. Enter
 is captured too, but its `on_submit` publishes PaletteRunSelected,
 so it runs exactly once per press.
 
+## WM titlebar with GNOME fallback (Round 10)
+
+By default the window manager draws the titlebar now, and Frost
+draws no titlebar row of its own: the toolbar is the top row of
+the window, and the content area starts at `TOOLBAR_HEIGHT`
+instead of `TITLEBAR_HEIGHT + TOOLBAR_HEIGHT`. On GNOME — where
+Mutter refuses server-side decorations, so a WM bar would mean no
+titlebar at all — Frost keeps its own 40 px titlebar row (title
+text plus minimize / maximize / close buttons, drag-to-move,
+double-press to maximize), exactly as in Rounds 1–9. The mode is
+chosen once at startup from the desktop environment and never
+changes while the app runs.
+
+The mechanism is libcosmic's own switch, verified in the vendored
+source (`src/app/settings.rs`): `Settings` has a
+`client_decorations: bool` field (default `true`), documented
+"Whether the window should have a border, a title bar, etc. or
+not", with a `derive_setters::Setters`-generated setter. The
+non-Wayland path in `src/app/mod.rs` turns it into
+`iced.window.decorations = !settings.client_decorations`; the
+Wayland path passes it into `SctkWindowSettings`, where sctk
+negotiates xdg-decoration with the compositor. The env check
+matters most on X11, Frost's current path.
+
+In `app.rs` the rule is `use_client_decorations(desktop: &str)
+-> bool` — pure, unit-tested, case-insensitive substring match
+on "gnome" (so "ubuntu:GNOME" matches too); `detected_desktop()`
+resolves the string from `XDG_CURRENT_DESKTOP`, falling back to
+`XDG_SESSION_DESKTOP`, empty when neither is set (which means the
+WM bar). `run()` hands the flag to libcosmic
+(`Settings::default().size(...).client_decorations(flag)`) and to
+the app as its `Flags` (changed from `()` to `bool`), so the view
+and the window cannot disagree. The `Frost` struct stores it as
+`client_decorations: bool`; `titlebar_height()` returns 40 px in
+the fallback and 0 in WM mode, and `content_rect()`, the initial
+webview height, and the menu panel's top padding all read it —
+nothing hardcodes the old 40 px offset any more. The view still
+builds the titlebar row and its buttons, but only pushes the row
+into the main column in fallback mode; the titlebar messages and
+their handlers stay live behind the flag. `titlebar_text()` still
+feeds `set_window_title` on every Tick, so the OS window title is
+correct in both modes. The built-in libcosmic headerbar stays
+hidden in both modes (`show_headerbar = false`).
+
+Popups need no change: their `window::open` calls already use
+`window::Settings` with `..Default::default()`, and iced's
+default `decorations` is `true` — so the five native windows get
+WM titlebars on decorating desktops in both modes, which fixes
+the Round 7 wart of the Settings window having no in-content
+Close button. `transparent: true` stays on the popups: it is
+about the surface's alpha mode (Round 7 — iced picks one alpha
+mode from the main window's surface; an opaque popup's 24-bit
+visual panics on configure), while decorations are about the WM
+frame; the two are orthogonal.
+
+What the sandbox cannot prove: bare Xvfb has no window manager,
+so the WM-drawn titlebar itself (its look, real min/max/close)
+is unverifiable here — the window simply shows no titlebar under
+Xvfb. Joel's KDE box is the verdict for the actual titlebar.
+
+Gate results (2026-11-16, Xvfb :97): tests 56/56; build green
+in 42m 53s serialized. WM mode (`XDG_CURRENT_DESKTOP=KDE`): no
+client titlebar row, toolbar on top, OS title "Frost — Example
+Domain", menu panel 4 px under the toolbar, all five popups +
+the palette + F12 Inspector (35 nodes) + Print Save +
+Back/Forward + strip-scroll all pass, `frost://` fails plainly,
+no listener, settings persist across relaunch. GNOME mode: the
+own titlebar row and its buttons are back, menu panel under the
+toolbar. `XDG_SESSION_DESKTOP=GNOME` alone (current unset) also
+restores the own bar. `transparent: true` popups and server-side
+decorations do not conflict — every popup opened, rendered, and
+closed cleanly.
+
 ## Extensions
 
 `frost-extensions` defines the contract now so Round 3+ wires it in
