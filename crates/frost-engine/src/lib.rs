@@ -24,6 +24,7 @@
 //! the [`Engine`]). Servo's embedder API expects `spin_event_loop` on the
 //! creating thread; the UI drives it from its own loop in Round 2.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -37,6 +38,10 @@ use servo::{
     WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
+
+pub mod snowplow;
+
+use crate::snowplow::Snowplow;
 
 /// Errors from the engine.
 #[derive(Debug)]
@@ -158,6 +163,9 @@ pub enum EngineEvent {
     /// The load was stopped before completing (0.8.0's `LoadStatus::Stopped`).
     LoadStopped,
     FrameReady,
+    /// A tracker/ad subresource request was blocked by Snowplow
+    /// (Round 13): the blocked URL, so the UI can count it.
+    ResourceBlocked(String),
     Crashed(String),
 }
 
@@ -262,6 +270,9 @@ impl EventLoopWaker for FrostWaker {
 #[derive(Clone)]
 struct FrostDelegate {
     tx: mpsc::Sender<EngineEvent>,
+    /// Shared Snowplow state (Round 13): the same `Rc` the [`Engine`]
+    /// keeps, so the Settings toggle flips what the delegate enforces.
+    snowplow: Rc<RefCell<Snowplow>>,
 }
 
 impl WebViewDelegate for FrostDelegate {
@@ -297,6 +308,14 @@ impl WebViewDelegate for FrostDelegate {
     fn notify_crashed(&self, _webview: WebView, reason: String, _backtrace: Option<String>) {
         let _ = self.tx.send(EngineEvent::Crashed(reason));
     }
+
+    /// Round 13 (Snowplow): every HTTP fetch reaches the embedder
+    /// here first. Blocked tracker/ad subresources are cancelled
+    /// (a fast network error); everything else is dropped untouched,
+    /// which the responder translates to "do not intercept".
+    fn load_web_resource(&self, _webview: WebView, load: servo::WebResourceLoad) {
+        snowplow::handle_load(load, &self.snowplow.borrow(), &self.tx);
+    }
 }
 
 /// The engine: owns Servo, spawns webviews, pumps the event loop.
@@ -304,6 +323,9 @@ pub struct Engine {
     servo: Servo,
     tx: mpsc::Sender<EngineEvent>,
     rx: mpsc::Receiver<EngineEvent>,
+    /// Shared Snowplow state (Round 13): the delegate enforces it,
+    /// the app toggles it. Same `Rc` in both places.
+    snowplow: Rc<RefCell<Snowplow>>,
 }
 
 impl Engine {
@@ -318,7 +340,23 @@ impl Engine {
             .event_loop_waker(Box::new(waker))
             .build();
         servo.setup_logging();
-        Ok(Self { servo, tx, rx })
+        Ok(Self {
+            servo,
+            tx,
+            rx,
+            snowplow: Rc::new(RefCell::new(Snowplow::new())),
+        })
+    }
+
+    /// Turn Snowplow blocking on or off (Round 13): the Settings
+    /// toggle. Takes effect immediately for subsequent requests.
+    pub fn set_snowplow_enabled(&self, enabled: bool) {
+        self.snowplow.borrow_mut().set_enabled(enabled);
+    }
+
+    /// Whether Snowplow blocking is currently on.
+    pub fn snowplow_enabled(&self) -> bool {
+        self.snowplow.borrow().is_enabled()
     }
 
     /// Spawn a webview loading `url` at `width` × `height` CSS pixels.
@@ -336,6 +374,7 @@ impl Engine {
         let _ = ctx.make_current();
         let delegate = FrostDelegate {
             tx: self.tx.clone(),
+            snowplow: self.snowplow.clone(),
         };
         let webview = WebViewBuilder::new(&self.servo, ctx.clone())
             .url(url)

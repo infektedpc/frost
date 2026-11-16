@@ -5,14 +5,13 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 12 — toolbar glyphs fixed.** The toolbar icons
-are proper, bigger, centered glyphs now: 20 px text in a
-centered container (libcosmic's TextButton left-aligns its
-label at the 14 px default), and back/forward use proper ❮/❯
-chevrons with a 2 px upward nudge for their low ink. Tests
-60/60 (baseline 58/58 + 2 new Round 12 tests). No fork patch;
-the fork is untouched at `f9462dbb7`. See
-[ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 13 — Snowplow v1, tracker/ad blocking.** The
+embedder refuses tracker/ad subresource requests before they
+leave the machine (62-domain blocklist, suffix matching), a
+Settings toggle (default on, persisted), and a real per-page
+blocked count in the status line. Tests 69/69 (baseline 60/60
++ 9 new Round 13 tests). No fork patch; the fork is untouched
+at `f9462dbb7`. See [ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -1587,3 +1586,117 @@ mouse-wheel scroll over the page, drag latency, the Round 6
 flashing fix on real hardware, and the WM-drawn titlebar
 itself (look, real min/max/close) — bare Xvfb has no window
 manager, so Joel's KDE box is the verdict for those.
+## Round 13 — Snowplow v1: tracker/ad blocking (what is proven, what is not)
+
+Step 2 in Joel's easiest-first order (command palette was
+step 1, Round 9). No fork patch; the fork is untouched at
+`f9462dbb7`. The interception point is embedder-side, the
+same mechanism ServoGTK 0.7.0 uses: the fork's
+`WebViewDelegate::load_web_resource` is called for every
+subresource fetch, and the delegate either lets it through
+(`DoNotIntercept`) or cancels it with
+`load.intercept(WebResourceResponse::new(url)).cancel()` —
+a fast network error, never a hang. `servo` re-exports
+`embedder_traits::*`, so no new dependency and no fork
+patch was needed. Blocked requests never reach the network
+at all: the gate log shows no `GET` for the blocked
+`localhost` URLs in `http_loader`, only the script's
+"Load cancelled" error reaching the page.
+
+New file `crates/frost-engine/src/snowplow.rs`: a 62-domain
+`DEFAULT_BLOCKLIST` copied from ServoGTK's list and
+deduped; the matcher is exact-or-suffix (listing
+`example.com` blocks `ads.example.com`, never a partial
+suffix like `notexample.com`), case-insensitive, and
+tolerant of a trailing dot. `Snowplow` holds the on/off
+state plus an extra list from the
+`FROST_SNOWPLOW_EXTRA_BLOCKLIST` env var (test hook — the
+gates block `localhost` with it). `handle_load` refuses
+nothing when Snowplow is off, never blocks main-frame
+navigations or non-HTTP(S) requests, and sends
+`EngineEvent::ResourceBlocked` per cancelled request so
+the UI counts real interceptions. The `Engine` owns one
+`Rc<RefCell<Snowplow>>` shared with the delegate, with
+`set_snowplow_enabled` / `snowplow_enabled` on the engine.
+`Settings.snowplow: bool` has `#[serde(default)] = true`,
+so settings files written before Round 13 (which lack the
+field) still parse — Joel's homepage does not reset. The
+Settings window has a "Snowplow: On/Off" toggle that
+applies on Save like the theme, with the note "Main-frame
+navigations are never blocked."
+
+Gates, all on the Round 13 binary under Xvfb :97 (test
+server on 127.0.0.1:18101, hang server on 127.0.0.1:18099):
+(a) the local test page (`r13-02-snowplow-on.jpg`):
+"blocked-img: failed", "allowed-img: loaded" (green
+square), "blocked-js: failed", page settled, status line
+"Snowplow test page · Snowplow blocked 4". (b) Toggle OFF
+in Settings → Save → reload: all three subresources load,
+both squares visible (`r13-06-off-reloaded.jpg`), settings
+file shows `"snowplow": false`; toggle back ON → Save →
+reload: blocked again (`r13-08-on-reloaded.jpg`,
+`"snowplow": true`); quit and relaunch → still blocked
+(`r13-10-persist.jpg`). (c) example.org loads with the
+sample banner (`r13-01-homepage.jpg`). (d) Full regression:
+Back/Forward clean sequence passes; reload/stop flips to ✕
+against the hang server and back to ⟳ on stop
+(`r13-17-hang-loading.jpg`, `r13-18-hang-stopped.jpg`);
+menu has all six entries; Ctrl+K palette opens with the
+live actions (`r13-19-palette.jpg`); Inspector F12 gives a
+real 35-node example.org snapshot
+(`r13-21-inspector.jpg`); strip-scroll paints fully to
+"Learn more" (`r13-28-scrolled.jpg`); `frost://settings`
+fails plainly with the "no longer has internal pages"
+status (`r13-29-frostscheme.jpg`); `ss` shows no Frost
+listener. (e) GNOME-mode launch shows Frost's own
+titlebar "Frost — Example Domain" with min/max/close
+(`r13-30-gnome.jpg`).
+
+The status-line count is intercepted *requests*, not
+unique URLs, and it varies by load: the 2-blocked-resource
+test page showed 4 on some loads and 3 on others, because
+Servo offers a subresource to the delegate once or twice
+(preload + real fetch) depending on timing. One real bug
+found in gating and fixed in-round: the count reset only
+on `LoadStarted`, which Back/Forward traversals never
+emit, so the previous page's count lingered on the new
+page ("Example Domain · Snowplow blocked 3"). The fix
+resets the count on `UrlChanged` too (verified:
+`r13-15-fix-testpage.jpg` still counts 4 on a fresh load,
+`r13-16-fix-back.jpg` shows plain "Example Domain" after
+Back). Same-document fragment navigations also reset the
+count — a known edge, accepted for v1.
+
+Build incident, worth knowing before the next round: the
+plain `target/debug/frost` link failed twice with
+`rust-lld` dying on SIGBUS — not a code error (the 1.1 GB
+test binary linked fine). The cause was disk headroom, not
+RAM: writes to the workspace hit "Disk quota exceeded"
+during a `debug=0` rebuild attempt, and the 2 GB link
+output could not grow past the ceiling (a faulted page
+the kernel cannot back is SIGBUS). The fix was deleting
+`target/debug/incremental` + `target/debug/examples`
+(`df` showed 19 GB freed — `du` overcounts the hardlinked
+files); the 1 GB probe write then succeeded and the plain
+debug link passed. The gate binary is the normal dev
+binary; no profile change shipped. Lesson: before a big
+build, check `df` headroom — the frost `target/` alone
+was 102 GB before the cleanup.
+
+Correction to the Round 9 wart note: the Inspector "Back
+to the page" button works when clicked at its visual
+center (165, 135 in the gate screenshots). Clicks ~15 px
+above the center (y 110 and 120) missed, and Escape does
+not close the Inspector — the "~15 px above its visual
+rect" reading does not reproduce on this build.
+
+Carried over, unchanged: the stale "Capturing…" status
+after a capture (Round 7); Settings has no in-content
+Close button (OS close works, and in WM mode the popup
+has a real WM close button); theme applies on Save, not
+per click. Not verified in the sandbox, as before: real
+mouse/keyboard, mouse-wheel scroll over the page, drag
+latency, the Round 6 flashing fix on real hardware, and
+the WM-drawn titlebar itself (look, real min/max/close) —
+bare Xvfb has no window manager, so Joel's KDE box is the
+verdict for those.

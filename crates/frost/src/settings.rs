@@ -142,6 +142,18 @@ pub struct Settings {
     /// Whether the menu's Exit entry opens the confirmation dialog
     /// (true) or quits immediately (false).
     pub confirm_exit: bool,
+    /// Whether Snowplow tracker/ad blocking is on (Round 13).
+    /// `serde(default)` so settings files written before Round 13
+    /// (no such field) still parse — without it the whole file
+    /// would be unparseable and the load would fall back to
+    /// defaults, silently resetting the homepage.
+    #[serde(default = "default_snowplow")]
+    pub snowplow: bool,
+}
+
+/// Snowplow is ON by default.
+fn default_snowplow() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -151,6 +163,7 @@ impl Default for Settings {
             homepage: "https://example.org".to_string(),
             search_engine: SearchEngine::DuckDuckGo,
             confirm_exit: true,
+            snowplow: true,
         }
     }
 }
@@ -247,9 +260,32 @@ mod tests {
         s.homepage = "https://example.com".to_string();
         s.search_engine = SearchEngine::Bing;
         s.confirm_exit = false;
+        s.snowplow = false;
         s.save_to(&path).unwrap();
         let back = Settings::load_from(&path);
         assert_eq!(back, s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn settings_without_snowplow_field_defaults_it_on() {
+        // A settings file written before Round 13 has no `snowplow`
+        // key. It must still parse (keeping the homepage etc.),
+        // with Snowplow defaulting to ON — never a wholesale
+        // fallback to defaults.
+        let path = std::env::temp_dir().join("frost-settings-test-old.json");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            r#"{"theme":"Light","homepage":"https://example.com","search_engine":"Bing","confirm_exit":false}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.theme, ThemeChoice::Light);
+        assert_eq!(loaded.homepage, "https://example.com");
+        assert_eq!(loaded.search_engine, SearchEngine::Bing);
+        assert!(!loaded.confirm_exit);
+        assert!(loaded.snowplow);
         let _ = std::fs::remove_file(&path);
     }
 

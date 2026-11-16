@@ -246,13 +246,20 @@ No new features — this round finishes what Round 3 left open:
 - Round 11 (done 2026-11-16, ahead of the order at Joel's pick):
   merged reload/stop button (⟳ idle, ✕ loading, flips back on
   finish or stop) + round toolbar icons (square 32 px bounds).
-  Then: Snowplow network-layer blocking, split view,
-  Deep Freeze offline archive, Frostbite tab hibernation (needs a
-  tab system first), Snowdrift workspaces (needs tabs + sessions +
-  persistence — biggest). Inspector v2 (docked panel,
-  click-to-inspect, live updates, console) stays unqueued. (Print-
-  to-PDF stays out until Servo gains a real print pipeline —
-  F-003's preview + PNG save is the honest scope.)
+- Round 12 (done 2026-11-16, at Joel's pick): toolbar glyphs
+  bigger + centered (20 px text in a centered container, ❮/❯
+  chevrons) — fixed his 0.11.0 icon verdict.
+- Round 13 (done 2026-11-16, step 2 in the order): Snowplow v1 —
+  embedder-side tracker/ad subresource blocking (62-domain
+  blocklist, suffix matcher), Settings toggle default on,
+  per-page blocked count in the status line. No fork patch.
+  Then: split view, Deep Freeze offline archive, Frostbite tab
+  hibernation (needs a tab system first), Snowdrift workspaces
+  (needs tabs + sessions + persistence — biggest). Inspector v2
+  (docked panel, click-to-inspect, live updates, console) stays
+  unqueued. (Print-to-PDF stays out until Servo gains a real
+  print pipeline — F-003's preview + PNG save is the honest
+  scope.)
 
 ## Later rounds (in rough order)
 
@@ -285,11 +292,16 @@ split-view is mostly UI.
 
 ### Snowplow — tracker/ad blocking at the network layer
 
-Blocking that happens before the request leaves the machine, in the
-engine's network stack — not a content script racing the page. Rules are
-compiled to a fast matcher; the `WebRequest` extension permission is the
-same hook, so blocklists and extensions share one path. The UI shows a
-per-page count of blocked requests ("plowed").
+**v1 DONE (Round 13, 2026-11-16).** Blocking that happens
+before the request leaves the machine — at the embedder
+delegate (`WebViewDelegate::load_web_resource`), not a
+content script racing the page, and not a fork patch in
+the engine's network stack. A 62-domain blocklist with a
+suffix matcher; the `WebRequest` extension permission is
+the same hook, so blocklists and extensions share one
+path. The UI shows a real per-page count of blocked
+requests in the status line. v2 (unqueued): main-frame
+blocking, per-site allow/deny, list management in the UI.
 
 ### Deep Freeze — offline page archive
 

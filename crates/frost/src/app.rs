@@ -393,6 +393,10 @@ pub struct Frost {
     address_editing: bool,
     /// One-line status under the toolbar.
     status: String,
+    /// Round 13 (Snowplow): tracker/ad subresources blocked on the
+    /// current page. Reset on each navigation; shown in the status
+    /// line when greater than zero.
+    snowplow_blocked: u64,
     /// The page title, for the status line once loaded.
     title: Option<String>,
     /// Whether the hamburger menu is open.
@@ -718,12 +722,20 @@ impl Frost {
                 self.title_dirty = true;
                 self.can_back = self.webview.can_go_back();
                 self.can_forward = self.webview.can_go_forward();
+                // Round 13: history (Back/Forward) traversals commit a
+                // new URL without a LoadStarted, so reset the Snowplow
+                // count here too — otherwise the previous page's count
+                // lingers on the new page. (Same-document fragment
+                // navigations also reset it; the count is per shown URL.)
+                self.snowplow_blocked = 0;
             },
             EngineEvent::LoadStarted => {
                 self.loading = true;
                 self.awaiting_load = true;
                 self.loading_since = Some(std::time::Instant::now());
                 self.injected_for = None;
+                // Round 13: a new page starts with a clean Snowplow count.
+                self.snowplow_blocked = 0;
                 self.status = format!("Loading {} …", self.address);
             },
             EngineEvent::LoadFinished => {
@@ -742,6 +754,12 @@ impl Frost {
                 self.awaiting_load = false;
                 self.loading_since = None;
                 self.status = "Stopped.".to_string();
+            },
+            EngineEvent::ResourceBlocked(_url) => {
+                // Round 13: a real count from the delegate, one event
+                // per cancelled request. The status line shows it
+                // (see the view); nothing is faked.
+                self.snowplow_blocked += 1;
             },
             EngineEvent::FrameReady => {
                 self.frame_dirty = true;
@@ -1130,6 +1148,9 @@ impl cosmic::Application for Frost {
         let (host, loaded, failed) = load_extensions();
 
         let engine = Engine::new().expect("frost: could not create the Servo engine");
+        // Round 13: the loaded setting decides whether Snowplow
+        // blocks from the first page (default ON).
+        engine.set_snowplow_enabled(settings.snowplow);
         let window_size = Size::new(INITIAL_WINDOW.0, INITIAL_WINDOW.1);
         let content_height = INITIAL_WINDOW.1
             - titlebar_height_for(client_decorations)
@@ -1150,6 +1171,7 @@ impl cosmic::Application for Frost {
                 address: homepage.clone(),
                 address_editing: false,
                 status: format!("Loading {homepage} …"),
+                snowplow_blocked: 0,
                 title: None,
                 menu_open: false,
                 menu_hovered: None,
@@ -1797,7 +1819,17 @@ impl cosmic::Application for Frost {
             .into()
         };
 
-        let status = container(text(&self.status).size(13))
+        // Round 13: the status line shows the real per-page Snowplow
+        // count when anything was blocked on this page.
+        let status_text = if self.snowplow_blocked > 0 {
+            format!(
+                "{} · Snowplow blocked {}",
+                self.status, self.snowplow_blocked
+            )
+        } else {
+            self.status.clone()
+        };
+        let status = container(text(status_text).size(13))
             .style(move |_| chrome_container_style(colors))
             .width(Length::Fill)
             .height(Length::Fixed(STATUS_HEIGHT))

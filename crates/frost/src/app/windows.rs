@@ -64,6 +64,8 @@ pub struct SettingsWindow {
     pub draft_homepage: String,
     pub draft_search: SearchEngine,
     pub draft_confirm: bool,
+    /// Round 13 (Snowplow): draft of the block-trackers toggle.
+    pub draft_snowplow: bool,
     pub note: String,
     pub show_extensions: bool,
 }
@@ -117,6 +119,8 @@ pub enum PopupMessage {
     SettingsHomepage(String),
     SettingsSearch(SearchEngine),
     SettingsConfirm(bool),
+    /// Round 13 (Snowplow): the block-trackers toggle's new value.
+    SettingsSnowplow(bool),
     SettingsSave,
     SettingsReset,
     SettingsToggleExtensions,
@@ -270,6 +274,7 @@ impl Frost {
             draft_homepage: self.settings.homepage.clone(),
             draft_search: self.settings.search_engine,
             draft_confirm: self.settings.confirm_exit,
+            draft_snowplow: self.settings.snowplow,
             note: String::new(),
             show_extensions: false,
         });
@@ -489,6 +494,12 @@ impl Frost {
                 }
                 Task::none()
             },
+            PopupMessage::SettingsSnowplow(value) => {
+                if let Some(w) = &mut self.settings_win {
+                    w.draft_snowplow = value;
+                }
+                Task::none()
+            },
             PopupMessage::SettingsSave => {
                 // Take the draft out of the window first: applying it
                 // touches self.settings (a separate field), and the
@@ -500,16 +511,18 @@ impl Frost {
                         w.draft_homepage.trim().to_string(),
                         w.draft_search,
                         w.draft_confirm,
+                        w.draft_snowplow,
                     )
                 }) else {
                     return Task::none();
                 };
-                let (theme, homepage, search, confirm) = draft;
+                let (theme, homepage, search, confirm, snowplow) = draft;
                 let mut new = self.settings.clone();
                 new.theme = theme;
                 new.homepage = homepage;
                 new.search_engine = search;
                 new.confirm_exit = confirm;
+                new.snowplow = snowplow;
                 let note = if !is_loadable_homepage(&new.homepage) {
                     "That homepage is not a valid http(s) URL — nothing was changed."
                         .to_string()
@@ -521,6 +534,11 @@ impl Frost {
                             if theme_changed {
                                 self.webview.set_theme(self.settings.theme.is_dark());
                             }
+                            // Round 13: the Snowplow toggle applies on
+                            // Save, like the theme — the engine flips
+                            // what the delegate enforces immediately.
+                            self.engine
+                                .set_snowplow_enabled(self.settings.snowplow);
                             "Settings saved.".to_string()
                         },
                         Err(e) => format!("Could not save settings: {e}"),
@@ -540,6 +558,8 @@ impl Frost {
                         if theme_changed {
                             self.webview.set_theme(self.settings.theme.is_dark());
                         }
+                        self.engine
+                            .set_snowplow_enabled(self.settings.snowplow);
                         "Settings reset to defaults.".to_string()
                     },
                     Err(e) => format!("Could not save settings: {e}"),
@@ -549,6 +569,7 @@ impl Frost {
                     w.draft_homepage = self.settings.homepage.clone();
                     w.draft_search = self.settings.search_engine;
                     w.draft_confirm = self.settings.confirm_exit;
+                    w.draft_snowplow = self.settings.snowplow;
                     w.note = note;
                 }
                 Task::none()
@@ -787,6 +808,23 @@ fn settings_view<'a>(frost: &'a Frost, w: &'a SettingsWindow) -> Element<'a, Mes
             PopupMessage::SettingsConfirm(!w.draft_confirm),
         ),
     );
+    // Round 13 (Snowplow): block tracker/ad subresources before they
+    // load. Applies on Save, like the theme.
+    children.push(section("Snowplow — block trackers and ads"));
+    children.push(
+        choice_button(
+            if w.draft_snowplow {
+                "Snowplow: On"
+            } else {
+                "Snowplow: Off"
+            },
+            false,
+            PopupMessage::SettingsSnowplow(!w.draft_snowplow),
+        ),
+    );
+    children.push(muted(
+        "Blocks tracker and ad requests before they load. Main-frame navigations are never blocked.",
+    ));
     children.push(
         cosmic::widget::row::with_children(vec![
             button::standard("Save settings")

@@ -667,3 +667,74 @@ same-URL-reload → stop instance (palette hides "Go back" /
 the clean sequence passes on the same binary, so the
 history path is intact and the quirk is unchanged from
 Round 11.
+
+## Round 13 — Snowplow v1 (embedder-side blocking)
+
+No fork patch. The 0.8.0 fork already exposes the hook
+ServoGTK 0.7.0 uses: `WebViewDelegate::load_web_resource`
+is called for every resource fetch the net layer is about
+to start, with a `WebResourceLoad` the embedder can
+cancel. `servo` re-exports `embedder_traits::*`, so the
+engine crate reaches it with no new dependency. The
+delegate implementation lives in `frost-engine`
+(`crates/frost-engine/src/lib.rs:316`): it hands the load
+to `snowplow::handle_load` with the shared state and the
+event sender. `handle_load` (`snowplow.rs:245`) returns
+`false` (→ `DoNotIntercept`, fetch proceeds untouched)
+when Snowplow is off, when `request.is_for_main_frame`,
+or when the URL is not blocked; otherwise it calls
+`load.intercept(WebResourceResponse::new(url)).cancel()`
+and sends `EngineEvent::ResourceBlocked(url)`. The cancel
+produces a fast network error at the page ("Load
+cancelled"), never a hang — the F-008 stop machinery is
+never involved, and the gate log proves blocked requests
+never reach `http_loader` (no `GET` for the blocked
+hosts, only the script's cancel error).
+
+State: the `Engine` owns one `Rc<RefCell<Snowplow>>`,
+cloned into the delegate at construction, so the Settings
+toggle (`Engine::set_snowplow_enabled`) and the delegate
+read the same flag with no channel round-trip. The
+blocklist is a `&[&str]` constant (62 entries, copied
+from ServoGTK and deduped); `host_matches` is
+exact-or-suffix on dot boundaries, lowercases, and strips
+one trailing dot, so `ads.example.com` matches
+`example.com` and `notexample.com` never does.
+`FROST_SNOWPLOW_EXTRA_BLOCKLIST` (comma/space separated)
+adds entries at construction — the gates block
+`localhost` through it. `Settings.snowplow` defaults to
+`true` via `#[serde(default)]`, so pre-Round-13 settings
+files parse unchanged.
+
+The per-page count lives in the app (`snowplow_blocked`,
+incremented once per `ResourceBlocked` event, rendered
+as "· Snowplow blocked N" only when N > 0). It resets on
+`LoadStarted` AND on `UrlChanged`: history traversals
+commit a new URL without a `LoadStarted`, and without
+the second reset the previous page's count lingered on
+the new page (found in gating, fixed in-round). The
+count is intercepted requests, not unique URLs — Servo
+offers a subresource to the delegate once or twice
+(preload + real fetch) depending on timing, so the same
+2-blocked-resource page showed 3 and 4 on different
+loads. Same-document fragment navigations also reset
+the count; accepted for v1.
+
+What v1 deliberately does not do: main-frame blocking
+(the hook could do it — `is_for_main_frame` is checked
+and passed through — but blocking a navigation the user
+explicitly typed is a v2 decision), per-site allow/deny,
+or list management in the UI. The roadmap sketch's
+"in the engine's network stack" phrasing is superseded:
+v1 blocks at the embedder delegate, before the fetch
+starts, which is the same observable point with no fork
+patch to maintain.
+
+Build note: the `target/` tree had grown past the
+workspace's disk headroom (102 GB; the plain 2 GB debug
+link died twice with `rust-lld` SIGBUS and a rebuild
+attempt hit "Disk quota exceeded"). Deleting
+`target/debug/incremental` + `target/debug/examples`
+restored the link. Before the next big build, check `df`
+— and never extract large things to /tmp (512 MB tmpfs)
+or let `target/` grow unchecked.
