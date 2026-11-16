@@ -184,6 +184,40 @@ button's top edge did not close it; `xclose` closed it cleanly with
 Frost alive. Both are bare-Xvfb harness observations, not packaging
 failures.
 
+### .deb 0.11.0 (Round 11, Debian 13, amd64)
+
+`packaging/build-deb-0.11.0.sh` builds `frost-0.11.0_amd64.deb` (SHA-256
+`2fea2805b9fb8066af47c2d95b4c335006894ad4cfddd3d61f131458d0384d5e`,
+64,809,912 B; stripped binary 318,772,456 B) from the Round 11 tree
+(HEAD `443ebed`, same proven gated binary — no rebuild). Same contents:
+`/usr/bin/frost`, desktop file, snowflake icon. Same honest
+stripped-DEBUG note in the Description. Depends were re-derived from
+`ldd` + `/proc` maps of the running Round 11 packaged binary and are
+IDENTICAL to the 0.9.0 list — `libvulkan1` and `libwayland-server0`
+both confirmed present again (wgpu takes the Vulkan path;
+libwayland-server is mapped alongside libwayland-client). The packaged
+binary's BuildID (`1a4d5d32…4078db`) is identical to the tree binary's
+— the .deb really contains the gated Round 11 build. The packaged
+binary was gated from a clean extraction: launch + example.org full
+paint + banner, round toolbar icons (true circles in a toolbar zoom)
+with one reload/stop slot, the flip gated against the hang server
+(load → ✕ → click ✕ → load stops → ↻, page settles back to
+example.org), all six menu entries (Settings, Print page…, Open
+file…, Inspector, Command palette… with Ctrl+K, Exit), Settings as a
+native window, Inspector capturing a real 35-node snapshot, Ctrl+K
+opening the command palette, `frost://settings` failing plainly with
+the honest status message, and no loopback listener. Install the same
+way: `sudo dpkg -i frost-0.11.0_amd64.deb` (+ `sudo apt-get install -f`
+only if a dep is missing). Never installed with `dpkg -i` in the
+sandbox — the real install is Joel's-box verdict.
+
+Harness notes (2026-11-16): the Inspector "Back to the page" hit-area
+wart was not re-clicked in this gate — Inspector was closed with the
+`xclose` helper (bare `WM_DELETE_WINDOW`), which closed it cleanly
+with Frost alive, as in the 0.9.0 gate. The stale "Capturing page
+structure…" status was visible at the bottom of the screen after the
+Inspector capture — the known Round 7 wart, carried over unchanged.
+
 ### Flatpak (manifest only — UNBUILT, UNVERIFIED)
 
 `packaging/org.frost.Frost.yml` + `packaging/build-flatpak.sh` build a
