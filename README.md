@@ -156,6 +156,39 @@ WM close button on a real desktop, and the in-app "Back to the page"
 button closes Inspector cleanly. Do not treat the Xvfb panic as a
 packaging failure.
 
+### .deb 0.9.0 (Round 9, Debian 13, amd64)
+
+`packaging/build-deb-0.9.0.sh` builds `frost-0.9.0_amd64.deb` (SHA-256
+`fe62fde622b18d2962a0258ac880caa9dfa632e0a2200abe92b6e6408bc251ae`,
+64,789,764 B; stripped binary 318,769,544 B) from the Round 9 tree
+(HEAD `1af7e10`, same proven gated binary — no rebuild). Same contents:
+`/usr/bin/frost`, desktop file, snowflake icon. Same honest
+stripped-DEBUG note in the Description. Depends were re-derived from
+`ldd` + `/proc` maps of the running Round 9 binary and are IDENTICAL
+to the 0.7.0 list — `libvulkan1` and `libwayland-server0` both confirmed
+present again (wgpu takes the Vulkan path; libwayland-server is mapped
+alongside libwayland-client). The packaged binary's BuildID
+(`340ee2c9…f8aa7`) is identical to the tree binary's — the .deb really
+contains the gated Round 9 build. The packaged binary was gated from a
+clean extraction: launch + example.org full paint + banner, all six
+menu entries (Settings, Print page…, Open file…, Inspector, Command
+palette… with Ctrl+K, Exit), Settings as a native window, Inspector
+capturing a real 35-node snapshot, Ctrl+K opening the command palette,
+`frost://settings` failing plainly with the honest status message, and
+no loopback listener. Install the same way: `sudo dpkg -i
+frost-0.9.0_amd64.deb` (+ `sudo apt-get install -f` only if a dep is
+missing). Never installed with `dpkg -i` in the sandbox — the real
+install is Joel's-box verdict.
+
+Harness notes (2026-11-15/16): closing the Settings popup with the
+`xclose` helper (bare `WM_DELETE_WINDOW`) left the app alive this time
+— unlike the 0.7.0 gate, where `xdotool windowclose` on Settings killed
+it with a winit `GetGeometry` panic. The Inspector "Back to the page"
+hit-area wart (Round 9) showed up again in this gate: a click on the
+button's top edge did not close it; `xclose` closed it cleanly with
+Frost alive. Both are bare-Xvfb harness observations, not packaging
+failures.
+
 ### Flatpak (manifest only — UNBUILT, UNVERIFIED)
 
 `packaging/org.frost.Frost.yml` + `packaging/build-flatpak.sh` build a
