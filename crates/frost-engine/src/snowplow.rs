@@ -38,7 +38,7 @@
 
 use std::sync::mpsc;
 
-use servo::{WebResourceLoad, WebResourceResponse};
+use servo::{WebResourceLoad, WebResourceResponse, WebViewId};
 use url::Url;
 
 use crate::EngineEvent;
@@ -246,6 +246,7 @@ pub fn handle_load(
     load: WebResourceLoad,
     snowplow: &Snowplow,
     tx: &mpsc::Sender<EngineEvent>,
+    webview: WebViewId,
 ) -> bool {
     if !snowplow.enabled {
         return false;
@@ -260,7 +261,7 @@ pub fn handle_load(
     }
     let blocked = url.to_string();
     load.intercept(WebResourceResponse::new(url)).cancel();
-    let _ = tx.send(EngineEvent::ResourceBlocked(blocked));
+    let _ = tx.send(EngineEvent::ResourceBlocked(webview, blocked));
     true
 }
 

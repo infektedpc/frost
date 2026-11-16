@@ -253,7 +253,14 @@ No new features — this round finishes what Round 3 left open:
   embedder-side tracker/ad subresource blocking (62-domain
   blocklist, suffix matcher), Settings toggle default on,
   per-page blocked count in the status line. No fork patch.
-  Then: split view, Deep Freeze offline archive, Frostbite tab
+- Round 14 (done 2026-11-16, step 3 in the order): Split view
+  v1 — two webviews side by side, fixed 50/50, each with its
+  own URL, history, and Snowplow count; active pane wears a
+  2 px border; menu + Ctrl+K toggle with a dynamic label.
+  No fork patch (every `EngineEvent` now carries a
+  `WebViewId` so the UI can route events to panes). No
+  draggable divider yet — that is the v1 limit, not a bug.
+  Then: Deep Freeze offline archive, Frostbite tab
   hibernation (needs a tab system first), Snowdrift workspaces
   (needs tabs + sessions + persistence — biggest). Inspector v2
   (docked panel, click-to-inspect, live updates, console) stays
@@ -284,11 +291,19 @@ cheap: freezing a tab is suspending its pipeline, not serializing it.
 
 ### Split-view — two pages in one tab
 
-One tab, two webviews side by side (or stacked), with a draggable
-divider. Each half is a full page: its own URL, its own back/forward.
-Built for comparing pages, reading docs beside code, watching a video
-while reading. The engine already supports many webviews per process —
-split-view is mostly UI.
+**v1 DONE (Round 14, 2026-11-16).** One tab, two webviews
+side by side at a fixed 50/50 split. Each half is a full
+page: its own URL, its own back/forward, its own Snowplow
+count. The active pane wears a 2 px border (the inactive
+pane's border is transparent at the same width, so
+switching never shifts layout); click a pane to activate
+it; the menu and the Ctrl+K palette toggle the split with
+a dynamic label ("Split view" / "Close split view");
+closing keeps the active pane. Built for comparing pages,
+reading docs beside code, watching a video while reading.
+The engine already supports many webviews per process —
+split-view is mostly UI. v2 (unqueued): a draggable
+divider, and stacked (top/bottom) splits.
 
 ### Snowplow — tracker/ad blocking at the network layer
 

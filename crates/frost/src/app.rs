@@ -14,7 +14,7 @@ use cosmic::widget::{self, button, container, text, text_input};
 use cosmic::{executor, iced, ApplicationExt, Element};
 use frost_engine::{
     Engine, EngineEvent, FrostCode, FrostInputEvent, FrostKeyState,
-    FrostMouseButtonAction, FrostWebView, MAX_SYNC_UPLOAD_BYTES,
+    FrostMouseButtonAction, FrostWebView, WebViewId, MAX_SYNC_UPLOAD_BYTES,
 };
 use frost_extensions::{ExtensionHost, ExtensionManifest, StubHost};
 use frost_inspector::{snapshot_from_json, DOM_WALK_SCRIPT};
@@ -68,6 +68,17 @@ const TOOLBAR_GLYPH_SIZE: f32 = 20.0;
 /// glyph sits higher by half the padding.
 const TOOLBAR_CHEVRON_NUDGE_UP: f32 = 2.0;
 const STATUS_HEIGHT: f32 = 28.0;
+/// Split view (Round 14): the active pane's border, in px — the
+/// same width on the inactive pane (transparent) so switching the
+/// active pane never shifts layout. The pane's image column sits
+/// inside this border + the same padding, so the webview viewport
+/// is the pane rect minus 2×PANE_BORDER on each side (see
+/// `pane_viewport_size`).
+const PANE_BORDER: f32 = 2.0;
+/// Index of the "Split view" entry in MENU_ITEMS (Round 14):
+/// the menu label is dynamic ("Split view" / "Close split view"),
+/// so the panel reads this index instead of the table's label.
+const SPLIT_MENU_INDEX: usize = 5;
 /// Hamburger menu dropdown panel (Round 8): a compact Firefox-style
 /// panel anchored top-right under the ☰ button, floating over the
 /// page — NOT the full-width bar of Rounds 2–7, which pushed the
@@ -105,16 +116,20 @@ const TICK: Duration = Duration::from_millis(16);
 /// Firefox shows one shortcut (F12 for Inspector); the other entries
 /// have no shortcut — do not invent any. Round 9 adds "Command
 /// palette…" (Ctrl+K, the palette's own shortcut) after Inspector,
-/// so the groups stay Settings | Print page… / Open file… /
-/// Inspector / Command palette… | Exit. The view builds the panel
+/// Round 14 adds "Split view" after it, so the groups stay
+/// Settings | Print page… / Open file… / Inspector /
+/// Command palette… | Split view / Exit. The view builds the panel
 /// from this table, so the spec and the rendering cannot drift.
 /// Separators fall after "Settings" and after "Command palette…".
-const MENU_ITEMS: [(&str, Option<&str>, Message); 6] = [
+/// The "Split view" label is dynamic (see SPLIT_MENU_INDEX):
+/// while split it reads "Close split view".
+const MENU_ITEMS: [(&str, Option<&str>, Message); 7] = [
     ("Settings", None, Message::OpenSettings),
     ("Print page…", None, Message::OpenPrint),
     ("Open file…", None, Message::OpenFile),
     ("Inspector", Some("F12"), Message::OpenInspector),
     ("Command palette…", Some("Ctrl+K"), Message::TogglePalette),
+    ("Split view", None, Message::ToggleSplit),
     ("Exit", None, Message::Exit),
 ];
 
@@ -127,6 +142,61 @@ fn menu_panel_geometry(window_width: f32) -> (f32, f32) {
         MENU_PANEL_WIDTH.min((window_width - 2.0 * MENU_PANEL_MARGIN).max(1.0));
     let x = (window_width - width - MENU_PANEL_MARGIN).max(0.0);
     (x, width)
+}
+
+/// Split view geometry (Round 14): the content rect's two halves,
+/// side by side. The left pane takes floor(width / 2), the right
+/// pane the rest, so an odd width loses no pixel and the halves
+/// tile exactly with no gap and no overlap.
+fn split_pane_rects(content: Rectangle) -> (Rectangle, Rectangle) {
+    let left_w = (content.width / 2.0).floor();
+    (
+        Rectangle {
+            x: content.x,
+            y: content.y,
+            width: left_w,
+            height: content.height,
+        },
+        Rectangle {
+            x: content.x + left_w,
+            y: content.y,
+            width: content.width - left_w,
+            height: content.height,
+        },
+    )
+}
+
+/// Which pane a window point falls in (Round 14): 0 in single
+/// view, or the left (0) / right (1) half in split view. The
+/// caller checks the point is inside the content area first.
+fn pane_at_point(content: Rectangle, split: bool, point: Point) -> usize {
+    if !split {
+        return 0;
+    }
+    let (left, _) = split_pane_rects(content);
+    if point.x < left.x + left.width {
+        0
+    } else {
+        1
+    }
+}
+
+/// A pane's webview viewport size (Round 14): in split view the
+/// image column sits inside the pane's 2 px border + 2 px padding,
+/// so the viewport is the pane rect minus 2×PANE_BORDER on each
+/// side. In single view the webview IS the content area, exactly
+/// as before. Never zero.
+fn pane_viewport_size(rect: Rectangle, split: bool) -> (u32, u32) {
+    if split {
+        let w = (rect.width - 2.0 * PANE_BORDER).max(1.0) as u32;
+        let h = (rect.height - 2.0 * PANE_BORDER).max(1.0) as u32;
+        (w, h)
+    } else {
+        (
+            rect.width.max(1.0) as u32,
+            rect.height.max(1.0) as u32,
+        )
+    }
 }
 
 /// (x, width) of the command-palette panel for a window of the
@@ -253,10 +323,13 @@ fn fuzzy_match(query: &str, label: &str) -> bool {
 /// flight — so no entry ever looks real while doing nothing. The
 /// rest are always available: every one of them is wired to an
 /// existing working message (no dead entries by construction).
+/// Round 14: the split command's label says what it WILL do —
+/// "Split view" in single view, "Close split view" while split.
 fn palette_commands_for(
     can_back: bool,
     can_forward: bool,
     loading: bool,
+    split: bool,
 ) -> Vec<(&'static str, Message)> {
     let mut commands = Vec::new();
     if can_back {
@@ -273,6 +346,11 @@ fn palette_commands_for(
     commands.push(("Print page…", Message::OpenPrint));
     commands.push(("Open file…", Message::OpenFile));
     commands.push(("Open Inspector", Message::OpenInspector));
+    if split {
+        commands.push(("Close split view", Message::ToggleSplit));
+    } else {
+        commands.push(("Split view", Message::ToggleSplit));
+    }
     commands.push(("Focus address bar", Message::FocusAddress));
     commands.push(("Quit Frost", Message::Exit));
     commands
@@ -330,6 +408,10 @@ pub enum Message {
     /// Opening it closes the menu; closing it leaves the page
     /// as it was (Round 9).
     TogglePalette,
+    /// Split the window into two panes side by side, or close
+    /// the split and keep the active pane (Round 14). In the
+    /// menu and the palette the label says what it will do.
+    ToggleSplit,
     /// Close the command palette without running anything
     /// (Escape, or a press outside the panel).
     ClosePalette,
@@ -362,14 +444,18 @@ pub enum Message {
     TitlebarDoubleClick,
 }
 
-pub struct Frost {
-    core: Core,
-    engine: Engine,
+/// One split-view pane (Round 14): a webview plus everything the
+/// app used to keep once, globally, for the single webview. The
+/// address bar itself stays on [`Frost`] — there is one bar,
+/// showing the ACTIVE pane's URL — and a pane's URL is whatever
+/// its webview reports. Status, Snowplow count, and history state
+/// are all per pane; the view reads the active pane's.
+struct Pane {
     webview: FrostWebView,
     /// Latest uploaded frame, as horizontal strips, if one has
     /// painted yet. Each entry is an iced image handle plus the
-    /// strip's height in pixels; the strips tile the content area
-    /// top to bottom (see `Frame::split_strips`).
+    /// strip's height in pixels; the strips tile the pane's
+    /// content area top to bottom (see `Frame::split_strips`).
     ///
     /// Round 6: a frame is NEVER uploaded as one image. iced 0.14
     /// uploads a raster image synchronously only when it is under
@@ -386,19 +472,92 @@ pub struct Frost {
     frame_dirty: bool,
     /// A load is in progress (Stop enabled, status shows it).
     loading: bool,
-    /// What the address bar shows.
-    address: String,
-    /// The user is mid-edit in the address bar: engine URL updates
-    /// must not clobber what they are typing.
-    address_editing: bool,
-    /// One-line status under the toolbar.
+    /// The page title, for the status line once loaded.
+    title: Option<String>,
+    /// One-line status for this pane.
     status: String,
     /// Round 13 (Snowplow): tracker/ad subresources blocked on the
     /// current page. Reset on each navigation; shown in the status
     /// line when greater than zero.
     snowplow_blocked: u64,
-    /// The page title, for the status line once loaded.
-    title: Option<String>,
+    can_back: bool,
+    can_forward: bool,
+    /// A load is in flight and no frame from it may be rendered yet.
+    /// The first paint of a load may be mid-build (the display list
+    /// is still arriving); rendering it would show a half-loaded
+    /// page, so the app renders nothing until LoadFinished (the
+    /// smoke test's pattern: one render after load + FrameReady
+    /// always paints fully). The old frame stays up during a
+    /// navigation until the new one is ready. (Round 4, F-007: with
+    /// full present a later paint DOES repair a partial frame now —
+    /// the old "damage is spent" claim is gone — but waiting for
+    /// LoadFinished still avoids showing a half-loaded page.)
+    awaiting_load: bool,
+    /// When the current load started; bounds the wait so a page that
+    /// never fires LoadFinished cannot leave a blank content area
+    /// forever (after 15 s renders are allowed anyway).
+    loading_since: Option<std::time::Instant>,
+    /// URL content scripts were last injected for; a new navigation
+    /// clears it so the new page gets its scripts.
+    injected_for: Option<String>,
+}
+
+impl Pane {
+    /// A pane for a webview that is already loading, with its
+    /// initial status line.
+    fn new(webview: FrostWebView, status: String) -> Self {
+        Self {
+            webview,
+            frame_strips: Vec::new(),
+            frame_dirty: false,
+            loading: true,
+            title: None,
+            status,
+            snowplow_blocked: 0,
+            can_back: false,
+            can_forward: false,
+            awaiting_load: true,
+            loading_since: Some(std::time::Instant::now()),
+            injected_for: None,
+        }
+    }
+
+    /// Mark a load in flight NOW (Round 4, F-008): Stop stays live
+    /// even if the load never reports a start.
+    fn mark_loading(&mut self, status: String) {
+        self.loading = true;
+        self.awaiting_load = true;
+        self.loading_since = Some(std::time::Instant::now());
+        self.status = status;
+    }
+
+    /// A load ended (finished, stopped, or crashed): clear the
+    /// in-flight flags and show `status`.
+    fn mark_settled(&mut self, status: String) {
+        self.loading = false;
+        self.awaiting_load = false;
+        self.loading_since = None;
+        self.status = status;
+    }
+}
+
+pub struct Frost {
+    core: Core,
+    engine: Engine,
+    /// The panes (Round 14): panes[0] always exists; panes[1]
+    /// exists exactly while split. `active_pane` indexes the pane
+    /// the toolbar, address bar, status line, and keyboard act on.
+    panes: Vec<Pane>,
+    /// Index of the active pane into `panes`.
+    active_pane: usize,
+    /// Whether the window shows two panes side by side.
+    split: bool,
+    /// What the address bar shows (the ACTIVE pane's URL, unless
+    /// the user is mid-edit — see `address_editing`).
+    address: String,
+    /// The user is mid-edit in the address bar: engine URL updates
+    /// must not clobber what they are typing.
+    address_editing: bool,
     /// Whether the hamburger menu is open.
     menu_open: bool,
     /// Index of the menu entry under the pointer, for the hover
@@ -415,8 +574,6 @@ pub struct Frost {
     /// list (Round 9). Reset to 0 whenever the query changes;
     /// clamped by the filtered length at use.
     palette_selected: usize,
-    can_back: bool,
-    can_forward: bool,
     window_size: Size,
     /// Round 10: whether Frost draws its own titlebar (GNOME
     /// fallback) or the window manager does. Chosen once at
@@ -431,21 +588,6 @@ pub struct Frost {
     /// The titlebar text changed; the OS window title needs the
     /// same update (via set_window_title, issued from the Tick).
     title_dirty: bool,
-    /// A load is in flight and no frame from it may be rendered yet.
-    /// The first paint of a load may be mid-build (the display list
-    /// is still arriving); rendering it would show a half-loaded
-    /// page, so the app renders nothing until LoadFinished (the
-    /// smoke test's pattern: one render after load + FrameReady
-    /// always paints fully). The old frame stays up during a
-    /// navigation until the new one is ready. (Round 4, F-007: with
-    /// full present a later paint DOES repair a partial frame now —
-    /// the old "damage is spent" claim is gone — but waiting for
-    /// LoadFinished still avoids showing a half-loaded page.)
-    awaiting_load: bool,
-    /// When the current load started; bounds the wait so a page that
-    /// never fires LoadFinished cannot leave a blank content area
-    /// forever (after 15 s renders are allowed anyway).
-    loading_since: Option<std::time::Instant>,
     /// A print preview capture is in flight (Round 4, F-003): the
     /// channel the engine delivers the PNG bytes on, polled by the
     /// Tick. Set by `Message::OpenPrint`; cleared when the bytes
@@ -494,9 +636,6 @@ pub struct Frost {
     /// + real injection through the engine — see
     /// `inject_content_scripts`).
     host: StubHost,
-    /// URL content scripts were last injected for; a new navigation
-    /// clears it so the new page gets its scripts.
-    injected_for: Option<String>,
 }
 
 impl Frost {
@@ -524,22 +663,130 @@ impl Frost {
         }
     }
 
-    /// The webview viewport size for the current window/menu state.
-    fn content_size(&self) -> (u32, u32) {
-        let rect = self.content_rect();
-        (
-            rect.width.max(1.0) as u32,
-            rect.height.max(1.0) as u32,
-        )
+    /// The webview viewport size for pane `index` (Round 14).
+    fn pane_size(&self, index: usize) -> (u32, u32) {
+        pane_viewport_size(self.pane_rect(index), self.split)
     }
 
-    /// Resize the webview to the content area, if it changed.
-    fn resize_webview(&mut self) {
-        let (w, h) = self.content_size();
-        if self.webview.size() != (w, h) {
-            self.webview.resize(w, h);
-            self.frame_dirty = true;
+    /// Resize every webview to its pane, if it changed.
+    fn resize_panes(&mut self) {
+        for i in 0..self.panes.len() {
+            let (w, h) = self.pane_size(i);
+            if self.panes[i].webview.size() != (w, h) {
+                self.panes[i].webview.resize(w, h);
+                self.panes[i].frame_dirty = true;
+            }
         }
+    }
+
+    /// The panes' rectangles in window coordinates (Round 14):
+    /// the whole content area alone, or its two halves side by
+    /// side. The second element is None in single view.
+    fn pane_rects(&self) -> (Rectangle, Option<Rectangle>) {
+        let rect = self.content_rect();
+        if self.split {
+            let (left, right) = split_pane_rects(rect);
+            (left, Some(right))
+        } else {
+            (rect, None)
+        }
+    }
+
+    /// The rectangle of pane `index` (0 = left / only, 1 = right).
+    fn pane_rect(&self, index: usize) -> Rectangle {
+        let (left, right) = self.pane_rects();
+        if index == 1 {
+            right.unwrap_or(left)
+        } else {
+            left
+        }
+    }
+
+    /// The active pane.
+    fn active_pane(&self) -> &Pane {
+        &self.panes[self.active_pane]
+    }
+
+    /// The active pane, mutably.
+    fn active_pane_mut(&mut self) -> &mut Pane {
+        &mut self.panes[self.active_pane]
+    }
+
+    /// Which pane a webview id belongs to (Round 14): the
+    /// delegate tags every engine event with its webview's id,
+    /// so events route to the pane that produced them. None
+    /// for an id no pane owns (a closed pane's straggler).
+    fn pane_index_for(&self, id: WebViewId) -> Option<usize> {
+        self.panes.iter().position(|p| p.webview.id() == id)
+    }
+
+    /// Make pane `index` the active one (Round 14): the toolbar,
+    /// address bar, status line, and keyboard follow it. The bar
+    /// shows the new pane's URL unless the user is mid-edit.
+    fn set_active_pane(&mut self, index: usize) {
+        if index >= self.panes.len() || index == self.active_pane {
+            return;
+        }
+        self.active_pane = index;
+        if !self.address_editing {
+            self.address = self.panes[index]
+                .webview
+                .url()
+                .map(|u| u.to_string())
+                .unwrap_or_default();
+        }
+        self.title_dirty = true;
+    }
+
+    /// Split the window into two panes side by side, or close the
+    /// split and keep the active pane (Round 14). The second pane
+    /// starts on the active pane's page — the most useful default:
+    /// a comparison, a link opened beside the original, or a
+    /// second view of the same page. The surviving pane on close
+    /// is the ACTIVE one; dropping the other pane's webview
+    /// closes it in the engine (`Drop for WebViewInner` sends
+    /// CloseWebView), so no pipeline is left running.
+    fn toggle_split(&mut self) -> Task<Message> {
+        if !self.split {
+            let url = self
+                .active_pane()
+                .webview
+                .url()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| self.settings.homepage.clone());
+            let (_, right) = split_pane_rects(self.content_rect());
+            let (w, h) = pane_viewport_size(right, true);
+            match self.engine.spawn_webview(&url, w, h) {
+                Ok(webview) => {
+                    webview.set_theme(self.settings.theme.is_dark());
+                    self.panes
+                        .push(Pane::new(webview, format!("Loading {url} …")));
+                    self.split = true;
+                    self.resize_panes();
+                },
+                Err(e) => {
+                    self.active_pane_mut().status =
+                        format!("Split view failed: {e}");
+                },
+            }
+        } else {
+            // Keep the active pane; drop the other (its webview's
+            // Drop closes it in the engine).
+            let other = if self.active_pane == 0 { 1 } else { 0 };
+            self.panes.remove(other);
+            self.active_pane = 0;
+            self.split = false;
+            if !self.address_editing {
+                self.address = self.panes[0]
+                    .webview
+                    .url()
+                    .map(|u| u.to_string())
+                    .unwrap_or_default();
+            }
+            self.title_dirty = true;
+            self.resize_panes();
+        }
+        Task::none()
     }
 
     /// Close the hamburger dropdown (and forget which entry was
@@ -562,7 +809,12 @@ impl Frost {
     /// table order. The filtered list is derived on demand, so
     /// the view and the run path can never disagree about it.
     fn palette_filtered(&self) -> Vec<(&'static str, Message)> {
-        palette_commands_for(self.can_back, self.can_forward, self.loading)
+        palette_commands_for(
+            self.active_pane().can_back,
+            self.active_pane().can_forward,
+            self.active_pane().loading,
+            self.split,
+        )
             .into_iter()
             .filter(|(label, _)| fuzzy_match(&self.palette_query, label))
             .collect()
@@ -632,6 +884,13 @@ impl Frost {
         let (x, width) = menu_panel_geometry(self.window_size.width);
         let mut children: Vec<Element<'_, Message>> = Vec::new();
         for (i, (label, shortcut, message)) in MENU_ITEMS.iter().enumerate() {
+            // Round 14: the Split view entry's label says what it
+            // WILL do — "Close split view" while split.
+            let label: &str = if i == SPLIT_MENU_INDEX && self.split {
+                "Close split view"
+            } else {
+                label
+            };
             // Separators between groups: after Settings, after
             // "Command palette…".
             if i == 1 || i == 5 {
@@ -671,105 +930,152 @@ impl Frost {
             .into()
     }
 
-    /// Translate an absolute window point into content-area coordinates,
-    /// or `None` when the point is outside the content area.
-    fn content_point(&self, point: Point) -> Option<Point> {
+    /// Translate an absolute window point into (pane, page)
+    /// coordinates (Round 14), or `None` outside the content
+    /// area. In split view the point also picks the pane it
+    /// lands in; the page coordinates are relative to that
+    /// pane's webview (inside its border + padding), clamped
+    /// to the viewport so a press on the border still lands
+    /// on the pane's edge pixel instead of a negative point.
+    fn pane_content_point(&self, point: Point) -> Option<(usize, Point)> {
         let rect = self.content_rect();
-        if rect.contains(point) {
-            Some(Point::new(point.x - rect.x, point.y - rect.y))
-        } else {
-            None
+        if !rect.contains(point) {
+            return None;
         }
+        let index = pane_at_point(rect, self.split, point);
+        let pane_rect = self.pane_rect(index);
+        let (w, h) = self.pane_size(index);
+        let pad = if self.split { PANE_BORDER } else { 0.0 };
+        let x = (point.x - pane_rect.x - pad).clamp(0.0, w as f32);
+        let y = (point.y - pane_rect.y - pad).clamp(0.0, h as f32);
+        Some((index, Point::new(x, y)))
     }
 
-    /// Titlebar text: the browser name, then the current site's
-    /// title. Before any title arrives, the site's host stands in;
-    /// internal (data:) pages show just the browser name.
+    /// Titlebar text: the browser name, then the ACTIVE pane's
+    /// site title. Before any title arrives, the site's host
+    /// stands in; internal (data:) pages show just the browser
+    /// name.
     fn titlebar_text(&self) -> String {
-        let label = match &self.title {
+        let pane = self.active_pane();
+        let label = match &pane.title {
             Some(t) if !t.is_empty() => t.clone(),
-            _ => match Url::parse(&self.address) {
-                Ok(u) if matches!(u.scheme(), "http" | "https") => u
-                    .host_str()
-                    .unwrap_or(&self.address)
-                    .to_string(),
+            _ => match pane.webview.url() {
+                Some(u) if matches!(u.scheme(), "http" | "https") => {
+                    match u.host_str() {
+                        Some(host) if !host.is_empty() => host.to_string(),
+                        _ => return "Frost".to_string(),
+                    }
+                },
                 _ => return "Frost".to_string(),
             },
         };
         format!("Frost — {label}")
     }
 
-    /// One engine event: update status, address bar, and history state.
+    /// One engine event: update the pane it came from (Round 14:
+    /// the delegate tags every event with its webview's id). An
+    /// event for a pane that no longer exists (a closed pane's
+    /// straggler) is dropped. The status line, address bar, and
+    /// OS title follow the ACTIVE pane only.
     fn handle_engine_event(&mut self, event: EngineEvent) {
+        // Route first: every variant carries its webview id.
+        let id = match &event {
+            EngineEvent::TitleChanged(id, _)
+            | EngineEvent::UrlChanged(id, _)
+            | EngineEvent::LoadStarted(id)
+            | EngineEvent::LoadFinished(id)
+            | EngineEvent::LoadStopped(id)
+            | EngineEvent::FrameReady(id)
+            | EngineEvent::ResourceBlocked(id, _)
+            | EngineEvent::Crashed(id, _) => *id,
+        };
+        let Some(index) = self.pane_index_for(id) else {
+            return;
+        };
+        let is_active = index == self.active_pane;
+        // A LoadFinished also (re-)injects this pane's content
+        // scripts — after the match, once the pane borrow ends.
+        let mut inject_after = false;
+        let pane = &mut self.panes[index];
         match event {
-            EngineEvent::TitleChanged(title) => {
-                self.title = title.clone();
-                self.title_dirty = true;
-                if !self.loading {
-                    self.status = self
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| "Untitled page".to_string());
+            EngineEvent::TitleChanged(_, title) => {
+                pane.title = title.clone();
+                if is_active {
+                    self.title_dirty = true;
+                    if !pane.loading {
+                        pane.status = pane
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| "Untitled page".to_string());
+                    }
                 }
             },
-            EngineEvent::UrlChanged(url) => {
+            EngineEvent::UrlChanged(_, url) => {
                 // Round 7: no internal pages any more — the engine
                 // URL is the display URL, full stop.
                 let display = url.to_string();
-                if !self.address_editing {
+                if is_active && !self.address_editing {
                     self.address = display;
                 }
-                self.title_dirty = true;
-                self.can_back = self.webview.can_go_back();
-                self.can_forward = self.webview.can_go_forward();
+                if is_active {
+                    self.title_dirty = true;
+                }
+                pane.can_back = pane.webview.can_go_back();
+                pane.can_forward = pane.webview.can_go_forward();
                 // Round 13: history (Back/Forward) traversals commit a
                 // new URL without a LoadStarted, so reset the Snowplow
                 // count here too — otherwise the previous page's count
                 // lingers on the new page. (Same-document fragment
                 // navigations also reset it; the count is per shown URL.)
-                self.snowplow_blocked = 0;
+                pane.snowplow_blocked = 0;
             },
-            EngineEvent::LoadStarted => {
-                self.loading = true;
-                self.awaiting_load = true;
-                self.loading_since = Some(std::time::Instant::now());
-                self.injected_for = None;
+            EngineEvent::LoadStarted(_) => {
+                pane.injected_for = None;
                 // Round 13: a new page starts with a clean Snowplow count.
-                self.snowplow_blocked = 0;
-                self.status = format!("Loading {} …", self.address);
+                pane.snowplow_blocked = 0;
+                let url = pane
+                    .webview
+                    .url()
+                    .map(|u| u.to_string())
+                    .unwrap_or_default();
+                pane.mark_loading(if url.is_empty() {
+                    "Loading…".to_string()
+                } else {
+                    format!("Loading {url} …")
+                });
             },
-            EngineEvent::LoadFinished => {
-                self.loading = false;
-                self.awaiting_load = false;
-                self.loading_since = None;
-                self.address_editing = false;
-                self.status = self.title.clone().unwrap_or_else(|| "Done".to_string());
-                self.inject_content_scripts();
+            EngineEvent::LoadFinished(_) => {
+                let status = pane
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "Done".to_string());
+                pane.mark_settled(status);
+                if is_active {
+                    self.address_editing = false;
+                }
+                inject_after = true;
                 // Round 4, F-007: no post-load jiggle any more — the
                 // fork uses full present, so the first paint after
                 // LoadFinished is complete as-is.
             },
-            EngineEvent::LoadStopped => {
-                self.loading = false;
-                self.awaiting_load = false;
-                self.loading_since = None;
-                self.status = "Stopped.".to_string();
+            EngineEvent::LoadStopped(_) => {
+                pane.mark_settled("Stopped.".to_string());
             },
-            EngineEvent::ResourceBlocked(_url) => {
+            EngineEvent::ResourceBlocked(_, _url) => {
                 // Round 13: a real count from the delegate, one event
                 // per cancelled request. The status line shows it
                 // (see the view); nothing is faked.
-                self.snowplow_blocked += 1;
+                pane.snowplow_blocked += 1;
             },
-            EngineEvent::FrameReady => {
-                self.frame_dirty = true;
+            EngineEvent::FrameReady(_) => {
+                pane.frame_dirty = true;
             },
-            EngineEvent::Crashed(reason) => {
-                self.loading = false;
-                self.awaiting_load = false;
-                self.loading_since = None;
-                self.status = format!("Page crashed: {reason}");
+            EngineEvent::Crashed(_, reason) => {
+                pane.mark_settled(format!("Page crashed: {reason}"));
             },
+        }
+        if inject_after {
+            self.inject_content_scripts(index);
         }
     }
 
@@ -789,16 +1095,22 @@ impl Frost {
         match event {
             iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 self.last_cursor = Some(position);
-                if let Some(p) = self.content_point(position) {
-                    self.webview
+                if let Some((index, p)) = self.pane_content_point(position) {
+                    self.panes[index]
+                        .webview
                         .send_input(FrostInputEvent::MouseMove { x: p.x, y: p.y });
                 }
             },
             iced::Event::Mouse(mouse::Event::ButtonPressed(button)) => {
                 if let Some(pos) = self.last_cursor {
-                    if let Some(p) = self.content_point(pos) {
+                    if let Some((index, p)) = self.pane_content_point(pos) {
+                        // Round 14: a press in a pane makes it the
+                        // active one — then the press reaches the
+                        // page, so one click both focuses the pane
+                        // and does what the user clicked.
+                        self.set_active_pane(index);
                         self.content_focused = true;
-                        self.webview.send_input(FrostInputEvent::MouseButton {
+                        self.panes[index].webview.send_input(FrostInputEvent::MouseButton {
                             button: map_button(button),
                             action: FrostMouseButtonAction::Down,
                             x: p.x,
@@ -809,8 +1121,8 @@ impl Frost {
             },
             iced::Event::Mouse(mouse::Event::ButtonReleased(button)) => {
                 if let Some(pos) = self.last_cursor {
-                    if let Some(p) = self.content_point(pos) {
-                        self.webview.send_input(FrostInputEvent::MouseButton {
+                    if let Some((index, p)) = self.pane_content_point(pos) {
+                        self.panes[index].webview.send_input(FrostInputEvent::MouseButton {
                             button: map_button(button),
                             action: FrostMouseButtonAction::Up,
                             x: p.x,
@@ -828,7 +1140,7 @@ impl Frost {
                     return Task::none();
                 }
                 if let Some(pos) = self.last_cursor {
-                    if let Some(p) = self.content_point(pos) {
+                    if let Some((index, p)) = self.pane_content_point(pos) {
                         // Servo takes pixel deltas; a "line" is ~40 px.
                         let (dx, dy) = match delta {
                             mouse::ScrollDelta::Lines { x, y } => {
@@ -838,7 +1150,7 @@ impl Frost {
                                 (x as f64, y as f64)
                             },
                         };
-                        self.webview.send_input(FrostInputEvent::Wheel {
+                        self.panes[index].webview.send_input(FrostInputEvent::Wheel {
                             dx,
                             dy,
                             x: p.x,
@@ -1020,6 +1332,23 @@ impl Frost {
             {
                 return Task::done(cosmic::Action::App(Message::TogglePalette));
             }
+            // Finisher fix: F12 is captured by a focused text
+            // input exactly like Ctrl+K (see above), so with the
+            // address bar focused it never reached the
+            // subscription's F12 handler — the Inspector only
+            // opened after clicking into the page first. Handle
+            // it here, mirroring that handler (open the snapshot,
+            // or just focus an Inspector window that is already
+            // open). An event is Captured or Ignored, never both,
+            // so it fires once.
+            if !repeat
+                && matches!(key, keyboard::Key::Named(keyboard::key::Named::F12))
+            {
+                if let Some(id) = self.popup_id(windows::PopupKind::Inspector) {
+                    return window::gain_focus(id);
+                }
+                self.capture_inspector();
+            }
             if self.palette_open
                 && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
             {
@@ -1043,7 +1372,7 @@ impl Frost {
             keyboard::key::Physical::Code(code) => map_code(code),
             keyboard::key::Physical::Unidentified(_) => FrostCode::Unidentified,
         };
-        self.webview.send_input(FrostInputEvent::Key {
+        self.active_pane().webview.send_input(FrostInputEvent::Key {
             state,
             // `text` is the character the keypress actually
             // produced; see `map_key_with_text`. Control/Meta
@@ -1057,7 +1386,7 @@ impl Frost {
         });
     }
 
-    /// Capture the current page's DOM for the Inspector window
+    /// Capture the ACTIVE pane's DOM for the Inspector window
     /// (Round 5, native window since Round 7): the walker script
     /// runs in the page and its JSON arrives on the channel; the
     /// Tick opens the Inspector window on the snapshot (or replaces
@@ -1068,19 +1397,21 @@ impl Frost {
         if self.inspector_shot_pending {
             return;
         }
-        if self.webview.url().is_none() {
-            self.status = "Inspector: no page loaded yet.".to_string();
+        if self.active_pane().webview.url().is_none() {
+            self.active_pane_mut().status =
+                "Inspector: no page loaded yet.".to_string();
             return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        self.webview
+        self.active_pane()
+            .webview
             .evaluate_javascript_string(DOM_WALK_SCRIPT, tx);
         self.inspector_shot_rx = Some(rx);
         self.inspector_shot_pending = true;
-        self.status = "Capturing page structure…".to_string();
+        self.active_pane_mut().status = "Capturing page structure…".to_string();
     }
 
-    /// Inject the content scripts that match the current page URL.
+    /// Inject the content scripts that match pane `index`'s URL.
     /// Runs once per URL, on LoadFinished (and on the 15 s safety
     /// net, for history traversals that never fire LoadFinished).
     /// `DocumentStart` scripts cannot run at document start (no
@@ -1089,17 +1420,17 @@ impl Frost {
     /// and is unaffected. Round 7: there are no internal pages
     /// any more, so every URL the engine loads is a real page —
     /// the old `frost://` / loopback guard is gone.
-    fn inject_content_scripts(&mut self) {
-        let Some(url) = self.webview.url().map(|u| u.to_string()) else {
+    fn inject_content_scripts(&mut self, index: usize) {
+        let Some(url) = self.panes[index].webview.url().map(|u| u.to_string()) else {
             return;
         };
-        if self.injected_for.as_deref() == Some(url.as_str()) {
+        if self.panes[index].injected_for.as_deref() == Some(url.as_str()) {
             return;
         }
-        self.injected_for = Some(url.clone());
+        self.panes[index].injected_for = Some(url.clone());
         let scripts = self.host.content_scripts_for(&url);
         for (_, script) in scripts {
-            self.webview.evaluate_javascript(&script.js);
+            self.panes[index].webview.evaluate_javascript(&script.js);
         }
     }
 }
@@ -1164,29 +1495,21 @@ impl cosmic::Application for Frost {
             Self {
                 core,
                 engine,
-                webview,
-                frame_strips: Vec::new(),
-                frame_dirty: false,
-                loading: true,
+                panes: vec![Pane::new(webview, format!("Loading {homepage} …"))],
+                active_pane: 0,
+                split: false,
                 address: homepage.clone(),
                 address_editing: false,
-                status: format!("Loading {homepage} …"),
-                snowplow_blocked: 0,
-                title: None,
                 menu_open: false,
                 menu_hovered: None,
                 palette_open: false,
                 palette_query: String::new(),
                 palette_selected: 0,
-                can_back: false,
-                can_forward: false,
                 window_size,
                 client_decorations,
                 last_cursor: None,
                 content_focused: true,
                 title_dirty: true,
-                awaiting_load: true,
-                loading_since: Some(std::time::Instant::now()),
                 print_shot_rx: None,
                 print_shot_pending: false,
                 print_pending_label: String::new(),
@@ -1204,7 +1527,6 @@ impl cosmic::Application for Frost {
                 inspector_win: None,
                 exit_win: None,
                 host,
-                injected_for: None,
             },
             Task::none(),
         )
@@ -1264,7 +1586,7 @@ impl cosmic::Application for Frost {
             return;
         }
         self.window_size = Size::new(width, height);
-        self.resize_webview();
+        self.resize_panes();
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -1281,23 +1603,26 @@ impl cosmic::Application for Frost {
                 let mut tasks: Vec<Task<Message>> = Vec::new();
                 // Safety net: a page that never fires LoadFinished
                 // must not leave a blank content area forever.
-                if self.awaiting_load {
-                    if let Some(since) = self.loading_since {
-                        if since.elapsed() > Duration::from_secs(15) {
-                            // A history traversal (back/forward)
-                            // restores from cache and never fires
-                            // LoadFinished, so without this the status
-                            // would read "Going back…" forever.
-                            self.awaiting_load = false;
-                            self.loading = false;
-                            self.status = self
-                                .title
-                                .clone()
-                                .unwrap_or_else(|| "Done".to_string());
-                            self.frame_dirty = true;
-                            // The traversal's page still gets its
-                            // content scripts (no LoadFinished fired).
-                            self.inject_content_scripts();
+                // Round 14: per pane — one pane's stuck load must
+                // not freeze the other pane's render.
+                for i in 0..self.panes.len() {
+                    if self.panes[i].awaiting_load {
+                        if let Some(since) = self.panes[i].loading_since {
+                            if since.elapsed() > Duration::from_secs(15) {
+                                // A history traversal (back/forward)
+                                // restores from cache and never fires
+                                // LoadFinished, so without this the status
+                                // would read "Going back…" forever.
+                                let status = self.panes[i]
+                                    .title
+                                    .clone()
+                                    .unwrap_or_else(|| "Done".to_string());
+                                self.panes[i].mark_settled(status);
+                                self.panes[i].frame_dirty = true;
+                                // The traversal's page still gets its
+                                // content scripts (no LoadFinished fired).
+                                self.inject_content_scripts(i);
+                            }
                         }
                     }
                 }
@@ -1309,24 +1634,28 @@ impl cosmic::Application for Frost {
                 // `Frame::split_strips` and the `frame_strips`
                 // field): one whole-frame image per render flashed
                 // dark for a frame on every load/scroll repaint.
-                if self.frame_dirty && !self.awaiting_load {
-                    if let Some(frame) = self.webview.render() {
-                        self.frame_strips = frame
-                            .split_strips(MAX_SYNC_UPLOAD_BYTES)
-                            .into_iter()
-                            .map(|strip| {
-                                let height = strip.height as f32;
-                                (
-                                    Handle::from_rgba(
-                                        strip.width,
-                                        strip.height,
-                                        strip.rgba,
-                                    ),
-                                    height,
-                                )
-                            })
-                            .collect();
-                        self.frame_dirty = false;
+                // Round 14: each pane renders on its own — a
+                // loading pane never blocks the other pane's paint.
+                for i in 0..self.panes.len() {
+                    if self.panes[i].frame_dirty && !self.panes[i].awaiting_load {
+                        if let Some(frame) = self.panes[i].webview.render() {
+                            self.panes[i].frame_strips = frame
+                                .split_strips(MAX_SYNC_UPLOAD_BYTES)
+                                .into_iter()
+                                .map(|strip| {
+                                    let height = strip.height as f32;
+                                    (
+                                        Handle::from_rgba(
+                                            strip.width,
+                                            strip.height,
+                                            strip.rgba,
+                                        ),
+                                        height,
+                                    )
+                                })
+                                .collect();
+                            self.panes[i].frame_dirty = false;
+                        }
                     }
                 }
                 // F-003 print preview: the screenshot bytes arrive
@@ -1365,7 +1694,8 @@ impl cosmic::Application for Frost {
                                 }
                             },
                             Err(e) => {
-                                self.status = format!("Inspector failed: {e}");
+                                self.active_pane_mut().status =
+                                    format!("Inspector failed: {e}");
                             },
                         }
                     }
@@ -1403,27 +1733,22 @@ impl cosmic::Application for Frost {
                 // Round 4, F-008: mark loading NOW (see
                 // load_loopback) so Stop is live even if this
                 // traversal never reports a load start.
-                self.loading = true;
-                self.awaiting_load = true;
-                self.loading_since = Some(std::time::Instant::now());
-                self.webview.go_back();
-                self.status = "Going back…".to_string();
+                let pane = self.active_pane_mut();
+                pane.mark_loading("Going back…".to_string());
+                pane.webview.go_back();
                 Task::none()
             },
             Message::Forward => {
                 // Round 4, F-008: mark loading NOW (see
                 // load_loopback).
-                self.loading = true;
-                self.awaiting_load = true;
-                self.loading_since = Some(std::time::Instant::now());
-                self.webview.go_forward();
-                self.status = "Going forward…".to_string();
+                let pane = self.active_pane_mut();
+                pane.mark_loading("Going forward…".to_string());
+                pane.webview.go_forward();
                 Task::none()
             },
             Message::Reload => {
-                self.loading = true;
-                self.awaiting_load = true;
-                self.loading_since = Some(std::time::Instant::now());
+                let pane = self.active_pane_mut();
+                pane.mark_loading("Reloading…".to_string());
                 // Round 4, F-006: the fork's `reload()` now notifies
                 // the delegate via `set_load_status`, so the engine
                 // reports `LoadStarted` for a reload — which clears
@@ -1431,14 +1756,14 @@ impl cosmic::Application for Frost {
                 // (clearing `injected_for` here) is RETIRED; setting
                 // `loading` here is kept so Stop stays live if the
                 // reload's first response never arrives (F-008).
-                self.webview.reload();
-                self.status = "Reloading…".to_string();
+                pane.webview.reload();
                 Task::none()
             },
             Message::Stop => {
-                match self.webview.stop() {
-                    Ok(()) => self.status = "Stopping…".to_string(),
-                    Err(e) => self.status = format!("Stop failed: {e}"),
+                let pane = self.active_pane_mut();
+                match pane.webview.stop() {
+                    Ok(()) => pane.status = "Stopping…".to_string(),
+                    Err(e) => pane.status = format!("Stop failed: {e}"),
                 }
                 Task::none()
             },
@@ -1456,27 +1781,40 @@ impl cosmic::Application for Frost {
                 // plainly and leave the current page alone — never
                 // a dead page, never a hang.
                 if trimmed.to_ascii_lowercase().starts_with("frost://") {
-                    self.status = "Frost no longer has internal pages — Settings, Print, Open file, and Inspector open in their own windows from the ☰ menu.".to_string();
+                    self.active_pane_mut().status = "Frost no longer has internal pages — Settings, Print, Open file, and Inspector open in their own windows from the ☰ menu.".to_string();
                     return Task::none();
                 }
                 let url = resolve_address(&trimmed, &self.settings);
-                match self.webview.load(&url) {
+                match self.active_pane().webview.load(&url) {
                     Ok(()) => {
                         // Round 4, F-008: mark the load in flight
                         // NOW (see load_url_in_main) so Stop stays
                         // live if the server never responds and
                         // LoadStarted never fires.
-                        self.loading = true;
-                        self.awaiting_load = true;
-                        self.loading_since = Some(std::time::Instant::now());
+                        self.active_pane_mut()
+                            .mark_loading(format!("Loading {url} …"));
                         self.address = url.clone();
                         self.address_editing = false;
                         self.content_focused = true;
-                        self.status = format!("Loading {url} …");
                     },
-                    Err(e) => self.status = format!("Cannot load {url}: {e}"),
+                    Err(e) => {
+                        self.active_pane_mut().status =
+                            format!("Cannot load {url}: {e}");
+                    },
                 }
                 Task::none()
+            },
+            Message::ToggleSplit => {
+                // Finisher fix: every other menu/palette command
+                // closes both overlays first; ToggleSplit closed
+                // neither, so picking "Split view" / "Close split
+                // view" from the menu left the menu open over the
+                // new split. (The palette's own close happens in
+                // PaletteRun before dispatch, so this is a no-op
+                // from the palette path.)
+                self.close_menu();
+                self.close_palette();
+                self.toggle_split()
             },
             Message::ToggleMenu => {
                 // Round 8: the menu floats over the content, so
@@ -1586,15 +1924,23 @@ impl cosmic::Application for Frost {
                     return Task::none();
                 }
                 let (tx, rx) = std::sync::mpsc::channel();
-                self.webview.request_screenshot_png(tx);
+                self.active_pane().webview.request_screenshot_png(tx);
                 self.print_shot_rx = Some(rx);
                 self.print_shot_pending = true;
-                self.status = "Capturing print preview…".to_string();
+                self.active_pane_mut().status =
+                    "Capturing print preview…".to_string();
                 // Freeze the printed page's identity here: the
                 // Print window renders from these.
-                self.print_pending_label = format!("Preview of {}", self.address);
-                self.print_pending_title = self.title.clone().unwrap_or_default();
-                self.print_pending_url = self.address.clone();
+                let pane_url = self
+                    .active_pane()
+                    .webview
+                    .url()
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| self.address.clone());
+                self.print_pending_label = format!("Preview of {pane_url}");
+                self.print_pending_title =
+                    self.active_pane().title.clone().unwrap_or_default();
+                self.print_pending_url = pane_url;
                 Task::none()
             },
             Message::OpenInspector => {
@@ -1728,7 +2074,7 @@ impl cosmic::Application for Frost {
                 button::ButtonClass::Standard,
                 TOOLBAR_CHEVRON_NUDGE_UP,
             );
-            if self.can_back {
+            if self.active_pane().can_back {
                 b.on_press(Message::Back)
             } else {
                 b
@@ -1740,7 +2086,7 @@ impl cosmic::Application for Frost {
                 button::ButtonClass::Standard,
                 TOOLBAR_CHEVRON_NUDGE_UP,
             );
-            if self.can_forward {
+            if self.active_pane().can_forward {
                 b.on_press(Message::Forward)
             } else {
                 b
@@ -1750,7 +2096,8 @@ impl cosmic::Application for Frost {
         // while idle, an X while a page is loading (the
         // Firefox/Chrome pattern). It flips back to reload both
         // when the load finishes and when the user stops it.
-        let (reload_stop_label, reload_stop_message) = reload_stop_button(self.loading);
+        let (reload_stop_label, reload_stop_message) =
+            reload_stop_button(self.active_pane().loading);
         let reload_stop =
             round_icon_button(reload_stop_label, button::ButtonClass::Standard, 0.0)
                 .on_press(reload_stop_message);
@@ -1788,46 +2135,36 @@ impl cosmic::Application for Frost {
         // titlebar / toolbar / content / status; the panel floats
         // over the content via the Stack below.
 
-        // Web content area: the live Servo frame as horizontal
-        // strips (Round 6), or a loading note until the first
-        // frame paints. The strips tile the area exactly — each is
-        // the frame's full width at its own height, no scaling, no
-        // seams — so the column is the whole frame at 1:1.
-        let content: Element<Message> = if self.frame_strips.is_empty() {
-            container(text("Loading…").size(16))
-                .style(move |_| chrome_container_style(colors))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .into()
+        // Web content area (Round 14): in single view, the live
+        // Servo frame as horizontal strips (Round 6), or a loading
+        // note until the first frame paints. In split view, two
+        // panes side by side, each its own frame — the active
+        // pane wears a 2 px border (the inactive pane's border is
+        // transparent at the same width, so switching the active
+        // pane never shifts layout).
+        let content: Element<Message> = if !self.split {
+            pane_element(&self.panes[0], colors, false, false)
         } else {
-            widget::column::with_children(
-                self.frame_strips
-                    .iter()
-                    .map(|(handle, height)| {
-                        Image::new(handle.clone())
-                            .width(Length::Fill)
-                            .height(Length::Fixed(*height))
-                            .content_fit(ContentFit::Fill)
-                            .into()
-                    })
-                    .collect::<Vec<Element<'_, Message>>>(),
-            )
+            widget::row::with_children(vec![
+                pane_element(&self.panes[0], colors, true, self.active_pane == 0),
+                pane_element(&self.panes[1], colors, true, self.active_pane == 1),
+            ])
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
         };
 
         // Round 13: the status line shows the real per-page Snowplow
-        // count when anything was blocked on this page.
-        let status_text = if self.snowplow_blocked > 0 {
+        // count when anything was blocked on this page — the ACTIVE
+        // pane's count, in split view.
+        let pane = self.active_pane();
+        let status_text = if pane.snowplow_blocked > 0 {
             format!(
                 "{} · Snowplow blocked {}",
-                self.status, self.snowplow_blocked
+                pane.status, pane.snowplow_blocked
             )
         } else {
-            self.status.clone()
+            pane.status.clone()
         };
         let status = container(text(status_text).size(13))
             .style(move |_| chrome_container_style(colors))
@@ -1930,6 +2267,78 @@ fn chrome_container_style(colors: ChromeColors) -> cosmic::iced::widget::contain
 /// A `[u8; 3]` theme color as an iced `Color`.
 fn rgb(color: [u8; 3]) -> cosmic::iced::Color {
     cosmic::iced::Color::from_rgb8(color[0], color[1], color[2])
+}
+
+/// One split-view pane's content element (Round 14): the pane's
+/// frame strips (or a loading note until the first frame paints).
+/// The strips tile the pane exactly — each is the frame's full
+/// width at its own height, no scaling, no seams — so the column
+/// is the whole frame at 1:1. In split view the element is wrapped
+/// in a 2 px border + the same padding: the ACTIVE pane's border
+/// is the theme's border color, the inactive pane's is
+/// transparent at the same width, so switching the active pane
+/// never shifts layout. In single view there is no wrapper at
+/// all — the content is exactly as it was before split view.
+fn pane_element<'a>(
+    pane: &'a Pane,
+    colors: ChromeColors,
+    split: bool,
+    active: bool,
+) -> Element<'a, Message> {
+    let inner: Element<'_, Message> = if pane.frame_strips.is_empty() {
+        container(text("Loading…").size(16))
+            .style(move |_| chrome_container_style(colors))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
+    } else {
+        widget::column::with_children(
+            pane.frame_strips
+                .iter()
+                .map(|(handle, height)| {
+                    Image::new(handle.clone())
+                        .width(Length::Fill)
+                        .height(Length::Fixed(*height))
+                        .content_fit(ContentFit::Fill)
+                        .into()
+                })
+                .collect::<Vec<Element<'_, Message>>>(),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    };
+    if !split {
+        return inner;
+    }
+    let border_color = if active {
+        rgb(colors.menu_border)
+    } else {
+        cosmic::iced::Color::TRANSPARENT
+    };
+    container(inner)
+        .style(move |_| pane_border_style(border_color))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(PANE_BORDER)
+        .into()
+}
+
+/// The split-view pane border (Round 14): a 2 px ring in `color`
+/// (the theme's border color for the active pane, transparent for
+/// the inactive one), square corners, no background — the page
+/// shows through.
+fn pane_border_style(color: cosmic::iced::Color) -> cosmic::iced::widget::container::Style {
+    cosmic::iced::widget::container::Style {
+        border: cosmic::iced::Border {
+            color,
+            width: PANE_BORDER,
+            radius: 0.0.into(),
+        },
+        ..Default::default()
+    }
 }
 
 /// One dropdown entry: label left, shortcut (F12) right-aligned in
@@ -2233,8 +2642,9 @@ mod tests {
     }
 
     #[test]
-    fn menu_items_are_six_with_f12_and_ctrl_k() {
-        assert_eq!(MENU_ITEMS.len(), 6);
+    fn menu_items_are_seven_with_f12_ctrl_k_and_split_view() {
+        assert_eq!(MENU_ITEMS.len(), 7);
+        assert_eq!(SPLIT_MENU_INDEX, 5);
         let labels: Vec<&str> = MENU_ITEMS.iter().map(|(label, _, _)| *label).collect();
         assert_eq!(
             labels,
@@ -2244,6 +2654,7 @@ mod tests {
                 "Open file…",
                 "Inspector",
                 "Command palette…",
+                "Split view",
                 "Exit"
             ]
         );
@@ -2254,6 +2665,7 @@ mod tests {
                 _ => assert_eq!(shortcut, None, "{label} must not invent a shortcut"),
             }
         }
+        assert!(matches!(MENU_ITEMS[SPLIT_MENU_INDEX].2, Message::ToggleSplit));
     }
 
     #[test]
@@ -2276,7 +2688,7 @@ mod tests {
     fn palette_commands_hide_unavailable_actions() {
         // Nothing to go back/forward to, nothing loading: only the
         // always-available commands show.
-        let labels: Vec<&str> = palette_commands_for(false, false, false)
+        let labels: Vec<&str> = palette_commands_for(false, false, false, false)
             .iter()
             .map(|(label, _)| *label)
             .collect();
@@ -2288,13 +2700,14 @@ mod tests {
                 "Print page…",
                 "Open file…",
                 "Open Inspector",
+                "Split view",
                 "Focus address bar",
                 "Quit Frost",
             ]
         );
         // With history and a load in flight, the conditional
         // commands appear in place.
-        let labels: Vec<&str> = palette_commands_for(true, true, true)
+        let labels: Vec<&str> = palette_commands_for(true, true, true, false)
             .iter()
             .map(|(label, _)| *label)
             .collect();
@@ -2309,10 +2722,18 @@ mod tests {
                 "Print page…",
                 "Open file…",
                 "Open Inspector",
+                "Split view",
                 "Focus address bar",
                 "Quit Frost",
             ]
         );
+        // While split, the split command reads as a close.
+        let labels: Vec<&str> = palette_commands_for(false, false, false, true)
+            .iter()
+            .map(|(label, _)| *label)
+            .collect();
+        assert!(labels.contains(&"Close split view"));
+        assert!(!labels.contains(&"Split view"));
     }
 
     #[test]
@@ -2362,6 +2783,75 @@ mod tests {
         assert!(TOOLBAR_CHEVRON_NUDGE_UP > 0.0);
         assert_eq!(TOOLBAR_CHEVRON_NUDGE_UP, 2.0);
         assert!(2.0 * TOOLBAR_CHEVRON_NUDGE_UP < TOOLBAR_GLYPH_SIZE);
+    }
+
+    #[test]
+    fn split_pane_rects_tile_the_content_area() {
+        // Even widths split exactly in half; odd widths give the
+        // extra pixel to the right pane; the halves never gap or
+        // overlap, at any size.
+        for (w, h) in [(1280.0, 684.0), (1279.0, 684.0), (800.0, 600.0), (1.0, 1.0)] {
+            let content = Rectangle {
+                x: 0.0,
+                y: 48.0,
+                width: w,
+                height: h,
+            };
+            let (left, right) = split_pane_rects(content);
+            assert_eq!(left.x, 0.0);
+            assert_eq!(left.y, 48.0);
+            assert_eq!(left.height, h);
+            assert_eq!(right.height, h);
+            assert_eq!(left.width + right.width, w);
+            assert_eq!(right.x, left.x + left.width);
+            assert_eq!(left.width, (w / 2.0).floor());
+        }
+    }
+
+    #[test]
+    fn pane_at_point_picks_the_half() {
+        let content = Rectangle {
+            x: 0.0,
+            y: 48.0,
+            width: 1280.0,
+            height: 684.0,
+        };
+        // Single view: everything is pane 0.
+        assert_eq!(pane_at_point(content, false, Point::new(1000.0, 100.0)), 0);
+        // Split view: left half, the exact middle, and right half.
+        assert_eq!(pane_at_point(content, true, Point::new(100.0, 100.0)), 0);
+        assert_eq!(pane_at_point(content, true, Point::new(639.0, 100.0)), 0);
+        assert_eq!(pane_at_point(content, true, Point::new(640.0, 100.0)), 1);
+        assert_eq!(pane_at_point(content, true, Point::new(1200.0, 100.0)), 1);
+    }
+
+    #[test]
+    fn pane_viewport_size_subtracts_the_border_when_split() {
+        let rect = Rectangle {
+            x: 0.0,
+            y: 48.0,
+            width: 640.0,
+            height: 684.0,
+        };
+        // Single view: the webview IS the content area.
+        assert_eq!(pane_viewport_size(rect, false), (640, 684));
+        // Split view: 2 px border + 2 px padding on each side.
+        assert_eq!(
+            pane_viewport_size(rect, true),
+            (
+                (640.0 - 2.0 * PANE_BORDER) as u32,
+                (684.0 - 2.0 * PANE_BORDER) as u32
+            )
+        );
+        // Degenerate rects never go to zero.
+        let tiny = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 2.0,
+            height: 2.0,
+        };
+        assert_eq!(pane_viewport_size(tiny, true), (1, 1));
+        assert_eq!(pane_viewport_size(tiny, false), (2, 2));
     }
 
     #[test]

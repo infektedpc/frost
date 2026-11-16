@@ -5,13 +5,13 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 13 — Snowplow v1, tracker/ad blocking.** The
-embedder refuses tracker/ad subresource requests before they
-leave the machine (62-domain blocklist, suffix matching), a
-Settings toggle (default on, persisted), and a real per-page
-blocked count in the status line. Tests 69/69 (baseline 60/60
-+ 9 new Round 13 tests). No fork patch; the fork is untouched
-at `f9462dbb7`. See [ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 14 — Split view, two pages side by side.** Each
+pane is a full webview with its own URL, history, and Snowplow
+count; the active pane wears a 2 px border, and the menu (7 items)
+and Ctrl+K palette toggle the split with a dynamic label. Tests
+72/72 (baseline 69/69 + 3 new Round 14 tests). No fork patch; the
+fork is untouched at `f9462dbb7`. See [ROADMAP.md](ROADMAP.md) for
+the plan.
 
 ## Layout
 
@@ -1700,3 +1700,158 @@ latency, the Round 6 flashing fix on real hardware, and
 the WM-drawn titlebar itself (look, real min/max/close) —
 bare Xvfb has no window manager, so Joel's KDE box is the
 verdict for those.
+
+## Round 14 — Split view: two pages side by side (what is proven, what is not)
+
+Step 3 in Joel's easiest-first order (command palette was
+step 1, Round 9; Snowplow step 2, Round 13). No fork patch;
+the fork is untouched at `f9462dbb7`.
+
+Honest process note: this round was written by a first
+builder who got the suite green (72/72) and then went quiet
+without a binary, gates, zip, or commit. A second agent
+finished it: re-ran the suite, removed one dead field the
+first builder left behind, built the binary, ran the live
+gates below, fixed two real bugs the gates found, and
+committed and zipped. The design below is the first
+builder's, as found; the finisher's changes are marked.
+
+Design (first builder's): the app no longer owns one
+webview — it owns `panes: Vec<Pane>` plus `active_pane`
+and `split` (`crates/frost/src/app.rs`). A `Pane` carries
+everything that used to be app-level per page: its
+`FrostWebView`, frame strips, `loading`, `title`, `status`,
+Snowplow count, `can_back`/`can_forward`, `awaiting_load`,
+`loading_since`, and `injected_for`. The engine had to learn
+which webview an event came from, so every `EngineEvent`
+variant now carries a `WebViewId` first
+(`crates/frost-engine/src/lib.rs`, `FrostWebView::id()`,
+`WebViewId` re-exported; `snowplow::handle_load` takes the
+id and tags `ResourceBlocked` with it — the two engine
+examples were updated for the new shapes, no behavior
+change). The second pane starts on the active pane's URL
+(or the homepage if it has none). The split is fixed
+50/50 — `split_pane_rects` gives the left pane
+`floor(width / 2)` and the right the rest, so odd widths
+lose no pixel and the halves tile exactly. There is NO
+draggable divider in v1 (a stated limit, not a missing
+piece). The active pane wears a 2 px border in the theme
+border color; the inactive pane's border is transparent at
+the same width, so switching the active pane never shifts
+layout. The border is layout-neutral in iced, so the
+webview viewport is the pane rect minus 2×PANE_BORDER on
+each side (`pane_viewport_size`) — do not "fix" that
+subtraction; it is correct. A click inside a pane
+activates it (`pane_at_point`); keyboard goes to the
+active pane; closing the split keeps the ACTIVE pane and
+drops the other, whose webview's `Drop` closes it in the
+engine, so no pipeline is left running. The menu gains a
+seventh entry at index 5 with a dynamic label ("Split
+view" / "Close split view", `SPLIT_MENU_INDEX`), and the
+Ctrl+K palette gains the same dynamic entry
+(`palette_commands_for` takes `split`).
+
+Finisher changes: (1) removed a dead `injected_for: Option<String>`
+field the first builder left on `Frost` itself after moving
+per-pane state into `Pane` — it was never read, only
+constructed (the build warned about it). Only the live
+`Pane` uses remain. (2) Menu did not close on pick: the
+`ToggleSplit` arm was the only menu/palette command that
+closed neither overlay, so picking "Split view" or "Close
+split view" left the dropdown open over the new split
+(gated: `r14-05-split2.jpg`, `r14-18-close-split.jpg`).
+The arm now closes both, like every other command
+(`r14-34-menu-fix.jpg`). (3) F12 was swallowed while the
+address bar had focus: a focused text input captures
+every KeyPressed, so F12 never reached the subscription's
+F12 handler — the Inspector only opened after clicking
+into the page first (gated: `r14-23-inspector.jpg`
+identical to the shot before it). The captured-event
+handler now has an F12 branch mirroring the subscription
+handler, the same pattern as the Round 9 Ctrl+K fix
+(`r14-35-f12-addrbar.jpg`: Inspector opens from address-bar
+focus, 35-node example.org snapshot, including the
+extension-injected `div#frost-sample-banner`).
+
+Gates, all on the Round 14 binary under Xvfb :97 (test
+server on 127.0.0.1:18101, hang server on 127.0.0.1:18099):
+(a) split — both panes paint example.org fully, banners
+in both (`r14-06-split-clean.jpg`). (b) Independent
+navigation: click the right pane (border moves with the
+active pane), navigate it to example.com — left stays on
+example.org with its banner, right shows example.com with
+no banner (`r14-08-right-com.jpg`); Back returns the right
+pane to example.org, banner back
+(`r14-10-back-settled.jpg`); Forward returns it to
+example.com (`r14-12-forward-settled.jpg`). The left pane
+is untouched throughout. (c) Reload/stop flip on the
+active pane against the hang server: ↻ flips to ✕, status
+"Loading http://127.0.0.1:18099/ …"
+(`r14-13-hang-loading.jpg`); Stop flips it back to ↻ and
+the left pane is unaffected
+(`r14-14-after-stop.jpg`). (d) Close split keeps the
+active pane's page: with the right pane active on
+example.com, the menu's "Close split view" returns a
+single full-width example.com, no banner
+(`r14-18-close-split.jpg`). (e) Menu entry works
+(`r14-02-menu.jpg`, seven items) and the palette lists
+"Split view" and runs it (`r14-19-palette.jpg`,
+`r14-20-palette-split.jpg`); Snowplow blocks in BOTH
+panes — left and right each show "blocked-img: failed",
+"allowed-img: loaded" (green square), "blocked-js: failed"
+with the status count "Snowplow blocked 4" for the active
+pane (`r14-21-snowplow-left.jpg`,
+`r14-22-snowplow-right.jpg`). (f) Full regression:
+settings save + persist across relaunch (search engine
+Google → saved → `settings.json` shows `"search_engine":
+"Google"` → relaunch → still Google, then restored to
+DuckDuckGo; `r14-28-settings.jpg`, `r14-29-settings-saved.jpg`,
+`r14-31-settings-relaunch.jpg`); banner on example.org /
+absent on example.com; Inspector F12 gives a real 26-node
+snapshot of the active pane's snowplow page
+(`r14-24-inspector2.jpg`) and "Back to the page" works at
+its visual center (`r14-25-back-to-page.jpg`); strip-scroll
+in a pane paints BAND 5 / BAND 6 fully, left pane
+untouched (`r14-26-bands-scrolled.jpg`); `frost://settings`
+fails plainly with the "no longer has internal pages"
+status (`r14-27-frost-scheme.jpg`); `ss` shows no Frost
+listener (only the harness's own test/hang servers). (g)
+GNOME-mode launch shows Frost's own titlebar "Frost —
+Example Domain" with min/max/close
+(`r14-33-gnome-launch.jpg`).
+
+One behavior worth knowing, observed in gating and left
+as-is: a navigation that is stopped before it commits
+(the hang-server load) adds no history entry, so Back
+from it goes to the page before the stopped one — that is
+standard browser behavior, not a split bug. The
+Inspector captures the ACTIVE pane's page only; the other
+pane is not snapshotted.
+
+Build note: the plain 2 GB debug link failed this round
+with `collect2: ld terminated with signal 9 [Killed]` —
+the OOM killer, not disk (66 GB free; the Round 13 SIGBUS
+was disk, this one is RAM: the sandbox cell is ~6 GiB and
+the host was under memory pressure from its own
+post-restart package installs). A retry got nearly to the
+end of the link before a runtime restart killed it
+mid-link. The gate binary was linked with
+`-C link-arg=-Wl,--strip-debug` via `cargo rustc -p frost
+--bins` (517 MB, symbols kept, debug sections stripped —
+same code, 4m 43s); the zip's source still builds the
+normal dev binary. If the plain link keeps dying in this
+sandbox, that flag is the workaround; on Joel's box the
+plain link is the real test.
+
+Carried over, unchanged: the stale "Capturing…" status
+after a capture (Round 7); Settings has no in-content
+Close button (OS close works, and in WM mode the popup
+has a real WM close button); theme applies on Save, not
+per click; the Back-button engine quirk (Back dead after
+a same-URL re-navigation + a Back click mid-load —
+documented, unreproduced on demand). Not verified in the
+sandbox, as before: real mouse/keyboard, mouse-wheel
+scroll over the page, drag latency, the Round 6 flashing
+fix on real hardware, and the WM-drawn titlebar itself
+(look, real min/max/close) — bare Xvfb has no window
+manager, so Joel's KDE box is the verdict for those.

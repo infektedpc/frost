@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while Instant::now() < load_deadline && !finished {
         engine.spin();
         while let Some(event) = engine.try_recv_event() {
-            if matches!(event, EngineEvent::LoadFinished | EngineEvent::LoadStopped) {
+            if matches!(event, EngineEvent::LoadFinished(_) | EngineEvent::LoadStopped(_)) {
                 finished = true;
             }
         }

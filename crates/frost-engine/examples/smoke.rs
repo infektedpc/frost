@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[smoke] event: {event:?}");
             if matches!(
                 event,
-                EngineEvent::LoadFinished | EngineEvent::LoadStopped
+                EngineEvent::LoadFinished(_) | EngineEvent::LoadStopped(_)
             ) {
                 finished = true;
             }
@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while Instant::now() < frame_deadline {
         engine.spin();
         while let Some(event) = engine.try_recv_event() {
-            if matches!(event, EngineEvent::FrameReady) {
+            if matches!(event, EngineEvent::FrameReady(_)) {
                 saw_frame = true;
             }
         }

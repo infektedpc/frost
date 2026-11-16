@@ -153,20 +153,23 @@ impl Frame {
 }
 
 /// Events the engine reports to the UI. Delivered over a channel so the UI
-/// never blocks inside a Servo callback.
+/// never blocks inside a Servo callback. Every variant carries the
+/// [`WebViewId`] of the webview it came from (Round 14: split view
+/// runs two webviews, so the UI must know which pane an event
+/// belongs to — an untagged event could not be routed).
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
-    TitleChanged(Option<String>),
-    UrlChanged(Url),
-    LoadStarted,
-    LoadFinished,
+    TitleChanged(WebViewId, Option<String>),
+    UrlChanged(WebViewId, Url),
+    LoadStarted(WebViewId),
+    LoadFinished(WebViewId),
     /// The load was stopped before completing (0.8.0's `LoadStatus::Stopped`).
-    LoadStopped,
-    FrameReady,
+    LoadStopped(WebViewId),
+    FrameReady(WebViewId),
     /// A tracker/ad subresource request was blocked by Snowplow
     /// (Round 13): the blocked URL, so the UI can count it.
-    ResourceBlocked(String),
-    Crashed(String),
+    ResourceBlocked(WebViewId, String),
+    Crashed(WebViewId, String),
 }
 
 /// Input events the UI sends into a webview. These are Frost's own shapes;
@@ -246,6 +249,9 @@ pub use servo::{
     Location as FrostLocation, Modifiers as FrostModifiers, NamedKey as FrostNamedKey,
 };
 pub use servo::{MouseButton as FrostMouseButton, MouseButtonAction as FrostMouseButtonAction};
+/// Re-exported so the UI can name the id the delegate tags every
+/// [`EngineEvent`] with (Round 14: split view routes events to panes).
+pub use servo::WebViewId;
 
 /// Minimal [`EventLoopWaker`]: Servo calls `wake()` when it wants the
 /// embedder to spin soon. The smoke test and (later) the UI poll on a short
@@ -277,23 +283,27 @@ struct FrostDelegate {
 
 impl WebViewDelegate for FrostDelegate {
     fn notify_page_title_changed(&self, webview: WebView, _title: Option<String>) {
+        let _ = self.tx.send(EngineEvent::TitleChanged(
+            webview.id(),
+            webview.page_title(),
+        ));
+    }
+
+    fn notify_url_changed(&self, webview: WebView, url: Url) {
         let _ = self
             .tx
-            .send(EngineEvent::TitleChanged(webview.page_title()));
+            .send(EngineEvent::UrlChanged(webview.id(), url));
     }
 
-    fn notify_url_changed(&self, _webview: WebView, url: Url) {
-        let _ = self.tx.send(EngineEvent::UrlChanged(url));
-    }
-
-    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+    fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
+        let id = webview.id();
         let event = match status {
-            LoadStatus::Started => EngineEvent::LoadStarted,
-            LoadStatus::Complete => EngineEvent::LoadFinished,
+            LoadStatus::Started => EngineEvent::LoadStarted(id),
+            LoadStatus::Complete => EngineEvent::LoadFinished(id),
             // 0.8.0 added Stopped (the load ended early, e.g. via
             // window.stop() inside the page). Surfaced as its own event
             // so the UI can tell "stopped" from "finished".
-            LoadStatus::Stopped => EngineEvent::LoadStopped,
+            LoadStatus::Stopped => EngineEvent::LoadStopped(id),
             // HeadParsed is not surfaced: the UI only cares about
             // started/finished/stopped.
             LoadStatus::HeadParsed => return,
@@ -301,20 +311,22 @@ impl WebViewDelegate for FrostDelegate {
         let _ = self.tx.send(event);
     }
 
-    fn notify_new_frame_ready(&self, _webview: WebView) {
-        let _ = self.tx.send(EngineEvent::FrameReady);
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        let _ = self.tx.send(EngineEvent::FrameReady(webview.id()));
     }
 
-    fn notify_crashed(&self, _webview: WebView, reason: String, _backtrace: Option<String>) {
-        let _ = self.tx.send(EngineEvent::Crashed(reason));
+    fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
+        let _ = self
+            .tx
+            .send(EngineEvent::Crashed(webview.id(), reason));
     }
 
     /// Round 13 (Snowplow): every HTTP fetch reaches the embedder
     /// here first. Blocked tracker/ad subresources are cancelled
     /// (a fast network error); everything else is dropped untouched,
     /// which the responder translates to "do not intercept".
-    fn load_web_resource(&self, _webview: WebView, load: servo::WebResourceLoad) {
-        snowplow::handle_load(load, &self.snowplow.borrow(), &self.tx);
+    fn load_web_resource(&self, webview: WebView, load: servo::WebResourceLoad) {
+        snowplow::handle_load(load, &self.snowplow.borrow(), &self.tx, webview.id());
     }
 }
 
@@ -416,6 +428,13 @@ pub struct FrostWebView {
 }
 
 impl FrostWebView {
+    /// This webview's id (Round 14): the delegate tags every
+    /// [`EngineEvent`] with it, so the UI can route events to
+    /// the right split-view pane.
+    pub fn id(&self) -> WebViewId {
+        self.inner.id()
+    }
+
     /// Navigate the main frame to `url`.
     pub fn load(&self, url: &str) -> Result<(), EngineError> {
         let url = Url::parse(url).map_err(|e| EngineError::InvalidUrl(e.to_string()))?;

@@ -738,3 +738,88 @@ attempt hit "Disk quota exceeded"). Deleting
 restored the link. Before the next big build, check `df`
 — and never extract large things to /tmp (512 MB tmpfs)
 or let `target/` grow unchecked.
+
+## Round 14 — Split view (two webviews, one window)
+
+The app owns one webview per pane, not one per window.
+`Frost` holds `panes: Vec<Pane>`, `active_pane: usize`,
+and `split: bool`. `Pane` (`crates/frost/src/app.rs:453`)
+is everything that used to be app-level per page: its
+`FrostWebView`, the Round 6 frame strips, `loading`,
+`title`, `status`, the Round 13 `snowplow_blocked` count,
+`can_back` / `can_forward`, `awaiting_load`,
+`loading_since`, and `injected_for`. The single-view
+path is the same shape with one pane, so no
+single-view behavior changed shape — it just reads
+through `active_pane()` / `active_pane_mut()` now. The
+old `Frost::webview` / `loading` / `status` fields are
+gone; `load_url_in_main` (`app/windows.rs`) loads in the
+active pane and marks it loading via `Pane::mark_loading`
+(Round 4, F-008: Stop stays live even if the load never
+reports a start).
+
+Routing: the engine tags every event with the webview it
+came from. All `EngineEvent` variants carry a `WebViewId`
+first (`TitleChanged`, `UrlChanged`, `LoadStarted`,
+`LoadFinished`, `LoadStopped`, `FrameReady`,
+`ResourceBlocked`, `Crashed`); the delegate reads it off
+`webview.id()` in each notify callback, `FrostWebView::id()`
+exposes it, and `servo::WebViewId` is re-exported for the
+UI. The tick drains events and looks the id up in the
+panes (a pane is found by matching webview id, not by
+index — indices shift when a pane closes). Snowplow's
+`handle_load` takes the id so `ResourceBlocked` lands on
+the right pane's count; the status line shows the ACTIVE
+pane's count only. The count resets per pane on
+`LoadStarted` and `UrlChanged`, as in Round 13.
+
+Geometry is pure functions, unit-tested (3 new tests:
+`split_pane_rects_tile_the_content_area`,
+`pane_at_point_picks_the_half`,
+`pane_viewport_size_subtracts_the_border_when_split`).
+`split_pane_rects` splits the content rect 50/50 (left
+takes `floor(width / 2)`, right the rest — no lost pixel
+on odd widths, no gap, no overlap). `pane_at_point`
+picks the pane for a click (0 in single view).
+`pane_viewport_size` is the pane rect minus 2×PANE_BORDER
+(2 px) on each side while split — the border is
+layout-neutral in iced, so the viewport math already
+accounts for it; the single-view viewport is the whole
+content area, as before. The active pane's border is the
+theme border color; the inactive pane draws the same
+2 px border transparent, so activation never shifts
+layout. `resize_panes` re-sizes both webviews after any
+split/close/resize.
+
+Lifecycle: `toggle_split` opens the second pane on the
+active pane's URL (homepage fallback) with the new
+webview's theme set before first paint; closing keeps
+the ACTIVE pane and `Vec::remove`s the other, whose
+`FrostWebView` drop closes it in the engine
+(`Drop for WebViewInner` sends `CloseWebView`) — no
+pipeline survives a close. The menu entry (index 5 in
+`MENU_ITEMS`, dynamic label via `SPLIT_MENU_INDEX`) and
+the palette entry (`palette_commands_for` takes `split`)
+both send `Message::ToggleSplit`.
+
+Finisher fixes (gating finds, same patterns as the
+surrounding code): the `ToggleSplit` arm now closes the
+menu and the palette before toggling — it was the only
+command arm that closed neither, so the dropdown stayed
+open over the new split. And `handle_iced_event_captured`
+gained an F12 branch mirroring the subscription's F12
+handler: a focused text input captures every KeyPressed,
+so F12 from the address bar never reached the
+subscription (the Round 9 Ctrl+K shape, fixed the same
+way); an event is Captured or Ignored, never both, so it
+fires once. The stale "Capturing…" status after an
+Inspector capture is still there (Round 7 wart).
+
+Build note: the plain 2 GB debug link OOM-killed twice
+in the sandbox this round (`ld` signal 9; ~6 GiB cell,
+host under memory pressure) and a runtime restart killed
+a retry mid-link. The gate binary was linked with
+`-C link-arg=-Wl,--strip-debug` via `cargo rustc -p frost
+--bins` (517 MB, same code, no debuginfo). No profile
+change shipped; the zip's source builds the normal dev
+binary.

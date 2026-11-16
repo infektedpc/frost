@@ -447,21 +447,21 @@ impl Frost {
         }
     }
 
-    /// Load a URL in the main webview with the same in-flight
+    /// Load a URL in the ACTIVE pane with the same in-flight
     /// ceremony as the address bar (Round 4, F-008: mark the load now
     /// so Stop stays live if the first response never arrives).
     pub fn load_url_in_main(&mut self, url: &str) {
-        match self.webview.load(url) {
+        match self.active_pane().webview.load(url) {
             Ok(()) => {
-                self.loading = true;
-                self.awaiting_load = true;
-                self.loading_since = Some(std::time::Instant::now());
+                self.active_pane_mut()
+                    .mark_loading(format!("Loading {url} …"));
                 self.address = url.to_string();
                 self.address_editing = false;
                 self.content_focused = true;
-                self.status = format!("Loading {url} …");
             },
-            Err(e) => self.status = format!("Cannot load {url}: {e}"),
+            Err(e) => {
+                self.active_pane_mut().status = format!("Cannot load {url}: {e}");
+            },
         }
     }
 }
@@ -532,7 +532,12 @@ impl Frost {
                         Ok(()) => {
                             self.settings = new;
                             if theme_changed {
-                                self.webview.set_theme(self.settings.theme.is_dark());
+                                // Round 14: the theme reaches EVERY
+                                // pane, not just the active one.
+                                for pane in &self.panes {
+                                    pane.webview
+                                        .set_theme(self.settings.theme.is_dark());
+                                }
                             }
                             // Round 13: the Snowplow toggle applies on
                             // Save, like the theme — the engine flips
@@ -556,7 +561,11 @@ impl Frost {
                     Ok(()) => {
                         self.settings = defaults;
                         if theme_changed {
-                            self.webview.set_theme(self.settings.theme.is_dark());
+                            // Round 14: the theme reaches EVERY pane.
+                            for pane in &self.panes {
+                                pane.webview
+                                    .set_theme(self.settings.theme.is_dark());
+                            }
                         }
                         self.engine
                             .set_snowplow_enabled(self.settings.snowplow);
@@ -615,7 +624,7 @@ impl Frost {
                 let url = match url::Url::from_file_path(&path) {
                     Ok(u) => u.to_string(),
                     Err(()) => {
-                        self.status =
+                        self.active_pane_mut().status =
                             format!("Cannot open {}: not a loadable file path", path.display());
                         return Task::none();
                     },
