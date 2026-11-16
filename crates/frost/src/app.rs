@@ -48,6 +48,25 @@ const TOOLBAR_HEIGHT: f32 = 48.0;
 /// horizontal padding on a 32 px tall button). Same visual size
 /// as before — just square, never oval.
 const TOOLBAR_ICON_SIZE: f32 = 32.0;
+/// Round 12: toolbar glyph size — the Round 11 buttons are round
+/// but the glyphs render small (~10 px) and left-of-center.
+/// libcosmic's TextButton builds its label in a left-aligned row
+/// at the default 14 px font with no alignment control, so the
+/// glyph sits at the button's left edge no matter the bounds.
+/// A 20 px glyph in a 32 px circle reads like a real toolbar
+/// icon (Firefox's are ~16 px in 32–36 px buttons) and still
+/// leaves room around it — the widest glyph, "↻", is ~20 px
+/// wide at this size.
+const TOOLBAR_GLYPH_SIZE: f32 = 20.0;
+/// Round 12: the ❮/❯ chevrons' ink sits ~2 px low in the em
+/// next to ↻/☰/✕ at the same size (measured from pixels, and
+/// from the font metrics — their ink center is ~2 px below the
+/// reload/menu glyphs' at 20 px), so the chevron buttons nudge
+/// their glyphs up by this much. The nudge is applied as bottom
+/// padding on the glyph container (see `round_icon_button`):
+/// padding shrinks the centered area from the bottom, so the
+/// glyph sits higher by half the padding.
+const TOOLBAR_CHEVRON_NUDGE_UP: f32 = 2.0;
 const STATUS_HEIGHT: f32 = 28.0;
 /// Hamburger menu dropdown panel (Round 8): a compact Firefox-style
 /// panel anchored top-right under the ☰ button, floating over the
@@ -162,17 +181,40 @@ fn titlebar_height_for(client_decorations: bool) -> f32 {
     }
 }
 
-/// Round 11: make a toolbar icon button round — square
-/// TOOLBAR_ICON_SIZE bounds with zero padding, so the glyph
-/// sits centered in the circle instead of in a pill. The
-/// button keeps whatever style and on_press the caller set;
-/// only the geometry changes.
+/// Round 12: a toolbar icon button with its glyph big and
+/// centered. Built on libcosmic's `button::custom` — the same
+/// Button widget and theme classes as `button::standard`, so
+/// hover/pressed/disabled look identical — with a 32×32
+/// container that centers the glyph both ways. TextButton
+/// cannot do this: its label lives in a left-aligned row at
+/// 14 px (see `src/widget/button/text.rs` in the vendored
+/// libcosmic source, pinned rev ecc5fe4 — the row is only
+/// `.align_y(Center)`, and the Builder exposes no horizontal
+/// alignment), which is exactly why the Round 11 glyphs sat
+/// small at the left edge of their circles. The caller sets
+/// the class and on_press, as before. `nudge_up` shifts the
+/// glyph up by that many px (0.0 for most glyphs): bottom
+/// padding shrinks the container's centered area from the
+/// bottom, so the glyph sits higher by half the padding.
+/// Needed for glyphs whose ink sits low in the em — the ❮/❯
+/// chevrons sit ~2 px low next to ↻/☰/✕ at the same size.
 fn round_icon_button<'a>(
-    b: button::TextButton<'a, Message>,
-) -> button::TextButton<'a, Message> {
-    b.width(Length::Fixed(TOOLBAR_ICON_SIZE))
+    label: &'static str,
+    class: button::ButtonClass,
+    nudge_up: f32,
+) -> button::Button<'a, Message> {
+    let bottom_pad = (2.0 * nudge_up).max(0.0) as u16;
+    let glyph = container(text(label).size(TOOLBAR_GLYPH_SIZE))
+        .width(Length::Fixed(TOOLBAR_ICON_SIZE))
+        .height(Length::Fixed(TOOLBAR_ICON_SIZE))
+        .align_x(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center)
+        .padding(iced::Padding::from([0u16, 0u16, bottom_pad, 0u16]));
+    button::custom(glyph)
+        .width(Length::Fixed(TOOLBAR_ICON_SIZE))
         .height(Length::Fixed(TOOLBAR_ICON_SIZE))
         .padding(iced::Padding::from([0u16, 0u16]))
+        .class(class)
 }
 
 /// Round 11: the merged reload/stop button — which glyph and
@@ -1652,8 +1694,18 @@ impl cosmic::Application for Frost {
         // is always live: reload when idle, stop while a load is
         // in flight (Round 11). All four icon buttons are round
         // (Round 11).
+        // Round 12: proper chevrons (❮/❯, U+276E/U+276F) instead
+        // of the single guillemets (‹/›) — the guillemets' ink
+        // is only ~6×9 px at 20 px and sits low, which is the
+        // "icons aren't right" Joel reported; the heavy chevrons
+        // are ~12×21 px and read as real toolbar icons. Their
+        // ink sits ~2 px low, corrected by the nudge.
         let back = {
-            let b = round_icon_button(button::standard("‹"));
+            let b = round_icon_button(
+                "❮",
+                button::ButtonClass::Standard,
+                TOOLBAR_CHEVRON_NUDGE_UP,
+            );
             if self.can_back {
                 b.on_press(Message::Back)
             } else {
@@ -1661,7 +1713,11 @@ impl cosmic::Application for Frost {
             }
         };
         let forward = {
-            let b = round_icon_button(button::standard("›"));
+            let b = round_icon_button(
+                "❯",
+                button::ButtonClass::Standard,
+                TOOLBAR_CHEVRON_NUDGE_UP,
+            );
             if self.can_forward {
                 b.on_press(Message::Forward)
             } else {
@@ -1674,14 +1730,16 @@ impl cosmic::Application for Frost {
         // when the load finishes and when the user stops it.
         let (reload_stop_label, reload_stop_message) = reload_stop_button(self.loading);
         let reload_stop =
-            round_icon_button(button::standard(reload_stop_label))
+            round_icon_button(reload_stop_label, button::ButtonClass::Standard, 0.0)
                 .on_press(reload_stop_message);
         // ☰ button: the suggested (accent) style while the menu is
         // open is the pressed/active state; standard otherwise.
         let menu_button = if self.menu_open {
-            round_icon_button(button::suggested("☰")).on_press(Message::ToggleMenu)
+            round_icon_button("☰", button::ButtonClass::Suggested, 0.0)
+                .on_press(Message::ToggleMenu)
         } else {
-            round_icon_button(button::standard("☰")).on_press(Message::ToggleMenu)
+            round_icon_button("☰", button::ButtonClass::Standard, 0.0)
+                .on_press(Message::ToggleMenu)
         };
         let toolbar_row = widget::row::with_children(vec![
             back.into(),
@@ -2243,6 +2301,35 @@ mod tests {
         // visual size — square, never oval.
         assert_eq!(TOOLBAR_ICON_SIZE, TOOLBAR_HEIGHT - 2.0 * 8.0);
         assert_eq!(TOOLBAR_ICON_SIZE, 32.0);
+    }
+
+    #[test]
+    fn toolbar_glyph_is_bigger_than_the_old_textbutton_default() {
+        // Round 12: the Round 11 glyphs rendered ~10 px tall
+        // because libcosmic's TextButton labels at 14 px, and
+        // sat at the button's left edge. The glyph must be
+        // clearly larger than that default, and still fit
+        // inside the 32 px circle with room to spare on every
+        // side (centering itself is verified by the gate
+        // screenshots, not by a unit test).
+        assert!(TOOLBAR_GLYPH_SIZE > 14.0);
+        assert_eq!(TOOLBAR_GLYPH_SIZE, 20.0);
+        assert!(TOOLBAR_GLYPH_SIZE < TOOLBAR_ICON_SIZE);
+        assert!(TOOLBAR_ICON_SIZE - TOOLBAR_GLYPH_SIZE >= 12.0);
+    }
+
+    #[test]
+    fn toolbar_chevron_nudge_is_small_and_positive() {
+        // Round 12: the ❮/❯ chevrons' ink sits ~2 px low in
+        // the em next to ↻/☰/✕ at the same size, so their
+        // buttons nudge the glyph up by this much. The nudge
+        // must be positive but small — a big nudge would push
+        // the glyph off-center the other way, and the bottom
+        // padding it turns into (2× the nudge) must leave the
+        // glyph room inside the 32 px button.
+        assert!(TOOLBAR_CHEVRON_NUDGE_UP > 0.0);
+        assert_eq!(TOOLBAR_CHEVRON_NUDGE_UP, 2.0);
+        assert!(2.0 * TOOLBAR_CHEVRON_NUDGE_UP < TOOLBAR_GLYPH_SIZE);
     }
 
     #[test]

@@ -606,3 +606,64 @@ sequence passes on the same binary, so the stuck state is a
 pre-existing engine-side quirk (Round 4 F-008 abort + Servo 0.8
 constellation session history), not something this round's
 toolbar change can cause or fix app-side.
+
+## Toolbar glyphs: bigger + centered (Round 12)
+
+Round 11 made the toolbar buttons circles, but the glyphs
+inside them were small (~10 px) and left-of-center — Joel's
+0.11.0 verdict. The cause is in libcosmic's `TextButton`
+(vendored source, pinned rev `ecc5fe4`, `src/widget/button/text.rs`):
+the label lives in an inner row that is only
+`.align_y(Alignment::Center)` — horizontal layout is
+left-aligned by default — at the default 14 px font / 20 px
+line height, with no horizontal-alignment control exposed on
+the Builder. Square bounds + zero padding cannot center a
+label that the widget itself left-aligns. (Read `ecc5fe4`,
+not the stale `9c62f19` checkout in the same directory: in
+`ecc5fe4` the style API is `button::ButtonClass` with the
+widget method `.class()`; `button::Style` is the iced
+catalog `Style` struct.)
+
+The fix keeps the same `Button` widget and theme classes
+and changes only the content: `round_icon_button()` builds
+on `button::custom` with a 32×32 `container` holding
+`text(label).size(TOOLBAR_GLYPH_SIZE)` (20.0) and
+`.align_x(Alignment::Center)` + `.align_y(Alignment::Center)`,
+outer button 32×32 + zero padding + `.class(class)`.
+Hover/pressed/disabled rendering is unchanged because the
+widget and the class are unchanged.
+
+Two glyph facts, both measured from pixels:
+
+- Back/forward used the single guillemets ‹/›, which are
+  quotation marks: their ink is ~6×9 px at 20 px and sits
+  ~3 px low in the em (4×8 px ink, dy +3.0 on the Round 11
+  build). They are now the proper heavy chevrons ❮/❯
+  (U+276E/U+276F), ~10×20 px ink at the same 20 px size.
+  The chevrons come from the DejaVu Sans fallback font
+  (Noto Sans, the sandbox's default sans, has no U+276E;
+  the other toolbar glyphs ↻/☰/✕ fall back to DejaVu too,
+  so the toolbar already mixed fonts — the swap makes
+  back/forward match the others' source font as well).
+- ❮/❯ ink still sits ~2 px low next to ↻/☰/✕ at the same
+  size, so the chevron buttons pass
+  `TOOLBAR_CHEVRON_NUDGE_UP = 2.0` to `round_icon_button`,
+  which applies it as bottom padding on the glyph
+  container: padding shrinks the centered area from the
+  bottom, so the glyph sits higher by half the padding.
+  Reload/stop and ☰ pass 0.0. Gated result on the final
+  binary: every glyph's bbox center within 0.5 px of its
+  button's center, in both WM mode and the GNOME fallback
+  (toolbar offset 40 px). The GNOME titlebar's own
+  min/max/close glyphs render centered and are untouched.
+
+Correction to Round 11's note above: the enabled/disabled
+shade DOES differ measurably — disabled buttons render
+(58,57,65), enabled (72,71,78) — so the button shade is a
+usable can_back read after all. Round 12 gating also
+reproduced the stuck-history quirk in a hang → stop →
+same-URL-reload → stop instance (palette hides "Go back" /
+"Go forward", the following navigation never commits);
+the clean sequence passes on the same binary, so the
+history path is intact and the quirk is unchanged from
+Round 11.

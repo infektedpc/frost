@@ -5,13 +5,14 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 11 — merged reload/stop button + round toolbar icons.**
-Reload and stop are one button now (reload icon while idle, X while
-loading, flips back on finish or on stop), and the toolbar buttons
-are true circles (square 32 px bounds, the theme's corner radius
-already past half the side). Tests 58/58 (baseline 56/56 + 2 new
-toolbar tests). No fork patch; the fork is untouched at
-`f9462dbb7`. See [ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 12 — toolbar glyphs fixed.** The toolbar icons
+are proper, bigger, centered glyphs now: 20 px text in a
+centered container (libcosmic's TextButton left-aligns its
+label at the 14 px default), and back/forward use proper ❮/❯
+chevrons with a 2 px upward nudge for their low ink. Tests
+60/60 (baseline 58/58 + 2 new Round 12 tests). No fork patch;
+the fork is untouched at `f9462dbb7`. See
+[ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -1395,6 +1396,185 @@ identically in every shot, so the palette (not the button
 shade) is the reliable can_back read; and the gate log being
 quiet proves nothing, because it is block-buffered when
 redirected.
+
+Carried over, unchanged: the stale "Capturing…" status after
+a capture (Round 7); the Inspector "Back to the page" hit
+area sitting ~15 px above its visual rect — the OS close
+works (Round 9); Settings has no in-content Close button
+(OS close works, and in WM mode the popup has a real WM
+close button); theme applies on Save, not per click. Not
+verified in the sandbox, as before: real mouse/keyboard,
+mouse-wheel scroll over the page, drag latency, the Round 6
+flashing fix on real hardware, and the WM-drawn titlebar
+itself (look, real min/max/close) — bare Xvfb has no window
+manager, so Joel's KDE box is the verdict for those.
+
+## Round 12 — toolbar glyphs bigger + centered (what is proven, what is not)
+
+Joel installed the 0.11.0 .deb on his KDE box: everything
+looked good except the icons. The toolbar buttons were
+round (Round 11 geometry worked), but the glyphs were small
+(~10 px) and sat left-of-center in the 32×32 circles, with
+empty dark space to the right of each glyph. The defect
+reproduced in the sandbox (`r11-01-toolbar-zoom.jpg` shows
+the same small left-shifted glyphs), so the fix was iterated
+and verified here. No fork patch; the fork is untouched at
+`f9462dbb7`. One file changed, `crates/frost/src/app.rs`.
+
+Root cause, proven from the vendored libcosmic source
+(pinned rev `ecc5fe4` — the `9c62f19` checkout in the same
+directory is stale and must not be read): libcosmic's
+`button::standard` / `button::suggested` build a `TextButton`
+whose label lives in an inner row that is only
+`.align_y(Alignment::Center)` — horizontal layout is
+left-aligned by default — at the default 14 px font / 20 px
+line height, with no horizontal-alignment control exposed
+on the Builder. Round 11 set 32×32 bounds + zero padding,
+so the glyph sat at the button's left edge no matter the
+bounds. The fix does not fight `TextButton`: `round_icon_button()`
+now builds on libcosmic's `button::custom` — the same
+`Button` widget and the same theme classes as
+`button::standard`, so hover/pressed/disabled look identical
+— with a 32×32 `container` holding `text(label)` at an
+explicit `TOOLBAR_GLYPH_SIZE: f32 = 20.0` and
+`.align_x(Alignment::Center)` + `.align_y(Alignment::Center)`,
+outer button 32×32 + zero padding + `.class(class)`.
+
+What changed:
+
+- Glyph size + centering, all four toolbar buttons: 20 px
+  text, explicitly centered both ways. Measured from pixels
+  (see gates): every glyph's bounding-box center is within
+  0.5 px of its button's center.
+- Back/forward glyph swap: the single guillemets ‹/› are
+  quotation marks, not chevrons — their ink is only ~6×9 px
+  at 20 px and sits ~3 px low in the em (measured: 4×8 px
+  ink, dy +3.0 on the Round 11 build). Back/forward now use
+  the proper heavy chevrons ❮/❯ (U+276E/U+276F), ~10×20 px
+  ink at the same 20 px size, which read as real toolbar
+  icons next to ↻/☰/✕. Same glyph family as before
+  (chevrons), just the typographically correct ones.
+- Chevron nudge: ❮/❯ ink still sits ~2 px low next to
+  ↻/☰/✕ at the same size (font metrics: their ink center
+  is ~2 px below the reload/menu glyphs'), so the chevron
+  buttons nudge their glyphs up by
+  `TOOLBAR_CHEVRON_NUDGE_UP: f32 = 2.0`, applied as bottom
+  padding on the glyph container (padding shrinks the
+  centered area from the bottom, so the glyph sits higher by
+  half the padding). Reload/stop and ☰ use a 0.0 nudge.
+- Same 32×32 round geometry and the same hit areas; the ☰
+  menu button gets the fix automatically (it shares
+  `round_icon_button`). The GNOME-fallback titlebar's
+  min/max/close buttons were measured in the GNOME gate and
+  are fine — their glyphs render centered — so they are
+  untouched.
+
+Tests 60/60 (baseline 58/58 + 2 new: the glyph size is
+bigger than the old 14 px TextButton default and fits the
+32 px circle, and the chevron nudge is small and positive).
+Build green in 36m 15s serialized. (The first build attempt
+was SIGTERM'd mid-link by a runtime restart after ~34 min;
+cargo resumed from cached artifacts. The restart also
+killed Xvfb :97 and the hang server; both were restarted
+before gating.)
+
+Gates, all on the final binary (Xvfb :97, 1280×800), with a
+new pixel measurement script (`measure12.py` in the harness
+dir — it finds the four 32×32 button circles from pixels
+instead of assuming positions, then measures each glyph's
+bright-pixel bbox against its button's true center):
+
+- Launch (`r12-01-launch.jpg`, `r12-01-toolbar-zoom.png`):
+  example.org fully painted, banner live. Measured offsets
+  (button → glyph): back 10×20 px, dx +0.0, dy +0.0;
+  forward 10×20 px, dx +0.0, dy +0.0; reload/stop 15×12 px,
+  dx −0.5, dy +0.0; menu 14×15 px, dx +0.0, dy −0.5. The
+  chevrons went from 4×8 px at dy +3.0 (Round 11 build,
+  measured with the same script) to 10×20 px dead-center.
+  The zoom shows big bold chevrons, centered, matching ↻
+  in visual weight.
+- Flip, hanging load (`r12-02-loading.jpg`,
+  `r12-03/03b/03c-stopped*.jpg`): navigate to the
+  never-responding server on 127.0.0.1:18099 → button shows
+  ✕ (11×11 px, dx −0.5, dy −0.5, centered) → click ✕ → load
+  stops → button flips back to ⟳ (15×12 px, dx −0.5,
+  dy +0.0), status bar back to "Example Domain". The flip
+  took three clicks to observe, not one: the stop's UI
+  update lagged ~15 s+ under SwiftShader, so the second
+  click landed on the (already flipped, not yet repainted)
+  ↻ button and reloaded the hang URL; the third click
+  stopped that reload. The flip itself works; the lesson is
+  to wait 30 s after a stop click before screenshotting.
+- Back/Forward, clean sequence on a fresh instance
+  (`r12-11/12/13-clean-*.jpg`): example.org → example.com
+  (banner correctly absent on .com) → Back click →
+  example.org with the banner back → Forward click →
+  example.com, no banner. The palette agrees: it lists
+  "Go back" on the clean instance (`r12-15-palette.jpg`).
+- Menu (`r12-14-menu.jpg`): all six entries (Settings,
+  Print page…, Open file…, Inspector F12, Command palette…
+  Ctrl+K, Exit), separators, ☰ pressed state; Escape closes.
+- Ctrl+K palette (`r12-15-palette.jpg`, and
+  `r12-07-palette-poisoned.jpg` on the first instance):
+  opens, lists the available commands, Enter runs; on the
+  poisoned instance it correctly hid "Go back" / "Go
+  forward" (see the anomaly note below).
+- Settings save + persist (`r12-16-settings.jpg`,
+  `r12-17-relaunch-persist.jpg`): homepage set to
+  https://example.com, matching JSON on disk; relaunch opens
+  example.com with the banner correctly absent.
+- Banner on .org / absent on .com (launch vs .com shots).
+- Inspector F12 (`r12-18-inspector.jpg`): real 33-node
+  snapshot of example.com, label/tree/Back/Re-capture;
+  closed cleanly via the OS close button, Frost alive.
+- Strip-scroll (`r12-21/23-bands-*.jpg`): the 10-band page
+  fully painted at the top (BAND 1/2), Space scrolls to
+  BAND 2/3/4 fully painted, no blank frame. (The first
+  Space press did nothing because keyboard focus was still
+  on the address bar after the navigation — clicking the
+  page first moves focus into the webview. Harness quirk,
+  same class as Round 9's PageDown note.)
+- `frost://settings` fails plainly (`r12-24-frosturl.jpg`):
+  the honest status message, page left alone (bands page,
+  fully painted). `ss` shows no Frost listener (only
+  127.0.0.1:18099, the hang server, and 127.0.0.1:9999,
+  the ps_server watchdog).
+- GNOME fallback (`r12-25-gnome.jpg`,
+  `r12-25-titlebar-zoom.png`): `XDG_CURRENT_DESKTOP=GNOME`
+  — Frost's own 40 px titlebar ("Frost — Example Domain"
+  plus min/max/close) is back, with the new toolbar under
+  it; measured with `--titlebar-offset 40`: back 10×20 px
+  dx +0.0 dy +0.0, forward 10×20 px dx +0.0 dy +0.0,
+  reload/stop 15×12 px dx −0.5 dy +0.0, menu 14×15 px
+  dx +0.0 dy −0.5. The titlebar's own −/▢/✕ glyphs render
+  centered in their circles, so they needed no fix.
+
+The Back anomaly, reproduced, still not a Round 12
+regression: the first gate instance showed the same stuck
+history as Round 11's first instance — after
+example.org → hang → stop → reload (same URL) → stop →
+example.com, the palette showed no "Go back" / "Go
+forward" (can_back/can_forward false) for every navigation
+after the stop, the .com navigation never committed (the
+banner stayed visible on .com), and Back clicks did
+nothing. The Round 12 diff touches nothing in the
+history/navigation path (one file, toolbar view + helpers
++ tests), and the same binary passes Back/Forward on the
+clean sequence (above), so the round did not break history.
+It is the same pre-existing engine-side quirk (Round 4
+F-008 abort + Servo 0.8 constellation session history),
+recorded here, not fixed in this round. Two corrections
+from this round's measurements: (1) the enabled/disabled
+shade DOES differ measurably — disabled buttons render
+(58,57,65), enabled (72,71,78) — so the button shade is a
+usable can_back read after all (Round 11's "does not
+visibly differ" was wrong at pixel level); (2) the gate
+log being quiet proves nothing (block-buffered when
+redirected). Harness notes: `xclose` needs `DISPLAY=:97`
+in its environment (the first two calls without it failed
+with "cannot open display"); `r12-launch.sh` does not set
+`XDG_CURRENT_DESKTOP`, so the first GNOME attempt ran in
+WM mode — the GNOME script adds the export.
 
 Carried over, unchanged: the stale "Capturing…" status after
 a capture (Round 7); the Inspector "Back to the page" hit
