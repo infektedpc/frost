@@ -242,7 +242,11 @@ No new features — this round finishes what Round 3 left open:
 - Round 10 (done 2026-11-16, ahead of the order at Joel's pick):
   WM titlebar with GNOME fallback — the window manager draws the
   titlebar by default; Frost's own bar survives only as the GNOME
-  fallback. Then: Snowplow network-layer blocking, split view,
+  fallback.
+- Round 11 (done 2026-11-16, ahead of the order at Joel's pick):
+  merged reload/stop button (⟳ idle, ✕ loading, flips back on
+  finish or stop) + round toolbar icons (square 32 px bounds).
+  Then: Snowplow network-layer blocking, split view,
   Deep Freeze offline archive, Frostbite tab hibernation (needs a
   tab system first), Snowdrift workspaces (needs tabs + sessions +
   persistence — biggest). Inspector v2 (docked panel,

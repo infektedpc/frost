@@ -555,3 +555,54 @@ FORK.md):
   click-to-inspect from the page (that needs a docked panel inside the
   live page — v2), no console, no network panel, no shadow DOM / iframe
   sub-documents / comments.
+
+## Merged reload/stop button + round toolbar icons (Round 11)
+
+The toolbar's reload and stop buttons are one button now, and all
+four toolbar icon buttons are circles. Both changes live in
+`crates/frost/src/app.rs` only; the fork is untouched.
+
+The merged button is a pure function of the `loading` flag Frost
+already tracks (true on navigation request, false on
+LoadFinished / LoadStopped, Round 4 / F-008):
+`reload_stop_button(loading)` maps idle → ("⟳", `Message::Reload`)
+and loading → ("✕", `Message::Stop`). The view renders whichever
+the flag says, so the icon flips back to ⟳ in both end states
+without any extra bookkeeping. The command palette's Reload /
+Stop loading entries already hide/show by the same flag and were
+not touched; keyboard reload is untouched (F5 is forwarded to the
+page via `send_key`, there is no app-level F5/Ctrl+R handler).
+
+The roundness fix is a geometry fact, not a style change. The
+pill shape came only from wider-than-tall bounds: a libcosmic
+`button::standard` wraps its label in `space_s` (16 px) of
+horizontal padding, so a 32 px tall button with a glyph was ~64 px
+wide. The theme's button corner radius `radius_xl = [160.0; 4]`
+(cosmic-theme `corner.rs`) is already far past half of a 32 px
+side, so the radius was never the constraint — the bounds were.
+`round_icon_button()` therefore does the whole job with square
+32×32 bounds (`TOOLBAR_ICON_SIZE`, the toolbar inner height: the
+48 px row minus 2×8 px row padding) and zero padding, keeping the
+caller's style and `on_press`. No `Button::Custom` style was
+needed. The GNOME-fallback titlebar's min/max/close buttons were
+already circular and are untouched; the address bar is a text
+field, not an icon button, and stays as-is. Menu geometry and
+`content_rect()` go through `titlebar_height()` as before, so the
+panel still anchors 4 px under the toolbar in both WM and
+fallback modes.
+
+History state, for the record: `can_back` / `can_forward` are
+refreshed only in `handle_engine_event` on `EngineEvent::UrlChanged`,
+read from `webview.can_go_back()` / `can_go_forward()` — which read
+Servo's `back_forward_list_index`, updated in `set_history` before
+`notify_url_changed` fires, so the ordering is correct at the
+engine level. The palette hides "Go back" / "Go forward" when the
+flags are false, which makes it the reliable read of the state
+(the button's enabled/disabled shade does not visibly differ in
+this theme). Round 11 gating found one session where the flags
+stayed false after a stop-plus-same-URL-re-navigation-plus-Back-
+during-load interleaving; the minimal hang → stop → navigate
+sequence passes on the same binary, so the stuck state is a
+pre-existing engine-side quirk (Round 4 F-008 abort + Servo 0.8
+constellation session history), not something this round's
+toolbar change can cause or fix app-side.

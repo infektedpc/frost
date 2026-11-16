@@ -39,6 +39,15 @@ use windows::{InspectorWindow, OpenWindow, PopupMessage, PrintWindow, SettingsWi
 /// glyphs, so the buttons are always visible.
 const TITLEBAR_HEIGHT: f32 = 40.0;
 const TOOLBAR_HEIGHT: f32 = 48.0;
+/// Round 11: toolbar icon buttons are round, not pill-shaped —
+/// square 32 px bounds, the toolbar's inner height (48 px row
+/// minus 2×8 px row padding). The theme's button corner radius
+/// (radius_xl = 160) is already far past half the side, so a
+/// square button renders as a circle; the pill shape came only
+/// from the wider-than-tall bounds (glyph + 2×space_s of
+/// horizontal padding on a 32 px tall button). Same visual size
+/// as before — just square, never oval.
+const TOOLBAR_ICON_SIZE: f32 = 32.0;
 const STATUS_HEIGHT: f32 = 28.0;
 /// Hamburger menu dropdown panel (Round 8): a compact Firefox-style
 /// panel anchored top-right under the ☰ button, floating over the
@@ -150,6 +159,35 @@ fn titlebar_height_for(client_decorations: bool) -> f32 {
         TITLEBAR_HEIGHT
     } else {
         0.0
+    }
+}
+
+/// Round 11: make a toolbar icon button round — square
+/// TOOLBAR_ICON_SIZE bounds with zero padding, so the glyph
+/// sits centered in the circle instead of in a pill. The
+/// button keeps whatever style and on_press the caller set;
+/// only the geometry changes.
+fn round_icon_button<'a>(
+    b: button::TextButton<'a, Message>,
+) -> button::TextButton<'a, Message> {
+    b.width(Length::Fixed(TOOLBAR_ICON_SIZE))
+        .height(Length::Fixed(TOOLBAR_ICON_SIZE))
+        .padding(iced::Padding::from([0u16, 0u16]))
+}
+
+/// Round 11: the merged reload/stop button — which glyph and
+/// message it shows for a given loading state. Pure, so the
+/// mapping is unit-testable; view() just renders it. The
+/// button is always live: reload when idle, stop while a load
+/// is in flight. It flips back to reload in both end states —
+/// load finished and load stopped — because both clear
+/// `self.loading` (see EngineEvent::LoadFinished /
+/// LoadStopped).
+fn reload_stop_button(loading: bool) -> (&'static str, Message) {
+    if loading {
+        ("✕", Message::Stop)
+    } else {
+        ("⟳", Message::Reload)
     }
 }
 
@@ -1607,12 +1645,15 @@ impl cosmic::Application for Frost {
             .width(Length::Fill)
             .height(Length::Fixed(TITLEBAR_HEIGHT));
 
-        // Toolbar: back / forward / reload / stop, address bar, menu.
-        // Back/forward/stop only get an on_press when they can act —
-        // without one the button renders disabled, never live-looking
-        // while doing nothing.
+        // Toolbar: back / forward / reload-or-stop, address bar,
+        // menu. Back/forward only get an on_press when they can
+        // act — without one the button renders disabled, never
+        // live-looking while doing nothing. The reload/stop slot
+        // is always live: reload when idle, stop while a load is
+        // in flight (Round 11). All four icon buttons are round
+        // (Round 11).
         let back = {
-            let b = button::standard("‹");
+            let b = round_icon_button(button::standard("‹"));
             if self.can_back {
                 b.on_press(Message::Back)
             } else {
@@ -1620,33 +1661,32 @@ impl cosmic::Application for Frost {
             }
         };
         let forward = {
-            let b = button::standard("›");
+            let b = round_icon_button(button::standard("›"));
             if self.can_forward {
                 b.on_press(Message::Forward)
             } else {
                 b
             }
         };
-        let stop = {
-            let b = button::standard("✕");
-            if self.loading {
-                b.on_press(Message::Stop)
-            } else {
-                b
-            }
-        };
+        // Round 11: one reload/stop button — the reload icon
+        // while idle, an X while a page is loading (the
+        // Firefox/Chrome pattern). It flips back to reload both
+        // when the load finishes and when the user stops it.
+        let (reload_stop_label, reload_stop_message) = reload_stop_button(self.loading);
+        let reload_stop =
+            round_icon_button(button::standard(reload_stop_label))
+                .on_press(reload_stop_message);
         // ☰ button: the suggested (accent) style while the menu is
         // open is the pressed/active state; standard otherwise.
         let menu_button = if self.menu_open {
-            button::suggested("☰").on_press(Message::ToggleMenu)
+            round_icon_button(button::suggested("☰")).on_press(Message::ToggleMenu)
         } else {
-            button::standard("☰").on_press(Message::ToggleMenu)
+            round_icon_button(button::standard("☰")).on_press(Message::ToggleMenu)
         };
         let toolbar_row = widget::row::with_children(vec![
             back.into(),
             forward.into(),
-            button::standard("⟳").on_press(Message::Reload).into(),
-            stop.into(),
+            reload_stop.into(),
             text_input("Address", &self.address)
                 .id(address_input_id())
                 .on_input(Message::AddressChanged)
@@ -2183,6 +2223,26 @@ mod tests {
                 "Quit Frost",
             ]
         );
+    }
+
+    #[test]
+    fn reload_stop_button_shows_reload_when_idle_and_stop_when_loading() {
+        let (label, message) = reload_stop_button(false);
+        assert_eq!(label, "⟳");
+        assert!(matches!(message, Message::Reload));
+        let (label, message) = reload_stop_button(true);
+        assert_eq!(label, "✕");
+        assert!(matches!(message, Message::Stop));
+    }
+
+    #[test]
+    fn toolbar_icon_size_fills_the_toolbar_inner_height() {
+        // The row is TOOLBAR_HEIGHT tall with 8 px of padding
+        // top and bottom, so the round icon buttons must be
+        // exactly the inner height to keep their current
+        // visual size — square, never oval.
+        assert_eq!(TOOLBAR_ICON_SIZE, TOOLBAR_HEIGHT - 2.0 * 8.0);
+        assert_eq!(TOOLBAR_ICON_SIZE, 32.0);
     }
 
     #[test]

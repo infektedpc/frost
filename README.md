@@ -5,16 +5,13 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 10 — WM titlebar with GNOME fallback.** The window
-manager draws the titlebar by default now (`client_decorations:
-false`); Frost's own 40 px titlebar row is gone on KDE and other
-decorating desktops, and the toolbar is the top row. On GNOME
-(Mutter refuses server-side decorations) Frost keeps drawing its
-own titlebar, chosen once at startup from `XDG_CURRENT_DESKTOP`
-(`XDG_SESSION_DESKTOP` as fallback). Either way the OS window
-title stays in step with the page title. Tests 56/56 (baseline
-53/53 + 3 new titlebar-mode tests). No fork patch; the fork is
-untouched at `f9462dbb7`. See [ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 11 — merged reload/stop button + round toolbar icons.**
+Reload and stop are one button now (reload icon while idle, X while
+loading, flips back on finish or on stop), and the toolbar buttons
+are true circles (square 32 px bounds, the theme's corner radius
+already past half the side). Tests 58/58 (baseline 56/56 + 2 new
+toolbar tests). No fork patch; the fork is untouched at
+`f9462dbb7`. See [ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -1247,3 +1244,132 @@ Proven in the gate (2026-11-16, Xvfb :97, the binary built Nov 16
   running Frost mid-gate (after the first three WM screenshots);
   the gates were re-run from a fresh launch on the same binary —
   no code change, no rebuild.
+
+## Round 11 — merged reload/stop button + round toolbar icons (what is proven, what is not)
+
+Two toolbar changes Joel asked for, done together because they
+touch the same buttons. No fork patch; the fork is untouched at
+`f9462dbb7`. One file changed, `crates/frost/src/app.rs` (+78/−18).
+
+What changed:
+
+- Merged reload/stop: the toolbar had separate reload (⟳) and stop
+  (✕) buttons. There is one button now. It shows ⟳ while idle and
+  ✕ while a page is loading; clicking it reloads when idle and
+  stops the load when loading. It flips back to ⟳ in both end
+  states — load finishes normally, and load stopped by the user.
+  The wiring reuses the `loading` flag Frost already tracks
+  (set true on navigation request, false on LoadFinished /
+  LoadStopped, Round 4 / F-008). `reload_stop_button(loading)`
+  is a pure mapping (idle → ("⟳", Reload), loading → ("✕",
+  Stop)); the command palette's Reload / Stop loading entries
+  already hide/show by the same state and are untouched, and
+  keyboard reload is untouched (F5 is forwarded to the page).
+- Round icons: the toolbar buttons were pill-shaped (wider than
+  tall). They are circles now — square 32×32 bounds
+  (`TOOLBAR_ICON_SIZE: f32 = 32.0`, the toolbar inner height)
+  with zero padding, via a `round_icon_button()` helper used by
+  back, forward, the merged reload/stop button, and the ☰ menu
+  button. The address bar stays as-is (text field); the
+  GNOME-fallback titlebar's min/max/close buttons were already
+  circular and are untouched. The pill shape came only from
+  wider-than-tall bounds (glyph + 2×space_s=16 horizontal
+  padding on a 32 px tall button): the theme's button corner
+  radius `radius_xl = [160.0; 4]` is already far past half the
+  side, so square bounds render as a circle. No custom style
+  was needed (`Button::Custom` exists but was not used). Hit
+  areas are the same visual size as before, just square.
+
+Tests 58/58 (baseline 56/56 + 2 new: the reload/stop mapping in
+both states, and the icon size filling the toolbar inner
+height). Build green in 43m 22s serialized.
+
+Gates, all on the final binary (Xvfb :97, 1280×800):
+
+- Launch (`r11-01-launch.jpg`): example.org fully painted,
+  banner live, toolbar is the top row (WM mode). Roundness
+  measured from the shot pixels, not eyeballed: back x 9..40,
+  forward 49..80, reload/stop 89..120, menu 1232..1263 — all
+  exactly 32 px wide, 32 px tall (y 9..40); all four buttons'
+  centers/tops/lefts are button background and all four corners
+  are toolbar background — true circles. (One naive scan was
+  contaminated by a 1 px top window-border line and by sampling
+  the menu button as the toolbar background; corrected by
+  sampling the background from the row's 8 px left padding.)
+- Flip, hanging load (`r11-02/03/03b`): navigate to the
+  never-responding server on 127.0.0.1:18099 → button shows ✕
+  → click ✕ → load stops → button flips back to ⟳ and the page
+  settles (slow settle under SwiftShader, ~13 s, same as the
+  Round 4 F-008 pattern).
+- Flip, normal load (`r11-04/05`): example.org → ✕ while
+  loading → ⟳ + banner + "Example Domain" on finish.
+- Back/Forward: clean sequence on a fresh instance —
+  example.org → bands file page → palette shows "Go back"
+  (`r11-15`) → palette "Go back" runs, address bar back on
+  example.org (`r11-16`) → toolbar Forward click, address bar
+  back on the bands page (`r11-17`). Post-stop sequence on the
+  same instance — hang → stop → example.com → palette shows
+  "Go back" (`r11-20`) → Back click traverses to the bands
+  page (`r11-21`). The toolbar buttons work; the palette
+  agrees with them.
+- Menu (`r11-22`): all six entries (Settings, Print page…,
+  Open file…, Inspector F12, Command palette… Ctrl+K, Exit),
+  separators, ☰ pressed state; Escape closes it (`r11-23`).
+- Ctrl+K palette opens and runs a command: "Go back" via Enter
+  (`r11-15/16`).
+- Settings save + persist (`r11-28/29/30`): homepage set to
+  https://example.com, "Settings saved.", matching JSON on
+  disk; relaunch opens example.com with the banner correctly
+  absent on .com.
+- Banner on .org / absent on .com (launch vs relaunch shots).
+- Inspector F12 (`r11-25`): real 26-node snapshot of the bands
+  page, label/tree/Back/Re-capture.
+- Strip-scroll (`r11-24`): Space scrolls the 10-band page fully
+  painted (BAND 2/3/4, no blank frame).
+- `frost://settings` fails plainly (`r11-27`): the honest
+  status message, page left alone. `ss` shows no Frost
+  listener (only 127.0.0.1:18099, the hang server, and
+  127.0.0.1:9999, the ps_server watchdog).
+- GNOME fallback (`r11-31`): `XDG_CURRENT_DESKTOP=GNOME` —
+  Frost's own 40 px titlebar ("Frost — Example Domain" plus
+  min/max/close) is back, with the new round-icon toolbar
+  under it.
+
+The Back anomaly, investigated, not a Round 11 regression: the
+first gate instance showed Back doing nothing after the
+sequence example.org → hang → stop → example.org →
+example.com → example.org → bands page — the palette showed
+no "Go back" (can_back false) for every navigation after the
+stop, and two Back clicks did nothing. The Round 11 diff
+touches nothing in the history/navigation path (one file,
+toolbar view + helpers + tests), and the same binary passes
+Back/Forward on the clean sequence and on the hang → stop →
+navigate sequence (above), so the round did not break
+history. The first instance's sequence additionally included
+a same-URL re-navigation (example.org right after the stop,
+when it was already current) and a Back click fired DURING
+the example.com load — one of those interleavings, or their
+combination, left that session's history state stuck; the
+minimal hang → stop → navigate sequence does NOT reproduce
+it. It is a pre-existing engine-side quirk (the stop path is
+Round 4's F-008 fork code plus Servo 0.8's constellation
+session history, untouched since Round 4), recorded here,
+not fixed in this round. Two misreads owned along the way:
+the "dim" back button in the downscaled screenshots was not
+dim at all — pixel measurement shows the button renders
+identically in every shot, so the palette (not the button
+shade) is the reliable can_back read; and the gate log being
+quiet proves nothing, because it is block-buffered when
+redirected.
+
+Carried over, unchanged: the stale "Capturing…" status after
+a capture (Round 7); the Inspector "Back to the page" hit
+area sitting ~15 px above its visual rect — the OS close
+works (Round 9); Settings has no in-content Close button
+(OS close works, and in WM mode the popup has a real WM
+close button); theme applies on Save, not per click. Not
+verified in the sandbox, as before: real mouse/keyboard,
+mouse-wheel scroll over the page, drag latency, the Round 6
+flashing fix on real hardware, and the WM-drawn titlebar
+itself (look, real min/max/close) — bare Xvfb has no window
+manager, so Joel's KDE box is the verdict for those.
