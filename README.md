@@ -184,6 +184,31 @@ button's top edge did not close it; `xclose` closed it cleanly with
 Frost alive. Both are bare-Xvfb harness observations, not packaging
 failures.
 
+### .deb 0.14.0 (Round 14, Debian 13, amd64)
+
+`packaging/build-deb-0.14.0.sh` builds `frost-0.14.0_amd64.deb` (SHA-256
+`5e19ba4761dbbea664f8bb208c9f647c62f258280ada872bf2f6eb9617409778`,
+64,843,612 B; stripped binary 318,835,144 B) from the Round 14 tree
+(HEAD `42e2a96`, same proven gated binary — no rebuild). Same contents:
+`/usr/bin/frost`, desktop file, snowflake icon. Same honest
+stripped-DEBUG note in the Description. Depends were re-derived from
+`ldd` + `/proc` maps of the running Round 14 binary and are
+IDENTICAL to the 0.11.0 list — `libvulkan1` and `libwayland-server0`
+both confirmed present again (wgpu takes the Vulkan path;
+libwayland-server is mapped alongside libwayland-client). The packaged
+binary's BuildID (`6a28b417…13ffe8`) is identical to the tree binary's
+— the .deb really contains the gated Round 14 build. The packaged
+binary was gated from a clean extraction: launch + example.org full
+paint + banner, Ctrl+K palette listing "Split view", split view with
+both panes fully painted + banners, menu with all 7 items and dynamic
+"Close split view" label. Install the same way:
+`sudo dpkg -i frost-0.14.0_amd64.deb` (+ `sudo apt-get install -f`
+only if a dep is missing). Never installed with `dpkg -i` in the
+sandbox — the real install is Joel's-box verdict. Note: the tree
+binary itself was linked with `--strip-debug` (517 MB) because the
+plain 2 GB debug link OOM-killed twice in the sandbox — same code, no
+debuginfo; the source still builds the normal dev binary.
+
 ### .deb 0.11.0 (Round 11, Debian 13, amd64)
 
 `packaging/build-deb-0.11.0.sh` builds `frost-0.11.0_amd64.deb` (SHA-256
