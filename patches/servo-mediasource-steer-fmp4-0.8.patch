@@ -1,0 +1,109 @@
+diff --git a/components/script/dom/media/mediasource.rs b/components/script/dom/media/mediasource.rs
+index ade56ff4a..4f24e4fe5 100644
+--- a/components/script/dom/media/mediasource.rs
++++ b/components/script/dom/media/mediasource.rs
+@@ -86,9 +86,29 @@ impl MediaSource {
+ 
+     /// <https://w3c.github.io/media-source/#dom-mediasource-istypesupported>
+     pub(crate) fn is_type_supported(type_: &DOMString) -> bool {
++        // Frost (F-015, Round 22): steer adaptive players toward fMP4.
++        // The MSE remuxer only understands fMP4 boxes, so WebM/AV1
++        // segments appended by a player would be dropped and playback
++        // would starve (Round 21). Returning false here makes the player
++        // pick fMP4 DASH instead (itag 134 + 140, proven in Round 20).
++        // Scoped to MediaSource only: HTMLMediaElement::canPlayType still
++        // calls can_play_type() directly, so plain <video src> playback
++        // of WebM files is unaffected.
++        if Self::mse_steer_blocks(&type_.str()) {
++            return false;
++        }
+         ServoMedia::get().can_play_type(&type_.str()) != SupportsMediaType::No
+     }
+ 
++    /// Pure predicate for the F-015 steer: true when the MSE layer must
++    /// refuse a type — any WebM container, or AV1 in any container.
++    /// Pure so it is unit-testable without a ServoMedia backend
++    /// (ServoMedia::get() blocks until init, which unit tests never do).
++    fn mse_steer_blocks(type_: &str) -> bool {
++        let lower = type_.to_ascii_lowercase();
++        lower.contains("webm") || lower.contains("av01")
++    }
++
+     pub(crate) fn ready_state(&self) -> MediaSourceReadyState {
+         self.ready_state.get()
+     }
+@@ -382,3 +402,74 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+     // https://w3c.github.io/media-source/#handler-mediasource-onsourceclose
+     event_handler!(sourceclose, GetOnsourceclose, SetOnsourceclose);
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    // The F-015 steer predicate is pure string logic, so it is fully
++    // testable here. is_type_supported itself is only tested for the
++    // steered (false) cases: the steer short-circuits before
++    // ServoMedia::get(), which blocks until init in a unit-test process.
++    // The passthrough (true) cases are proven live by the R18 probe gate
++    // (isTypeSupported avc1 → true) and the R19/R20 probe gates.
++
++    #[test]
++    fn steer_blocks_webm_containers() {
++        assert!(MediaSource::mse_steer_blocks("video/webm"));
++        assert!(MediaSource::mse_steer_blocks(
++            "video/webm; codecs=\"vp9, opus\""
++        ));
++        assert!(MediaSource::mse_steer_blocks("audio/webm; codecs=\"opus\""));
++        assert!(MediaSource::mse_steer_blocks("audio/webm"));
++    }
++
++    #[test]
++    fn steer_blocks_av1_in_any_container() {
++        assert!(MediaSource::mse_steer_blocks(
++            "video/mp4; codecs=\"av01.0.05M.08\""
++        ));
++        assert!(MediaSource::mse_steer_blocks(
++            "video/webm; codecs=\"av01.0.05M.08\""
++        ));
++        assert!(MediaSource::mse_steer_blocks("video/mp4; codecs=\"av01\""));
++    }
++
++    #[test]
++    fn steer_is_case_insensitive() {
++        assert!(MediaSource::mse_steer_blocks("video/WEBM"));
++        assert!(MediaSource::mse_steer_blocks(
++            "video/MP4; codecs=\"AV01.0.05M.08\""
++        ));
++    }
++
++    #[test]
++    fn steer_passes_fmp4_h264_aac_and_vp9() {
++        // These reach can_play_type() unchanged: H.264 + AAC (the proven
++        // itag 134 + 140 path), VP9 inside fMP4 (box-level remux is
++        // codec-agnostic), and an unknown type (still the backend's call).
++        assert!(!MediaSource::mse_steer_blocks(
++            "video/mp4; codecs=\"avc1.42E01E, mp4a.40.2\""
++        ));
++        assert!(!MediaSource::mse_steer_blocks(
++            "video/mp4; codecs=\"vp09.00.10.08\""
++        ));
++        assert!(!MediaSource::mse_steer_blocks(
++            "video/x-bogus; codecs=\"nope\""
++        ));
++    }
++
++    #[test]
++    fn is_type_supported_returns_false_for_steered_types() {
++        // Short-circuits before ServoMedia::get(), so this is safe here.
++        assert!(!MediaSource::is_type_supported(&DOMString::from(
++            "video/webm; codecs=\"vp9, opus\""
++        )));
++        assert!(!MediaSource::is_type_supported(&DOMString::from(
++            "audio/webm; codecs=\"opus\""
++        )));
++        assert!(!MediaSource::is_type_supported(&DOMString::from(
++            "video/mp4; codecs=\"av01.0.05M.08\""
++        )));
++    }
++}

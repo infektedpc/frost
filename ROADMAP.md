@@ -397,13 +397,32 @@ No new features — this round finishes what Round 3 left open:
   page still does NOT play; seeking not supported. Full suite
   88/88; R18 probe 29/29, R19 probe ALL PASS, R20 probe ALL
   PASS; all regressions pass. No .deb, no push.
-- Round 22 (next, MSE project): make the muxer handle WebM —
-  either parse WebM/EBML and repackage WebM tracks into fMP4,
-  or steer the player toward fMP4 by having
-  `MediaSource.isTypeSupported` return false for `audio/webm`,
-  `video/webm`, and AV1 so the player falls back to itag 134
-  (avc1/fMP4) + itag 140 (mp4a/fMP4), which are PROVEN to play
-  through the remuxer (R20). That choice needs Joel's word.
+- Round 22 (done 2026-11-17, MSE project): steer the player
+  to fMP4 — Joel chose this himself over parsing WebM/EBML
+  into fMP4. F-015 makes `MediaSource.isTypeSupported`
+  return false for `webm` and `av01` (pure predicate
+  `mse_steer_blocks`, case-insensitive; everything else still
+  delegates to `can_play_type()`), so the player falls back
+  to itag 134 (avc1/fMP4) + itag 140 (mp4a/fMP4), PROVEN to
+  play through the remuxer (R20). What the gates proved:
+  on the real watch page the player picks fMP4 only (avc1
+  + mp4a appends, drains all `pushed=1, dropped=0`,
+  buffered to 18.93 / 19.06, zero webm/opus/av01 in either
+  run's log), the decoded frame renders and currentTime
+  advances — but the video freezes a few seconds in, both
+  runs, with a full buffer and no error (new post-steer
+  stall, not the R21 starvation; audio-sink stall refuted
+  by an unmuted probe advancing past 7.5 s in real time).
+  Plain `<video src>` WebM is unaffected (canPlayType
+  "probably", plays 0.00 → 3.01). Scope check: plain
+  `canPlayType` calls `can_play_type()` directly, so the
+  steer is MediaSource-only. Honest limits: the watch page
+  still does not play through; seeking not supported. Full
+  suite 88/88; R18 probe 29/29, R19 probe ALL PASS, R20
+  probe ALL PASS; all regressions pass. No .deb, no push.
+- Round 23 (next, MSE project): diagnose the post-steer
+  stall — why a fully-buffered MSE element stops advancing
+  a few seconds in on the real watch page with no error.
   Then: Frostbite tab hibernation (needs a tab system
   first), Snowdrift workspaces (needs tabs + sessions +
   persistence — biggest). Inspector v2 (docked panel,

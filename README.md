@@ -5,21 +5,25 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 21 — MSE slice 4: drive the SABR/MSE path on
-the real YouTube watch page (fork patch F-014: MSE append +
-player-event logging at info level; embedder diagnostic URL
-block `FROST_BLOCK_URL_SUBSTRING`). What the gates proved:
-the player DOES initialize and append on the real watch page
-(59 `MSE:` lines, 23 appendBuffers) — but it chooses WebM
-audio (Opus) + AV1/VP9 video, and the remuxer is fMP4-only,
-so every WebM chunk is silently dropped, the combined init
-never emits, and the player starves and stalls at 0:00. The
-watch page still does NOT play; the itag-18 hypothesis is NOT
-supported by the run that reached the player (zero itag-18
-requests — the player went straight to DASH), and the bot
-check is flaky between runs (one run showed "Sign in to
-confirm you're not a bot" with no player at all). Tests 88/88.
-Fork at F-014. See [ROADMAP.md](ROADMAP.md) for the plan.**
+**Status: Round 22 — MSE slice 5: steer the YouTube player
+to fMP4 (fork patch F-015: `MediaSource.isTypeSupported`
+returns false for any type containing `webm` or `av01`).
+What the gates proved: the steer works — on the real watch
+page the player now picks fMP4 DASH (itag 134 avc1.4D400C +
+itag 140 mp4a.40.2), every append pushes (`dropped=0`, full
+buffer 0.00–18.93 video / 0.00–19.06 audio), zero
+webm/opus/av01 appends in either run, and the decoded frame
+renders with currentTime advancing (0:00 → 0:02 in run 1,
+further in run 2). What is NOT proven: the watch page still
+does not play THROUGH — in both runs the frame freezes a
+few seconds in (pixel-confirmed identical frames 15 s apart,
+no error in the log, full buffer). The stall is a new,
+undiagnosed post-steer issue, not the R21 starvation
+(`pushed=0`) and not an audio-sink stall (the same segments
+played UNMUTED in a probe advance in real time past 7.5 s).
+Plain `<video src>` WebM playback is unaffected
+(canPlayType "probably", plays 0.00 → 3.01). Tests 88/88.
+Fork at F-015. See [ROADMAP.md](ROADMAP.md) for the plan.**
 
 ## Layout
 
@@ -3083,3 +3087,101 @@ handle WebM — either parse WebM/EBML and repackage into
 fMP4, or steer the player to fMP4 via `isTypeSupported`
 (itag 134 + 140 are PROVEN to play through the remuxer);
 that choice needs Joel's word.
+
+## Round 22 — MSE slice 5: steer the player to fMP4 (F-015)
+
+Joel chose this direction himself (steer to fMP4 over parsing
+WebM/EBML into fMP4). F-015 (`patches/servo-mediasource-steer-
+fmp4-0.8.patch`, fork commit `35749febb`, fifteen patches
+total) adds a pure predicate `mse_steer_blocks` in
+`components/script/dom/media/mediasource.rs`:
+`MediaSource::is_type_supported` returns false for any type
+containing `webm` (`audio/webm`, `video/webm`) or `av01`
+(AV1 in any container), case-insensitive; everything else
+still delegates to `ServoMedia::can_play_type()` unchanged.
+`addSourceBuffer` inherits the steer (it calls
+`is_type_supported` and throws for refused types). 5 fork unit
+tests (predicate cases + short-circuit false cases; the
+passthrough-true cases are proven live by the R18 probe gate,
+since `ServoMedia::get()` blocks until init in a unit-test
+process). `clone-fork.sh` now applies fifteen patches (and
+fixes the pre-existing wart where F-014's patch was missing
+from the apply loop). Full suite 88/88 (54+18+8+8).
+
+Scope check (done, not assumed): plain `<video>`
+`canPlayType` calls `can_play_type()` directly in
+`htmlmediaelement.rs` (line 3583), so it is untouched — the
+false is scoped to the `MediaSource.isTypeSupported` path
+only. Proven live by the non-MSE WebM gate (below): a local
+VP9+Opus `.webm` via plain `<video src>` still plays.
+
+What the gates proved: the R18 probe is 29/29 ALL PASS with
+the new expectations (webm false, av01 false, avc1 true,
+bogus false); R19 probe ALL PASS (playing, currentTime 1.51);
+R20 probe ALL PASS (playing, currentTime 0.00 → 2.56,
+decoded frame). On the real watch page ("Me at the zoo",
+two fresh-Frost runs, no URL block): the player picks fMP4
+DASH — appends are `video/mp4; codecs="avc1.4D400C"` (itag
+134) and `audio/mp4; codecs="mp4a.40.2"` (itag 140) only,
+drains all `pushed=1 chunks, dropped=0`, buffered grows to
+[(0.0, 18.93)] video / [(0.0, 19.06)] audio, player events
+`MetadataUpdated … 320x240 format=ISO fMP4` and
+`DurationChanged 19.064s`, and **zero** webm/opus/av01
+mentions in either run's log. The decoded frame renders
+(Jawed at the zoo) and currentTime advances (0:00 → 0:02 in
+run 1; a later frame in run 2, 48% of pixels different from
+run 1's frozen frame).
+
+What is NOT proven — the watch page still does NOT play
+through. In both runs the frame freezes a few seconds in:
+run 1 stuck at 0:02 with the spinner (pixel-diff of two
+screenshots 15 s apart: 0.02% differ — identical frame);
+run 2 froze at a later, unmeasured time with the controls
+auto-hidden (same 0.02% pixel-diff; clicks on the video and
+the `k` key did not unfreeze it or wake the controls). No
+player error, no GStreamer error, no `not-negotiated`, no
+seek-refused warning, and no further `MSE:` lines after the
+freeze — the full duration sits buffered while the element
+sits still. This is a NEW stall, not the R21 starvation
+(`pushed=0` there; `pushed=1, dropped=0` here). The
+audio-sink hypothesis is refuted: the same segments played
+UNMUTED in a probe (a `muted`-less copy of the R20 probe
+with an extra 5 s check) advance in real time past 7.5 s
+(t0=0.00, t1=2.51, t2=7.52, ALL PASS). The YouTube page
+reloads itself once per load with `&themeRefresh=1` (seen
+in both runs) — whether that reload leaves a stale pipeline
+behind is unproven. Seeking still unsupported. Hardware
+decode still a later stage.
+
+All other regressions pass: youtube.com loads with 0
+SendRequest/PROTOCOL_ERROR (skeleton placeholders as in
+R21), homepage paints, split view both panes, Snowplow
+blocks in both panes (status "blocked 3"), Freeze writes a
+correct archive (`<base href>` + index.json, status
+"Frozen: …"), Settings save + persist across relaunch
+(homepage example.com + search Google, fresh launch opens
+on example.com), Inspector F12 (35 nodes on example.org;
+33 on example.com — its DOM has no sample-banner div),
+bands.html strip-scroll paints (BAND 9/10 after End),
+frost://settings fails plainly (status explains the menu
+windows), no Frost listener, GNOME-mode fallback titlebar
+(own bar, min/max/close), local H.264 video still plays
+("playing t=5.00", SMPTE bars), plain WebM plays
+(canPlayType "probably", currentTime 0.00 → 3.01).
+
+Harness notes for the next round: `xclose` lives in
+`~/workspace/harness-tmp/frost/xclose`, NOT in
+`~/workspace/servo-de/tools/` (the wrong path fails
+silently and leaves popups overlaying later gates — that
+is why the first bands scroll measured 0% different: the
+End key went to the still-open Settings window). Pixel-diff
+two screenshots before believing a freeze or a scroll —
+the eye misses a frozen frame; 0.02% differ means frozen,
+96% differ means scrolled. The watch page's
+`&themeRefresh=1` reload happens on every load in the
+sandbox; a watch-page run's first player is always thrown
+away. The plain 2 GB debug link still OOM-kills; the gate
+binary is linked with `-C link-arg=-Wl,--strip-debug`
+(522,337,704 B). Next: diagnose the post-steer stall —
+why a fully-buffered MSE element stops advancing a few
+seconds in with no error — then Frostbite hibernation.
