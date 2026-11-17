@@ -5,13 +5,13 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 17 — YouTube playback, staged: the page loads now
-(the HTTP/2 header fix, fork patch F-010), the player UI renders,
-but videos do not play — Servo 0.8.0 has no Media Source Extensions
-and YouTube's player requires them. The media stack itself is
-proven: a local H.264 video plays with frames advancing. Tests
-87/87. Fork at `c16cca72d` (F-010). See
-[ROADMAP.md](ROADMAP.md) for the plan.**
+**Status: Round 18 — MSE foundation: `MediaSource` /
+`SourceBuffer` exist in the engine (fork patch F-011),
+`isTypeSupported` answers, a `<video>` attaches a
+MediaSource and reaches `open`. YouTube still does NOT
+play — appended bytes are queued, not decoded; the
+decode pipeline is Round 19. Tests 87/87. Fork at
+F-011. See [ROADMAP.md](ROADMAP.md) for the plan.**
 
 ## Layout
 
@@ -2524,3 +2524,101 @@ and testable on his box from this tree, but
 playback needs MSE first. Next in the easiest-first
 order: Frostbite hibernation (needs tabs) — unless
 Joel wants the MSE project instead.
+
+## Round 18 — MSE foundation (MediaSource exists, attaches, answers)
+
+Joel's pick 2026-11-16 ("MSE project next", ahead of
+Frostbite): the first shippable slice of the multi-round
+MSE project. Fork patch F-011 adds `MediaSource` +
+`SourceBuffer` + `SourceBufferList` to the engine —
+new WebIDL bindings and new DOM types in
+`components/script/dom/media/`, `URL.createObjectURL
+(mediaSource)` (script-side per-global map, since the
+file-manager blob store is Blob-only), and attach to
+a `<video>` element through the resource fetch
+algorithm's object branch (`closed` → `open` +
+`sourceopen`; detach in the load algorithm,
+`closed` + `sourceclose`).
+
+Honest limit, stated up front: `appendBuffer`
+QUEUES bytes. `buffered` stays empty, nothing is
+decoded, and YouTube still does not play — the
+decode pipeline (media thread → GStreamer appsrc)
+is Round 19, YouTube playback is Round 21, hardware
+decode after that. The staging table is in
+ARCHITECTURE.md.
+
+Gates, all on the Round 18 strip-debug binary under
+Xvfb :97 (test servers 18080/18099/18101, fresh
+`r18-config`/`r18-data`):
+
+- MSE probe (`r18-02`, `r18-03`): ALL PASS, 29/29
+  checks — `typeof MediaSource` function,
+  `isTypeSupported` true for avc1/vp9/av01 and false
+  for a bogus type, `new MediaSource()` closed with
+  NaN duration and empty lists, `srcObject` attach
+  fires `sourceopen` (readyState `open`, round-trip),
+  `addSourceBuffer` → length 1, mode `segments`,
+  `appendBuffer` → `updateend` with `updating`
+  false after, bogus-type `addSourceBuffer` throws,
+  `removeSourceBuffer` empties the list,
+  `endOfStream` → `sourceended` (`ended`), detach
+  via `srcObject = null` + `load()` → `sourceclose`
+  (`closed`), `URL.createObjectURL(ms)` → `blob:`
+  URL and attach via `video.src` → `sourceopen`
+  (`open`, networkState loading 2).
+- Regressions, all pass: homepage paints
+  (`r18-01`); youtube.com loads, 0 `SendRequest` /
+  `PROTOCOL_ERROR` in the log (`r18-04`; the page
+  still shows skeleton placeholders — the known
+  YouTube-JS gap, not a regression); split view,
+  both panes painted (`r18-12`); Snowplow blocks in
+  both panes — blocked-img/js failed, allowed-img
+  loaded, status "blocked 4" (`r18-13`, `r18-14`);
+  Freeze writes a correct archive (`index.json` +
+  HTML with `<base>` tag and live DOM, `r18-15`);
+  Inspector F12, 30-node snapshot (`r18-16`);
+  `frost://settings` fails plainly with the
+  no-internal-pages message (`r18-17`); strip-scroll
+  paints (`r18-19`); settings save + persist across
+  relaunch (search engine changed to Google, still
+  Google after quit + relaunch, `r18-20`–`r18-23`;
+  restored to DuckDuckGo afterwards); no Frost
+  listener (`ss` — only the loomtop `:9999`
+  watcher and the three test servers); GNOME-mode
+  fallback titlebar with min/max/close (`r18-24`).
+- Local H.264 video still plays — with one harness
+  note: under the blocklist launch it errors
+  (code 4) because Snowplow's extra `localhost`
+  blocklist blocks the test video file itself, the
+  same way it blocks the Snowplow test page's
+  subresources. Under a no-blocklist launch
+  (`r18-launch-noblock.sh`, same binary) the
+  moving video plays, "playing t=10.00" at the end
+  of the 10 s clip, with 6,298 differing pixels
+  between an early and a later frame
+  (`r18-07`–`r18-10`). That is the harness's own
+  test configuration, not an R18 regression — the
+  plain-`src` video path is untouched by F-011 (the
+  blob-URL interception only fires for `blob:`
+  URLs), and the video gate needs the no-blocklist
+  launch the same way the Snowplow gates need the
+  blocklist launch.
+
+Harness notes for the next round: the plain click
+on the address bar does NOT select all — type
+appends to the existing URL (the first probe
+navigation produced
+`https://example.org/http://localhost…`); always
+Ctrl+A first (`r18-nav.sh` does this). `r5-key.sh`
+takes X keycodes, not names — Return is 36, not
+the string "Return". The F12 keycode is 96.
+Menu rows are ~35 px apart — "Split view" is at
+(1019, 287), "Freeze this page…" at (1047, 324),
+"Close split view" at (1033, 287); measure with
+visual grounding, don't estimate. No `.deb`, no
+push — there is nothing new for Joel to install
+that changes YouTube playback; the foundation is
+real and testable on his box from this tree, but
+playback needs Round 19 first. Next: Round 19,
+`SourceBuffer.appendBuffer` → media thread.

@@ -307,6 +307,21 @@ No new features — this round finishes what Round 3 left open:
   requires MSE and refuses before fetching. Implementing
   MSE is a multi-round engine project, not attempted
   here. No .deb, no push.
+- Round 18 (done 2026-11-17, MSE project — Joel's pick
+  2026-11-16, ahead of Frostbite): MSE foundation,
+  fork patch F-011. `MediaSource` + `SourceBuffer` +
+  `SourceBufferList` WebIDL bindings with the full
+  attribute/state-machine surface (`isTypeSupported`,
+  `addSourceBuffer`/`removeSourceBuffer`,
+  `endOfStream`, `setLiveSeekableRange`, `appendBuffer`
+  with the `updatestart` → `update` → `updateend`
+  sequence, `abort`/`remove`/`changeType`),
+  `URL.createObjectURL(mediaSource)`, and attach to a
+  `<video>` element (`closed` → `open` + `sourceopen`,
+  detach → `closed` + `sourceclose`). Honest limit:
+  `appendBuffer` QUEUES bytes — `buffered` stays
+  empty, nothing is decoded, YouTube still does not
+  play. The decode pipeline is Round 19.
   Then: Frostbite tab hibernation (needs a tab system
   first), Snowdrift workspaces (needs tabs + sessions +
   persistence — biggest). Inspector v2 (docked panel,

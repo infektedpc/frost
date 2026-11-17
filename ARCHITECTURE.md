@@ -1152,3 +1152,149 @@ picks by rank, so on Joel's box VA-API H.264 needs
 outranks `avdec_h264`); Haswell has no VP9/AV1
 hardware decode, so H.264 stays the accelerated
 path.
+
+## Round 18 — MSE foundation (F-011)
+
+### What the survey found
+
+The fork's media element already had the hook:
+`HTMLMediaElement.webidl` declared `typedef
+(MediaStream /*or MediaSource */ or Blob)
+MediaProvider` — uncommenting `MediaSource` is the
+intended first step. `SrcObject` in
+`htmlmediaelement.rs` is `MediaStream | Blob`, and
+resource selection routes `Mode::Object` to
+`resource_fetch_algorithm(Resource::Object)`; the
+player is created by `create_media_player` but never
+told to load an object URL, so attach can succeed
+without touching the player at all. `create_media_player`
+uses `StreamType::Seekable` for any non-MediaStream
+object, so a MediaSource needs no player change.
+
+`URL.createObjectURL` in the fork is Blob-only: the
+file-manager blob URL store holds `FileImpl::Memory
+(BlobBuf)`. Adding a MediaSource entry there would be
+a cross-crate project (net_traits + net + script) —
+not this round. Instead `createObjectURL(mediaSource)`
+mints a UUID, registers the object in a script-side
+per-global map on `GlobalScope`
+(`mediasource_blob_urls`), and returns a normal
+`blob:` URL; the media element resolves `blob:` URLs
+back through that map in `load_from_src_attribute`
+before fetching. `RevokeObjectURL` removes the map
+entry first and falls back to the file-manager path.
+
+### What was built
+
+New WebIDL (`MediaSource`, `SourceBuffer`,
+`SourceBufferList` — globbed from
+`components/script_bindings/webidls/`, no manual
+list) and new DOM types in
+`components/script/dom/media/` (`mediasource.rs`,
+`sourcebuffer.rs`, `sourcebufferlist.rs`, registered
+in `dom/media/mod.rs`). The surface:
+
+- `MediaSource`: constructor, `isTypeSupported`
+  (delegates to `ServoMedia::get().can_play_type()`),
+  `sourceBuffers` / `activeSourceBuffers` (empty in
+  this round — no data, no selected tracks),
+  `readyState`, `duration` (`[SetterThrows]`),
+  `addSourceBuffer` / `removeSourceBuffer`,
+  `endOfStream`, `setLiveSeekableRange` /
+  `clearLiveSeekableRange`, `sourceopen` /
+  `sourceended` / `sourceclose` handlers.
+- `SourceBuffer`: `mode` (`[SetterThrows]`),
+  `updating`, `buffered` (empty in this round),
+  `timestampOffset` (`[SetterThrows]`),
+  `audioTracks` / `videoTracks` (empty lists),
+  `appendWindowStart` / `appendWindowEnd`
+  (`[SetterThrows]`, writable per spec),
+  `appendBuffer` / `abort` / `remove` /
+  `changeType`, `updatestart` / `update` /
+  `updateend` / `error` / `abort` handlers.
+- `SourceBufferList`: `length`, indexed getter,
+  `addsourcebuffer` / `removesourcebuffer` events.
+
+Attach: `SrcObject::MediaSource` flows through the
+resource fetch algorithm's object branch, which
+calls `attach_media_source` — detaches a different
+previously-attached source, sets
+`attached_media_source` (distinct from `src_object`:
+assigned vs attached; detach happens in the load
+algorithm, implementing the step 7.3 TODO), sets
+readyState `open`, and queues `sourceopen` — and
+that queued task also clears the element's
+delaying-the-load-event flag, because attach is the
+end of the load (no fetch follows). Detach reverses
+it (`closed`, lists cleared, duration NaN,
+`sourceclose`). `appendBuffer` validates (updating
+→ InvalidStateError, non-open → InvalidStateError),
+copies bytes via `get_buffer_source_copy`, queues
+them in `pending_bytes`, sets `updating = true`,
+and fires `updatestart` → `update` → `updateend`
+as tasks, with `updating` staying true until the
+`updateend` task runs.
+
+### Codegen traps worth recording
+
+- Plain WebIDL attributes generate bare Rust names
+  (`ReadyState`, `Duration`, `Updating`,
+  `Buffered`, `Mode`) — the `Get` prefix appears
+  only for `[Throws]` attributes, and `[Throws]`
+  on an attribute makes BOTH accessors fallible.
+  The spec-correct marking for a throwing setter
+  with a non-throwing getter is `[SetterThrows]`
+  (→ `SetX(...) -> ErrorResult`, getter plain).
+  `double` maps to `Finite<f64>`; only
+  `unrestricted double` maps to plain `f64`.
+- Getters that create DOM objects need `cx`, and
+  the only way to get it is a per-interface `'cx'`
+  list in `Bindings.conf` (the `HTMLMediaElement`
+  `AudioTracks` precedent) — added for
+  `MediaSource` (`AddSourceBuffer`,
+  `SourceBuffers`, `ActiveSourceBuffers`) and
+  `SourceBuffer` (`Buffered`, `AudioTracks`,
+  `VideoTracks`). Static methods take `&Window`
+  for Window-only interfaces (`IsTypeSupported`),
+  `&GlobalScope` only for Window+Worker ones
+  (`CreateObjectURL`).
+- `atom!("...")` only accepts statically-registered
+  atoms from the `stylo_atoms` table (a crates.io
+  dependency — not patchable in-round). New event
+  names (`sourceopen`, `updateend`,
+  `addsourcebuffer`, `removesourcebuffer`) must be
+  fired with runtime `Atom::from("...")`. The
+  `event_handler!` macro is fine — it uses
+  `stringify!`, not `atom!`.
+- Non-trait helper methods cannot live inside an
+  `impl XMethods` block (E0407) — the URL
+  `create_object_url_for_*` helpers live in a plain
+  `impl URL` block.
+- `reflect_dom_object_with_proto` wants the
+  `&Window` itself (it implements
+  `DerivedFrom<GlobalScope>`); passing
+  `&global.global()` fails the bound.
+- `TimeRangesContainer` has no `new()` —
+  `default()`; `TimeRanges::new` takes `&Window`;
+  `AudioTrackList` / `VideoTrackList` take
+  `(cx, window, tracks, Option<&HTMLMediaElement>)`.
+
+### MSE staging plan — honest status per stage
+
+| Stage | Status |
+|---|---|
+| 1. HTTP/2 header fix (F-010) | DONE (R17) — youtube.com loads. |
+| 2. Media stack on (`media-gstreamer`) | DONE (R17) — local H.264 plays, frames advance. |
+| 3. MSE foundation (F-011) | DONE (R18) — this round. `MediaSource` exists, attaches, `isTypeSupported` answers. Bytes queue, nothing decodes. |
+| 4. `SourceBuffer.appendBuffer` → media thread | NEXT (R19) — drain `pending_bytes` into the media thread; report decoded ranges in `buffered`; wire `activeSourceBuffers` when tracks are selected. |
+| 5. GStreamer appsrc pipeline | R20 — a media-thread source feeding appended segments into an `appsrc`/`decodebin` pipeline behind the existing player; first MSE-backed frame on a local segment. |
+| 6. YouTube playback | R21 — YouTube's DASH player attaches, appends, and plays a real video. Gate: a watch page plays, not just loads. |
+| 7. Hardware decode | After R21 — VA-API H.264 on Joel's box (`gstreamer1.0-vaapi`); VP9/AV1 stay software on Haswell. |
+
+No unit tests were added in this round: the changes
+are fork-only DOM types that need a script thread
+to construct, and the fork's tests are not part of
+the frost workspace suite anyway (same reasoning as
+Round 17). The guard is the live probe gate
+(`r18-media/probe.html`, all PASS) plus the full
+regression gate set.

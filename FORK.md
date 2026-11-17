@@ -35,7 +35,8 @@ git -C servo fetch --unshallow
 The first three were proven earlier in the servo-de embedder against
 Servo 0.8.0; the fourth is Frost's own F-001 (Round 2), the fifth is
 F-005 (Round 3), the next three are Round 4 (F-006, F-007, F-008),
-and the ninth is F-009 (Round 16), and the tenth is F-010 (Round 17).
+and the ninth is F-009 (Round 16), the tenth is F-010 (Round 17),
+and the eleventh is F-011 (Round 18).
 Each was verified with `git apply --check` against this
 fork point before applying, one commit per patch. The patch files are
 vendored in `patches/` so the fork is reproducible from this repo alone
@@ -53,6 +54,7 @@ vendored in `patches/` so the fork is reproducible from this repo alone
 | `f9462dbb7` | `patches/servo-stop-abort-pending-0.8.patch` | F-008 (Round 4): `handle_stop_msg` also drains the webview's pending session-history changes for the top-level browsing context and closes their pipelines, mirroring `handle_abort_load_url_msg` — so Stop aborts a navigation stuck at the constellation, which `Stop` alone could never reach (it only goes to the CURRENT pipeline, and the embedder cannot name the pending pipeline). |
 | `1136ffe68` | `patches/servo-hardware-rendering-context-0.8.patch` | F-009 (Round 16): add `HardwareRenderingContext` — the same offscreen surfman shape as `SoftwareRenderingContext`, but `Connection::create_adapter()` (hardware) instead of `create_software_adapter()` (llvmpipe), so pages rasterize on the GPU where one exists. The embedder tries it first and falls back to software on failure. Which adapter was picked is visible in the log without extra code: WebRender logs its GL renderer at device creation (`webrender::device::gl` — `Renderer: ...`). |
 | `c16cca72d` | `patches/servo-http2-header-list-size-0.8.patch` | F-010 (Round 17): raise the HTTP/2 client's max header list size from h2's 16 KiB default to 256 KiB (`.http2_max_header_list_size(256 * 1024)` in `create_http_client`, `components/net/connector.rs`). YouTube's homepage response headers decode to more than 16 KiB, so the h2 decoder flagged the block oversize and reset the stream with PROTOCOL_ERROR — youtube.com loaded (tiny 301 headers) but www.youtube.com failed with "client error (SendRequest)". Chrome allows ~256 KiB of response headers; this matches that. |
+| `c4e87a381` | `patches/servo-mediasource-foundation-0.8.patch` | F-011 (Round 18): MSE foundation — new `MediaSource` / `SourceBuffer` / `SourceBufferList` WebIDL + DOM types (`components/script/dom/media/`), `URL.createObjectURL(mediaSource)` via a script-side per-global map on `GlobalScope`, attach to a `<video>` element (`closed` → `open` + `sourceopen`, detach in the load algorithm), `isTypeSupported` via `ServoMedia::can_play_type`, `appendBuffer` queues bytes with the `updatestart` → `update` → `updateend` sequence. `buffered` stays empty — nothing is decoded yet; the decode pipeline is Round 19. |
 
 Fork log:
 
