@@ -81,6 +81,9 @@
 //! libcosmic cannot build.
 
 #[cfg(feature = "ui-libcosmic")]
+mod archive;
+
+#[cfg(feature = "ui-libcosmic")]
 mod file_browser;
 
 #[cfg(feature = "ui-libcosmic")]

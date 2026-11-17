@@ -20,10 +20,13 @@ use frost_extensions::{ExtensionHost, ExtensionManifest, StubHost};
 use frost_inspector::{snapshot_from_json, DOM_WALK_SCRIPT};
 use url::Url;
 
+use crate::archive;
 use crate::file_browser;
 use crate::keymap::{map_button, map_code, map_key_with_text, map_location, map_modifiers};
 use crate::settings::{is_loadable_homepage, ChromeColors, Settings as FrostSettings};
-use windows::{InspectorWindow, OpenWindow, PopupMessage, PrintWindow, SettingsWindow};
+use windows::{
+    ArchivesWindow, InspectorWindow, OpenWindow, PopupMessage, PrintWindow, SettingsWindow,
+};
 
 /// Chrome geometry, fixed by construction (see the module docs).
 /// Round 10: the window manager draws the titlebar by default
@@ -116,20 +119,24 @@ const TICK: Duration = Duration::from_millis(16);
 /// Firefox shows one shortcut (F12 for Inspector); the other entries
 /// have no shortcut — do not invent any. Round 9 adds "Command
 /// palette…" (Ctrl+K, the palette's own shortcut) after Inspector,
-/// Round 14 adds "Split view" after it, so the groups stay
+/// Round 14 adds "Split view" after it, Round 15 adds "Freeze this
+/// page…" and "Archived pages…" after that, so the groups stay
 /// Settings | Print page… / Open file… / Inspector /
-/// Command palette… | Split view / Exit. The view builds the panel
+/// Command palette… | Split view / Freeze this page… /
+/// Archived pages… / Exit. The view builds the panel
 /// from this table, so the spec and the rendering cannot drift.
 /// Separators fall after "Settings" and after "Command palette…".
 /// The "Split view" label is dynamic (see SPLIT_MENU_INDEX):
 /// while split it reads "Close split view".
-const MENU_ITEMS: [(&str, Option<&str>, Message); 7] = [
+const MENU_ITEMS: [(&str, Option<&str>, Message); 9] = [
     ("Settings", None, Message::OpenSettings),
     ("Print page…", None, Message::OpenPrint),
     ("Open file…", None, Message::OpenFile),
     ("Inspector", Some("F12"), Message::OpenInspector),
     ("Command palette…", Some("Ctrl+K"), Message::TogglePalette),
     ("Split view", None, Message::ToggleSplit),
+    ("Freeze this page…", None, Message::FreezePage),
+    ("Archived pages…", None, Message::OpenArchives),
     ("Exit", None, Message::Exit),
 ];
 
@@ -320,7 +327,8 @@ fn fuzzy_match(query: &str, label: &str) -> bool {
 /// The palette's commands (Round 9): only actions that can act
 /// right now. "Go back" / "Go forward" appear only when there is
 /// history to move through, "Stop loading" only while a load is in
-/// flight — so no entry ever looks real while doing nothing. The
+/// flight, "Freeze this page" only when a page is loaded (Round 15)
+/// — so no entry ever looks real while doing nothing. The
 /// rest are always available: every one of them is wired to an
 /// existing working message (no dead entries by construction).
 /// Round 14: the split command's label says what it WILL do —
@@ -330,6 +338,7 @@ fn palette_commands_for(
     can_forward: bool,
     loading: bool,
     split: bool,
+    can_freeze: bool,
 ) -> Vec<(&'static str, Message)> {
     let mut commands = Vec::new();
     if can_back {
@@ -351,6 +360,10 @@ fn palette_commands_for(
     } else {
         commands.push(("Split view", Message::ToggleSplit));
     }
+    if can_freeze {
+        commands.push(("Freeze this page", Message::FreezePage));
+    }
+    commands.push(("Archived pages…", Message::OpenArchives));
     commands.push(("Focus address bar", Message::FocusAddress));
     commands.push(("Quit Frost", Message::Exit));
     commands
@@ -412,6 +425,13 @@ pub enum Message {
     /// the split and keep the active pane (Round 14). In the
     /// menu and the palette the label says what it will do.
     ToggleSplit,
+    /// Freeze the ACTIVE pane's page as a Deep Freeze archive
+    /// (Round 15): capture the live DOM and save it as a
+    /// self-contained HTML file in the archives dir.
+    FreezePage,
+    /// Open the Archived pages window (Round 15): the list of
+    /// frozen pages, with Open and Delete per entry.
+    OpenArchives,
     /// Close the command palette without running anything
     /// (Escape, or a press outside the panel).
     ClosePalette,
@@ -616,6 +636,20 @@ pub struct Frost {
     /// inspected page never left the main window, so no navigation
     /// is needed.
     inspector_recapture: bool,
+    /// A Deep Freeze capture is in flight (Round 15): the channel
+    /// the frozen outerHTML arrives on, polled by the Tick. Set
+    /// by `freeze_page`; cleared when the HTML arrives (or the
+    /// capture errors) and the archive is written.
+    freeze_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// A freeze capture is in flight; the status line says so
+    /// until the archive is written.
+    freeze_pending: bool,
+    /// The frozen page's identity, fixed at freeze time (URL,
+    /// title) — the archive is written from these when the
+    /// capture lands, so a navigation in between cannot
+    /// mislabel it.
+    freeze_pending_url: String,
+    freeze_pending_title: String,
     /// Current settings (theme, homepage, search engine, exit
     /// confirmation). Loaded at startup; the native Settings
     /// window edits them and saves (Round 7 — no more server
@@ -631,6 +665,8 @@ pub struct Frost {
     print_win: Option<PrintWindow>,
     open_win: Option<OpenWindow>,
     inspector_win: Option<InspectorWindow>,
+    /// Round 15: the Archived pages window, if open.
+    archives_win: Option<ArchivesWindow>,
     exit_win: Option<window::Id>,
     /// Content-script host (StubHost: in-memory, real disk loading
     /// + real injection through the engine — see
@@ -814,6 +850,7 @@ impl Frost {
             self.active_pane().can_forward,
             self.active_pane().loading,
             self.split,
+            self.active_pane().webview.url().is_some(),
         )
             .into_iter()
             .filter(|(label, _)| fuzzy_match(&self.palette_query, label))
@@ -1411,7 +1448,56 @@ impl Frost {
         self.active_pane_mut().status = "Capturing page structure…".to_string();
     }
 
-    /// Inject the content scripts that match pane `index`'s URL.
+    /// Freeze the ACTIVE pane's page as a Deep Freeze archive
+    /// (Round 15): the capture script runs on a clone of the live
+    /// DOM (never mutating it) and its outerHTML arrives on the
+    /// channel; the Tick writes the archive file and says so in
+    /// the status line. The page itself never leaves the main
+    /// window, so there is no navigation to wait for.
+    fn freeze_page(&mut self) {
+        if self.freeze_pending {
+            return;
+        }
+        if self.active_pane().webview.url().is_none() {
+            self.active_pane_mut().status = "Freeze: no page loaded yet.".to_string();
+            return;
+        };
+        self.freeze_pending_url = self
+            .active_pane()
+            .webview
+            .url()
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        self.freeze_pending_title = self.freeze_title();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.active_pane()
+            .webview
+            .evaluate_javascript_string(archive::FREEZE_CAPTURE_SCRIPT, tx);
+        self.freeze_rx = Some(rx);
+        self.freeze_pending = true;
+        self.active_pane_mut().status = "Freezing page…".to_string();
+    }
+
+    /// The title to freeze the ACTIVE pane under: the page title
+    /// when it has one, else the host, else the URL, else
+    /// "Untitled page".
+    fn freeze_title(&self) -> String {
+        let pane = self.active_pane();
+        if let Some(t) = &pane.title {
+            if !t.trim().is_empty() {
+                return t.trim().to_string();
+            }
+        }
+        if let Some(u) = pane.webview.url() {
+            if let Some(host) = u.host_str() {
+                if !host.is_empty() {
+                    return host.to_string();
+                }
+            }
+            return u.to_string();
+        }
+        "Untitled page".to_string()
+    }
     /// Runs once per URL, on LoadFinished (and on the 15 s safety
     /// net, for history traversals that never fire LoadFinished).
     /// `DocumentStart` scripts cannot run at document start (no
@@ -1518,6 +1604,10 @@ impl cosmic::Application for Frost {
                 inspector_shot_rx: None,
                 inspector_shot_pending: false,
                 inspector_recapture: false,
+                freeze_rx: None,
+                freeze_pending: false,
+                freeze_pending_url: String::new(),
+                freeze_pending_title: String::new(),
                 settings,
                 extensions: loaded,
                 failed_extensions: failed,
@@ -1525,6 +1615,7 @@ impl cosmic::Application for Frost {
                 print_win: None,
                 open_win: None,
                 inspector_win: None,
+                archives_win: None,
                 exit_win: None,
                 host,
             },
@@ -1696,6 +1787,41 @@ impl cosmic::Application for Frost {
                             Err(e) => {
                                 self.active_pane_mut().status =
                                     format!("Inspector failed: {e}");
+                            },
+                        }
+                    }
+                }
+                // Round 15 Deep Freeze: the frozen outerHTML
+                // arrives on this channel once the capture script
+                // runs in the page. Write the archive file and
+                // say so in the status line. A failed capture
+                // leaves the current page up and says so.
+                if let Some(rx) = &self.freeze_rx {
+                    if let Ok(result) = rx.try_recv() {
+                        self.freeze_rx = None;
+                        self.freeze_pending = false;
+                        let url = std::mem::take(&mut self.freeze_pending_url);
+                        let title = std::mem::take(&mut self.freeze_pending_title);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        match result.and_then(|html| {
+                            archive::save_archive(
+                                &archive::archives_dir(),
+                                &title,
+                                &url,
+                                &html,
+                                now,
+                            )
+                        }) {
+                            Ok(entry) => {
+                                self.active_pane_mut().status =
+                                    format!("Frozen: {}", entry.title);
+                            },
+                            Err(e) => {
+                                self.active_pane_mut().status =
+                                    format!("Freeze failed: {e}");
                             },
                         }
                     }
@@ -1956,6 +2082,22 @@ impl cosmic::Application for Frost {
                     self.capture_inspector();
                     Task::none()
                 }
+            },
+            Message::FreezePage => {
+                // Round 15: freeze the ACTIVE pane's page. The
+                // archive is written from the Tick once the
+                // capture script's outerHTML arrives.
+                self.close_menu();
+                self.close_palette();
+                self.freeze_page();
+                Task::none()
+            },
+            Message::OpenArchives => {
+                // Round 15: the Archived pages window (or focus
+                // it, if open).
+                self.close_menu();
+                self.close_palette();
+                self.open_archives_window()
             },
             Message::OpenFile => {
                 self.close_menu();
@@ -2642,8 +2784,8 @@ mod tests {
     }
 
     #[test]
-    fn menu_items_are_seven_with_f12_ctrl_k_and_split_view() {
-        assert_eq!(MENU_ITEMS.len(), 7);
+    fn menu_items_are_nine_with_f12_ctrl_k_split_view_and_freeze() {
+        assert_eq!(MENU_ITEMS.len(), 9);
         assert_eq!(SPLIT_MENU_INDEX, 5);
         let labels: Vec<&str> = MENU_ITEMS.iter().map(|(label, _, _)| *label).collect();
         assert_eq!(
@@ -2655,6 +2797,8 @@ mod tests {
                 "Inspector",
                 "Command palette…",
                 "Split view",
+                "Freeze this page…",
+                "Archived pages…",
                 "Exit"
             ]
         );
@@ -2666,6 +2810,8 @@ mod tests {
             }
         }
         assert!(matches!(MENU_ITEMS[SPLIT_MENU_INDEX].2, Message::ToggleSplit));
+        assert!(matches!(MENU_ITEMS[6].2, Message::FreezePage));
+        assert!(matches!(MENU_ITEMS[7].2, Message::OpenArchives));
     }
 
     #[test]
@@ -2686,9 +2832,9 @@ mod tests {
 
     #[test]
     fn palette_commands_hide_unavailable_actions() {
-        // Nothing to go back/forward to, nothing loading: only the
-        // always-available commands show.
-        let labels: Vec<&str> = palette_commands_for(false, false, false, false)
+        // Nothing to go back/forward to, nothing loading, no page
+        // loaded: only the always-available commands show.
+        let labels: Vec<&str> = palette_commands_for(false, false, false, false, false)
             .iter()
             .map(|(label, _)| *label)
             .collect();
@@ -2701,13 +2847,14 @@ mod tests {
                 "Open file…",
                 "Open Inspector",
                 "Split view",
+                "Archived pages…",
                 "Focus address bar",
                 "Quit Frost",
             ]
         );
         // With history and a load in flight, the conditional
         // commands appear in place.
-        let labels: Vec<&str> = palette_commands_for(true, true, true, false)
+        let labels: Vec<&str> = palette_commands_for(true, true, true, false, false)
             .iter()
             .map(|(label, _)| *label)
             .collect();
@@ -2723,17 +2870,36 @@ mod tests {
                 "Open file…",
                 "Open Inspector",
                 "Split view",
+                "Archived pages…",
                 "Focus address bar",
                 "Quit Frost",
             ]
         );
         // While split, the split command reads as a close.
-        let labels: Vec<&str> = palette_commands_for(false, false, false, true)
+        let labels: Vec<&str> = palette_commands_for(false, false, false, true, false)
             .iter()
             .map(|(label, _)| *label)
             .collect();
         assert!(labels.contains(&"Close split view"));
         assert!(!labels.contains(&"Split view"));
+        // Freeze appears only when a page is loaded (Round 15).
+        let labels: Vec<&str> = palette_commands_for(false, false, false, false, true)
+            .iter()
+            .map(|(label, _)| *label)
+            .collect();
+        assert!(labels.contains(&"Freeze this page"));
+        let labels: Vec<&str> = palette_commands_for(false, false, false, false, false)
+            .iter()
+            .map(|(label, _)| *label)
+            .collect();
+        assert!(!labels.contains(&"Freeze this page"));
+    }
+
+    #[test]
+    fn menu_split_index_still_points_at_split_view() {
+        // SPLIT_MENU_INDEX is also covered by the nine-item menu
+        // test; this keeps the index itself pinned.
+        assert_eq!(MENU_ITEMS[SPLIT_MENU_INDEX].0, "Split view");
     }
 
     #[test]

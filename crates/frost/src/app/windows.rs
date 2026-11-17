@@ -37,6 +37,7 @@ use cosmic::iced::{window, ContentFit, Length, Size};
 use cosmic::widget::{button, container, text_input};
 use cosmic::{iced, ApplicationExt, Element};
 
+use crate::archive::{self, ArchiveEntry};
 use crate::file_browser::{self, DirEntry, MdBlock};
 use crate::settings::{
     is_loadable_homepage, SearchEngine, Settings as FrostSettings, ThemeChoice,
@@ -52,6 +53,8 @@ pub enum PopupKind {
     Print,
     Open,
     Inspector,
+    /// Round 15: the Archived pages (Deep Freeze) window.
+    Archives,
     Exit,
 }
 
@@ -111,6 +114,14 @@ pub struct InspectorWindow {
     pub selected: Option<u64>,
 }
 
+/// The Archived pages window's state (Round 15): the frozen pages
+/// listed newest first, plus a load/delete error, if any.
+pub struct ArchivesWindow {
+    pub id: window::Id,
+    pub entries: Vec<ArchiveEntry>,
+    pub error: Option<String>,
+}
+
 /// Messages from the popup windows. Each kind is single-instance, so
 /// no window id travels with the message — the kind implies it.
 #[derive(Debug, Clone)]
@@ -135,6 +146,12 @@ pub enum PopupMessage {
     InspectorToggle(u64),
     InspectorRecapture,
     InspectorBack,
+    /// Round 15 (Deep Freeze): open the i-th archived page in the
+    /// active pane, delete the i-th archived page (file + index),
+    /// or close the Archived pages window.
+    ArchivesOpen(usize),
+    ArchivesDelete(usize),
+    ArchivesClose,
     ExitConfirm,
     ExitCancel,
 }
@@ -234,6 +251,7 @@ impl Frost {
             PopupKind::Print => self.print_win.as_ref().map(|w| w.id),
             PopupKind::Open => self.open_win.as_ref().map(|w| w.id),
             PopupKind::Inspector => self.inspector_win.as_ref().map(|w| w.id),
+            PopupKind::Archives => self.archives_win.as_ref().map(|w| w.id),
             PopupKind::Exit => self.exit_win,
         }
     }
@@ -248,6 +266,8 @@ impl Frost {
             Some(PopupKind::Open)
         } else if self.popup_id(PopupKind::Inspector) == Some(id) {
             Some(PopupKind::Inspector)
+        } else if self.popup_id(PopupKind::Archives) == Some(id) {
+            Some(PopupKind::Archives)
         } else if self.popup_id(PopupKind::Exit) == Some(id) {
             Some(PopupKind::Exit)
         } else {
@@ -385,6 +405,31 @@ impl Frost {
         ])
     }
 
+    /// Open the Archived pages window (Round 15, or focus it, if
+    /// open). A fresh listing is read for the archives dir.
+    pub fn open_archives_window(&mut self) -> Task<Message> {
+        if let Some(id) = self.popup_id(PopupKind::Archives) {
+            return window::gain_focus(id);
+        }
+        let (id, spawn) = window::open(window::Settings {
+            size: Size::new(820.0, 620.0),
+            exit_on_close_request: false,
+            transparent: true,
+            position: window::Position::Centered,
+            ..Default::default()
+        });
+        let entries = archive::list_archives(&archive::archives_dir());
+        self.archives_win = Some(ArchivesWindow {
+            id,
+            entries,
+            error: None,
+        });
+        Task::batch([
+            spawn.map(|id| cosmic::Action::App(Message::WindowOpened(id))),
+            self.set_window_title("Archived pages".to_string(), id),
+        ])
+    }
+
     /// Open the Exit confirmation dialog (or focus it, if open).
     pub fn open_exit_window(&mut self) -> Task<Message> {
         if let Some(id) = self.popup_id(PopupKind::Exit) {
@@ -422,6 +467,7 @@ impl Frost {
             Some(PopupKind::Print) => self.print_win = None,
             Some(PopupKind::Open) => self.open_win = None,
             Some(PopupKind::Inspector) => self.inspector_win = None,
+            Some(PopupKind::Archives) => self.archives_win = None,
             Some(PopupKind::Exit) => self.exit_win = None,
             None => {},
         }
@@ -675,6 +721,56 @@ impl Frost {
                 Task::none()
             },
             PopupMessage::InspectorBack => self.close_popup(PopupKind::Inspector),
+            PopupMessage::ArchivesOpen(index) => {
+                // Load the archive's file:// URL in the ACTIVE pane
+                // (same in-flight ceremony as the address bar), then
+                // close the list. The archive is a frozen snapshot —
+                // opening it never re-fetches the live page.
+                let Some(entry) = self
+                    .archives_win
+                    .as_ref()
+                    .and_then(|w| w.entries.get(index).cloned())
+                else {
+                    return Task::none();
+                };
+                let path = entry.path(&archive::archives_dir());
+                let url = match url::Url::from_file_path(&path) {
+                    Ok(u) => u.to_string(),
+                    Err(()) => {
+                        self.active_pane_mut().status = format!(
+                            "Cannot open {}: not a loadable file path",
+                            path.display()
+                        );
+                        return Task::none();
+                    },
+                };
+                self.load_url_in_main(&url);
+                self.close_popup(PopupKind::Archives)
+            },
+            PopupMessage::ArchivesDelete(index) => {
+                // Delete the file + index entry, then re-list so
+                // the window shows the result. A failed delete
+                // reports in the window instead of closing it.
+                let Some(entry) = self
+                    .archives_win
+                    .as_ref()
+                    .and_then(|w| w.entries.get(index).cloned())
+                else {
+                    return Task::none();
+                };
+                let result = archive::delete_archive(&archive::archives_dir(), &entry);
+                if let Some(w) = &mut self.archives_win {
+                    match result {
+                        Ok(()) => {
+                            w.error = None;
+                            w.entries = archive::list_archives(&archive::archives_dir());
+                        },
+                        Err(e) => w.error = Some(e),
+                    }
+                }
+                Task::none()
+            },
+            PopupMessage::ArchivesClose => self.close_popup(PopupKind::Archives),
             PopupMessage::ExitConfirm => {
                 std::process::exit(0);
             },
@@ -710,6 +806,12 @@ impl Frost {
                     return container(text("")).into();
                 };
                 inspector_view(self, w)
+            },
+            Some(PopupKind::Archives) => {
+                let Some(w) = &self.archives_win else {
+                    return container(text("")).into();
+                };
+                archives_view(self, w)
             },
             Some(PopupKind::Exit) => exit_view(self),
             None => container(text("")).into(),
@@ -1117,6 +1219,95 @@ fn open_view<'a>(frost: &'a Frost, w: &'a OpenWindow) -> Element<'a, Message> {
         container(
             button::standard("Close")
                 .on_press(Message::Popup(PopupMessage::OpenClose)),
+        )
+        .padding([12, 0, 0, 0])
+        .into(),
+    );
+    container(
+        scrollable(
+            cosmic::widget::column::with_children(children)
+                .spacing(4)
+                .padding([8, 16, 16, 16]),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill),
+    )
+    .style(move |_| chrome_container_style(colors))
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+/// The Archived pages window (Round 15, Deep Freeze): the frozen
+/// pages, newest first — title, original URL, freeze date, file
+/// size — each with Open (loads the frozen file:// in the active
+/// pane) and Delete (removes the file + the index entry).
+fn archives_view<'a>(frost: &'a Frost, w: &'a ArchivesWindow) -> Element<'a, Message> {
+    let colors = frost.settings.theme.chrome_colors();
+    let mut children: Vec<Element<'_, Message>> = vec![];
+    children.push(
+        container(text("Archived pages").size(22))
+            .padding([8, 0, 4, 0])
+            .into(),
+    );
+    children.push(
+        muted("Frozen pages are read-only snapshots — opening one never re-fetches the live page."),
+    );
+    if let Some(error) = &w.error {
+        children.push(
+            container(text(error).size(14))
+                .padding([8, 0, 4, 0])
+                .into(),
+        );
+    }
+    if w.entries.is_empty() {
+        children.push(muted("(No frozen pages yet — use Freeze this page… from the ☰ menu.)"));
+    } else {
+        for (i, entry) in w.entries.iter().enumerate() {
+            let detail = if entry.url.is_empty() {
+                format!(
+                    "{} · {}",
+                    format_capture_time(entry.frozen_at_unix * 1000),
+                    file_browser::human_size(entry.size_bytes)
+                )
+            } else {
+                format!(
+                    "{} · {} · {}",
+                    entry.url,
+                    format_capture_time(entry.frozen_at_unix * 1000),
+                    file_browser::human_size(entry.size_bytes)
+                )
+            };
+            let buttons: Vec<Element<'_, Message>> = vec![
+                button::standard("Open")
+                    .on_press(Message::Popup(PopupMessage::ArchivesOpen(i)))
+                    .into(),
+                button::standard("Delete")
+                    .on_press(Message::Popup(PopupMessage::ArchivesDelete(i)))
+                    .into(),
+            ];
+            children.push(
+                container(
+                    cosmic::widget::column::with_children(vec![
+                        container(text(&entry.title).size(15)).into(),
+                        container(text(detail).size(13))
+                            .padding([2, 0, 2, 0])
+                            .into(),
+                        cosmic::widget::row::with_children(buttons)
+                            .spacing(8)
+                            .into(),
+                    ])
+                    .spacing(2),
+                )
+                .padding([8, 0, 8, 0])
+                .into(),
+            );
+        }
+    }
+    children.push(
+        container(
+            button::standard("Close")
+                .on_press(Message::Popup(PopupMessage::ArchivesClose)),
         )
         .padding([12, 0, 0, 0])
         .into(),

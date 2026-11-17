@@ -260,10 +260,20 @@ No new features — this round finishes what Round 3 left open:
   No fork patch (every `EngineEvent` now carries a
   `WebViewId` so the UI can route events to panes). No
   draggable divider yet — that is the v1 limit, not a bug.
-  Then: Deep Freeze offline archive, Frostbite tab
-  hibernation (needs a tab system first), Snowdrift workspaces
-  (needs tabs + sessions + persistence — biggest). Inspector v2
-  (docked panel, click-to-inspect, live updates, console) stays
+- Round 15 (done 2026-11-16, step 4 in the order): Deep Freeze
+  v1 — freeze the active pane's page into a single
+  self-contained HTML archive (live DOM, absolute
+  subresource URLs, `<base>` tag) under
+  `$XDG_DATA_HOME/frost/archives/` with an `index.json`;
+  "Archived pages…" native window lists archives with
+  Open/Delete; menu (9 items) + Ctrl+K entries. No fork
+  patch. Honest v1 limits: heavy JS apps may not replay
+  perfectly (scripts re-run against the static DOM), no
+  incremental updates — re-freeze to refresh.
+  Then: Frostbite tab hibernation (needs a tab system
+  first), Snowdrift workspaces (needs tabs + sessions +
+  persistence — biggest). Inspector v2 (docked panel,
+  click-to-inspect, live updates, console) stays
   unqueued. (Print-to-PDF stays out until Servo gains a real
   print pipeline — F-003's preview + PNG save is the honest
   scope.)
@@ -320,10 +330,27 @@ blocking, per-site allow/deny, list management in the UI.
 
 ### Deep Freeze — offline page archive
 
-Save any page as a frozen archive: the full DOM + resources, stored
-locally, re-openable without the network. Not a screenshot and not a
-single-file HTML dump — a real archive Frost can re-render. For research,
-receipts, and pages that disappear.
+**v1 DONE (Round 15, 2026-11-16).** "Freeze this page…"
+in the menu and the Ctrl+K palette saves the ACTIVE
+pane's page as one self-contained HTML file: the live
+DOM cloned via the Inspector's script-injection path,
+relative subresource URLs rewritten to absolute, a
+`<base href="original-url">` in the head, saved to
+`$XDG_DATA_HOME/frost/archives/` with an `index.json`
+(title, URL, date frozen, size). "Archived pages…"
+opens a native window listing archives with Open (loads
+the archive `file://` in the active pane) and Delete
+(removes file + entry). Archives are read-only
+snapshots — opening one never re-fetches the live page;
+Snowplow-blocked resources simply are not in the
+archive. Honest v1 limits: plain pages archive cleanly,
+heavy JS apps may not replay perfectly (scripts in the
+snapshot run against a static DOM — example.org's own
+`s.js` re-runs on open and re-orders its paragraphs),
+and there are no incremental updates (re-freeze to
+refresh). v2 (unqueued): inlining subresources so an
+archive needs no network at all, and per-archive
+refresh.
 
 ### Command palette
 

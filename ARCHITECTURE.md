@@ -823,3 +823,82 @@ a retry mid-link. The gate binary was linked with
 --bins` (517 MB, same code, no debuginfo). No profile
 change shipped; the zip's source builds the normal dev
 binary.
+
+## Round 15 — Deep Freeze archives (live-DOM snapshot, file + index)
+
+The archive module is `crates/frost/src/archive.rs`
+(pure functions + filesystem, 10 unit tests). It does
+not touch the engine or the fork: capture goes through
+the same `evaluate_javascript_string` injection the
+Inspector uses (Round 5), and the writer is plain
+`std::fs`.
+
+Capture: `FREEZE_CAPTURE_SCRIPT` is a JS IIFE run in the
+active pane's webview. It clones `documentElement`
+(`cloneNode(true)`), inserts `<base
+href="<page URL>">` as the first child of the clone's
+head when the page has no `<base>` of its own, rewrites
+every relative `src`, `href`, and `srcset` in the clone
+to absolute URLs with `new URL(value, pageUrl)`, and
+returns `clone.outerHTML`. The live DOM is never
+mutated — the banner div the sample extension injected
+is captured because it is in the live DOM, which is
+correct: the archive is the page as it was. What the
+script cannot do is freeze state that is not in the DOM:
+a script in the snapshot re-runs on open against the
+static DOM (example.org's own `s.js` re-inserts its
+translated paragraphs and re-orders them — the README
+gates caught this live; it is the documented v1 limit,
+not a capture bug).
+
+Storage: `archives_dir()` resolves
+`$XDG_DATA_HOME/frost/archives/` (else
+`~/.local/share/frost/archives/`), the same XDG
+convention as `settings.json` under `$XDG_CONFIG_HOME`.
+`archive_filename` is `sanitize_title(title)` (lowercase
+alphanumerics and `-`, everything else dropped) + `-` +
+`timestamp_compact` (`YYYYMMDD-HHMM`, UTC) + `.html`;
+`save_archive` appends `-2`, `-3`, … on collision and
+writes `index.json` (a `Vec<ArchiveEntry>`: title, url,
+filename, `frozen_at_unix`, `size_bytes`) newest-first.
+`list_archives` returns index entries whose file still
+exists, recovers orphan `.html` files not in the index,
+and prunes stale index entries. `format_frozen_time`
+renders the Unix time as `YYYY-MM-DD HH:MM:SS UTC`
+(Howard Hinnant civil-from-days, no chrono dependency);
+`human_size` is reused from `file_browser`.
+
+Flow: the menu and the palette both send
+`Message::FreezePage` / `Message::OpenArchives`.
+`freeze_page()` mirrors `capture_inspector`: it takes
+the ACTIVE pane's webview and URL (`active_pane()` —
+in split view this is the pane the user clicked last),
+arms `freeze_rx` / `freeze_pending` /
+`freeze_pending_url` / `freeze_pending_title`, and
+evaluates the script. The tick polls the receiver and,
+on arrival, calls `archive::save_archive` and sets the
+status to "Frozen: {title}" (or "Freeze failed: {e}").
+`freeze_title()` falls back page title → host → URL →
+"Untitled page". The palette gates the entry on
+`can_freeze` — shown only when the active pane has a
+URL; "Archived pages…" is always shown
+(`palette_commands_for` gained a `can_freeze: bool`).
+Both arms close the menu and the palette first, like
+every other command.
+
+The list window is `PopupKind::Archives`
+(`crates/frost/src/app/windows.rs`), the Round 7 native
+popup pattern: `ArchivesWindow { id, entries, error }`
+(820×620, title "Archived pages"), built from a fresh
+`list_archives` call on open. `PopupMessage::ArchivesOpen(usize)`
+loads the archive with `Url::from_file_path` through
+`load_url_in_main` (active pane) and closes the list;
+`ArchivesDelete(usize)` removes the file and the index
+entry, then re-lists in place; `ArchivesClose` closes.
+The view reuses `format_capture_time` (windows.rs, UTC)
+and shows the read-only note ("Frozen pages are
+read-only snapshots — opening one never re-fetches the
+live page."), one row per archive (title, URL · date ·
+size, Open / Delete buttons), an empty state, and a
+Close button. No fork patch, no new crate: the feature
+is one module plus two message arms plus one popup kind.

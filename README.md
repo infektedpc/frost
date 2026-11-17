@@ -5,13 +5,14 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 14 — Split view, two pages side by side.** Each
-pane is a full webview with its own URL, history, and Snowplow
-count; the active pane wears a 2 px border, and the menu (7 items)
-and Ctrl+K palette toggle the split with a dynamic label. Tests
-72/72 (baseline 69/69 + 3 new Round 14 tests). No fork patch; the
-fork is untouched at `f9462dbb7`. See [ROADMAP.md](ROADMAP.md) for
-the plan.
+**Status: Round 15 — Deep Freeze archives: freeze any page into a
+self-contained HTML snapshot and reopen it offline.** "Freeze this
+page…" in the menu (9 items) and the Ctrl+K palette saves the
+ACTIVE pane's live DOM with absolute subresource URLs and a
+`<base>` tag; "Archived pages…" opens a native window listing
+archives with Open/Delete. Tests 83/83 (baseline 72/72 + 11 new
+Round 15 tests). No fork patch; the fork is untouched at
+`f9462dbb7`. See [ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -1880,3 +1881,170 @@ scroll over the page, drag latency, the Round 6 flashing
 fix on real hardware, and the WM-drawn titlebar itself
 (look, real min/max/close) — bare Xvfb has no window
 manager, so Joel's KDE box is the verdict for those.
+
+## Round 15 — Deep Freeze: freeze a page into an offline archive (what is proven, what is not)
+
+Step 4 in Joel's easiest-first order (command palette was
+step 1, Round 9; Snowplow step 2, Round 13; split view
+step 3, Round 14). No fork patch; the fork is untouched
+at `f9462dbb7`.
+
+Design: a new module `crates/frost/src/archive.rs`
+owns the whole feature. "Freeze this page…" in the
+hamburger menu (now 9 items) and "Freeze this page" in
+the Ctrl+K palette saves the ACTIVE pane's current page
+— in split view the active pane, in single view the only
+pane. The capture reuses the Inspector's script-injection
+path: `FREEZE_CAPTURE_SCRIPT` is a JS IIFE that clones
+`document.documentElement`, inserts a `<base
+href="original-url">` into the clone's head if none
+exists, rewrites relative `src` / `href` / `srcset`
+attributes to absolute URLs against the page's URL, and
+returns `clone.outerHTML` — the live DOM is never
+mutated. `build_archive_html` wraps it in a doctype plus
+an identifying comment (URL + freeze time) and
+`save_archive` writes it to
+`$XDG_DATA_HOME/frost/archives/` (same convention as
+`settings.json` under `$XDG_CONFIG_HOME/frost/`), named
+sanitized-title + timestamp, e.g.
+`example-domain-20261117-0251.html`, with a `-2`/`-3`
+collision suffix. An `index.json` next to the files
+records title, original URL, filename, freeze time, and
+size; `list_archives` returns index entries whose file
+still exists (plus orphan `.html` recovery and stale
+pruning), newest first. "Archived pages…" (menu and
+palette) opens a native libcosmic window (the Round 7
+pattern — no web server, no frost:// page) listing
+title, original URL, date frozen, and file size, with
+Open (loads the archive `file://` in the active pane)
+and Delete (removes the file and the index entry). The
+status line reports "Frozen: <title>". Archives are
+read-only snapshots: opening one never re-fetches the
+live page, and Snowplow-blocked resources simply are not
+in the archive (they never loaded).
+
+Honest v1 limits (stated, not oversold): plain pages
+archive cleanly; heavy JavaScript apps may not replay
+perfectly — scripts in the snapshot run against a static
+DOM, not the live app state. There are no incremental
+updates to an archive — re-freeze to refresh. And a
+snapshot's subresources re-resolve against the original
+URL, so they need the network (or the browser cache) to
+load; only the DOM text itself is guaranteed offline.
+
+Gates, all on the Round 15 binary under Xvfb :97 (test
+server on 127.0.0.1:18080, hang server on 127.0.0.1:18099,
+subresource server on 127.0.0.1:18101): (a) freeze
+example.org from the menu — archive
+`example-domain-20261117-0251.html` (2,947 B) appears in
+the archives dir with a correct `index.json` entry, and
+the status line says "Frozen: Example Domain"
+(`r15-02-menu.jpg`, `r15-03-frozen.jpg`). The file head
+shows the doctype, the identifying comment, and `<base
+href="https://example.org/">` as the head's first child.
+(b) Open the archive `file://` — it renders the frozen
+example.org content: all six language paragraphs, the
+"Learn more" link, and the extension banner from the
+frozen DOM (`r15-04-archive-open.jpg`). (c) The Archived
+pages window lists it — "Example Domain",
+"https://example.org/ · 2026-11-17 02:51:02 UTC · 2 KB"
+— with Open and Delete (`r15-05-archives.jpg`); Open
+from the list loads the archive in the active pane
+(`r15-05c-open-from-list.jpg`, byte-identical render to
+the direct `file://` open); Delete removes the file and
+the entry (`index.json` becomes `[]`) and the window
+shows "(No frozen pages yet — use Freeze this page…
+from the ☰ menu.)" (`r15-05f-after-delete.jpg`). (d)
+Split-view freeze is active-pane: with example.org left
+and the Snowplow test page right, Freeze from the menu
+writes `snowplow-test-page-20261117-0258.html` (title
+"Snowplow test page", URL the 127.0.0.1 test page — NOT
+example.org) and the status says "Frozen: Snowplow test
+page" (`r15-07-split.jpg`, `r15-07b-right-snowplow.jpg`,
+`r15-07d-frozen-right.jpg`). (e) Menu 9 items and
+palette entries work — the palette lists "Freeze this
+page" and "Archived pages…" (`r15-09-palette.jpg`) and
+Freeze from the palette actually freezes the active
+(left) pane, writing a second snowplow archive
+(`r15-09b-palette-freeze.jpg`); Snowplow still blocks in
+BOTH panes — each shows "blocked-img: failed",
+"allowed-img: loaded" (green square), "blocked-js:
+failed" with the status count "Snowplow blocked 4"
+(`r15-08-snowplow-right.jpg`,
+`r15-08b-snowplow-left.jpg`). (f) Full regression:
+settings save + persist across relaunch (homepage
+example.org → example.com and theme Dark → Light, saved
+→ `settings.json` shows both → relaunch opens
+example.com in Light, `r15-15-settings.jpg`,
+`r15-15b-settings-saved.jpg`, `r15-17-relaunch.jpg`);
+banner on example.org and correctly absent on
+example.com (the sample extension's manifest matches
+example.org only — that is by design, not a miss);
+Inspector F12 gives a real 30-node snapshot of the
+active pane's snowplow page (`r15-11-inspector.jpg`);
+split view opens and closes keeping the active pane
+(`r15-10-split-closed.jpg`); strip-scroll paints BAND
+2 / BAND 3 / BAND 4 fully (`r15-12-bands-scrolled.jpg`);
+`frost://settings` fails plainly with the "no longer
+has internal pages" status (`r15-13-frost-scheme.jpg`);
+`ss` shows no Frost listener (only the harness's own
+servers on 9999/18080/18099/18101). (g) GNOME-mode
+launch shows Frost's own titlebar "Frost — Example
+Domain" with min/max/close above the toolbar, in the
+persisted Light theme (`r15-18-gnome.jpg`).
+
+Three things the gates found, all understood, none a
+code defect: (1) The first hamburger click "failed"
+because the harness clicked at y≈108 — the toolbar is
+at y 0–47 and the ☰ button's center is (1247, 24),
+measured from the launch PPM with `measure-toolbar.py`.
+The visual-grounding point (1248, 24) was right; the
+estimate from the displayed (scaled) image was wrong.
+Lesson: measure toolbar rows from the PPM, or trust
+grounding — never estimate pixel rows from the displayed
+image. (2) The Back-button engine quirk from Rounds
+11/12 reappeared: after a same-URL `file://` →
+`file://` navigation (Open from the list), Back showed
+"Going back…" then settled on the same `file://` URL.
+Typed navigation worked around it; clean Back sequences
+still pass. (3) example.org's own `s.js` re-runs when an
+archive opens: it inserts a second copy of the
+translated paragraphs and re-orders by
+`navigator.languages`, so the archive renders with
+Arabic first and English at the bottom. The archive
+FILE is correct — one copy of each paragraph, DOM order
+verified on disk — the re-run is the page's own script
+against the static DOM, which is exactly the documented
+v1 limit in action. Scripts are kept in the snapshot by
+design; stripping them would be a different feature.
+
+Two harness notes for the next round: the Round 15
+launch script only starts the 18080 test server and the
+18099 hang server — the Snowplow page's subresources
+live on 18101, and until that server was started by hand
+every subresource read "failed" (including the allowed
+one). Start 18101 serving `r13-test/` before any
+Snowplow gate. And the Snowplow status count in split
+view reads "Snowplow blocked 4" with 2 blocked requests
+per pane — the count sums across panes; the per-pane
+blocking behavior itself is correct in both. Cosmetic,
+left as-is.
+
+Build note: the plain 2 GB debug link OOM-killed twice
+in Round 14, so this round linked the gate binary with
+`-C link-arg=-Wl,--strip-debug` via `cargo rustc -p frost
+--bins` from the start (517,092,064 B, same code, no
+debuginfo). No profile change shipped; the zip's source
+builds the normal dev binary.
+
+Carried over, unchanged: the stale "Capturing…" status
+after a capture (Round 7); Settings has no in-content
+Close button (OS close works, and in WM mode the popup
+has a real WM close button); theme applies on Save, not
+per click; the Back-button engine quirk (above).
+Not verified in the sandbox, as before: real
+mouse/keyboard, mouse-wheel scroll over the page, drag
+latency, the Round 6 flashing fix on real hardware, and
+the WM-drawn titlebar itself (look, real min/max/close)
+— bare Xvfb has no window manager, so Joel's KDE box is
+the verdict for those.
