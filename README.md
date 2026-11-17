@@ -5,13 +5,15 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 18 — MSE foundation: `MediaSource` /
-`SourceBuffer` exist in the engine (fork patch F-011),
-`isTypeSupported` answers, a `<video>` attaches a
-MediaSource and reaches `open`. YouTube still does NOT
-play — appended bytes are queued, not decoded; the
-decode pipeline is Round 19. Tests 87/87. Fork at
-F-011. See [ROADMAP.md](ROADMAP.md) for the plan.**
+**Status: Round 19 — MSE slice 2: `SourceBuffer.appendBuffer`
+→ media thread (fork patch F-012). Appended fMP4 segments
+reach the player, `buffered` reports [0.00–10.00],
+`loadedmetadata` fires with duration 10 s and 320×240,
+and — beyond the slice's scope — the segments decode
+and PLAY through the existing ServoSrc pipeline.
+YouTube still does NOT play — its DASH player has not
+been driven yet; that is Round 20/21. Tests 87/87.
+Fork at F-012. See [ROADMAP.md](ROADMAP.md) for the plan.**
 
 ## Layout
 
@@ -21,7 +23,7 @@ frost/
 ├── rust-toolchain.toml   # Rust 1.99.1 (matches the Servo fork's pin)
 ├── FORK.md               # the Servo fork: point, patches, planned patches
 ├── clone-fork.sh         # recreate servo/ from scratch (shallow v0.8.0 + patches)
-├── patches/              # the ten proven 0.8.0 engine patches (vendored)
+├── patches/              # the twelve proven 0.8.0 engine patches (vendored)
 ├── servo/                # the Servo fork (NESTED repo, gitignored, not in the zip)
 ├── crates/
 │   ├── frost/            # libcosmic app: toolbar, address bar, hamburger menu
@@ -2622,3 +2624,168 @@ that changes YouTube playback; the foundation is
 real and testable on his box from this tree, but
 playback needs Round 19 first. Next: Round 19,
 `SourceBuffer.appendBuffer` → media thread.
+
+## Round 19 — MSE slice 2 (`appendBuffer` → media thread)
+
+The second slice of the MSE project Joel chose
+2026-11-16 ("MSE project next", ahead of Frostbite).
+Fork patch F-012 wires `SourceBuffer`'s queued
+`pending_bytes` into the media thread:
+
+- New pure-fMP4 parser `components/script/dom/media/mp4.rs`
+  (registered in `dom/media/mod.rs`): init segment
+  (`moov`: mvhd timescale/duration, trak tkhd track_ID
+  + mdia mdhd timescale + hdlr handler) and media
+  segments (`moof`/`traf`: tfhd track_ID +
+  default-sample-duration, tfdt base decode time,
+  trun per-sample durations or the tfhd default),
+  `timestampOffset` + appendWindow clipping, range
+  merge/subtract. 7 unit tests with hand-built boxes —
+  they live in the fork's script crate and do NOT run
+  in the frost workspace suite (the fork has its own
+  cold `servo/target/`; `cargo check -p servo-script`
+  in the fork was tried and killed mid-rebuild of
+  mozjs — the frost workspace build is the correct
+  build path). The live probe gate is the guard for
+  the parser.
+- `SourceBuffer::drain_pending` hands each queued
+  chunk to the player through
+  `HTMLMediaElement::push_media_source_data` — the
+  same `player.push_data` path the network fetch
+  uses — and computes `buffered` TimeRanges
+  script-side from the parsed segments. Script-side
+  is required: the player's `buffered()` needs a
+  known total input size, which an open-ended MSE
+  stream never has. On `EnoughData` the remaining
+  chunks stay queued for the next `NeedData` drain.
+- `HTMLMediaElement` drives state from the media
+  thread: metadata → `HAVE_METADATA` +
+  `loadedmetadata` + `networkState` Idle (MSE data
+  arrives via appends, not the network); the
+  demuxer-reported duration propagates to the
+  element and to the `MediaSource`
+  (`playback_duration_changed` → `set_duration_from_media`);
+  `Buffered()` unions the source buffers' ranges
+  for MSE elements; `attach_media_source` drains
+  bytes appended before attach; the SeekData arm
+  refuses MSE seeks with a warning (no byte-range
+  fetch exists to serve one).
+- Bug fixed by the gate (not in the original code):
+  `add_to_active` silently dropped the buffer when
+  the page had never read `activeSourceBuffers`
+  before the first metadata event — the list did not
+  exist yet, so the `get()` guard no-op'd. It now
+  creates the list on demand (takes a `JSContext`).
+  A probe-side bug was fixed at the same time: the
+  probe asserted `networkState === 3` for "idle",
+  but the enum is 0 EMPTY / 1 IDLE / 2 LOADING /
+  3 NO_SOURCE — idle is 1, and the tail was already
+  setting it correctly.
+
+Stretch result, gated live — beyond this slice's
+scope: the pushed segments decode and PLAY through
+the existing ServoSrc/decodebin3 pipeline. The
+probe's `play()` fires `playing`, `currentTime`
+advances to 2.00 after 2 s, and a decoded frame
+(the white ball on black) renders
+(`r19-probe4b`). That re-scopes Round 20: it is
+no longer "build an appsrc pipeline" — the pipeline
+already works for local segments — but "feed
+YouTube's DASH segments through this one and close
+whatever gaps that exposes".
+
+Honest limits, stated up front: YouTube still does
+NOT play — its player has not been driven against
+this yet; that is Rounds 20–21. Seeking is not
+supported in this slice. Duration is the demuxer's
+running estimate over the segments it has consumed
+so far: the last segment can sit in the script-side
+queue until playback asks for more data, so the
+probe polls for the duration to settle once playing
+(8 s → 10 s in one run). The Snowplow blocked
+count is cosmetic and racy in split view: the same
+page read "blocked 1" with YouTube loading in the
+other pane and "blocked 4" single-pane — the
+blocking behavior itself (blocked-img/js failed,
+allowed-img loaded) is correct in every run, and
+the count code is untouched by F-012. No `.deb`, no
+push — there is nothing new for Joel to install
+that changes YouTube playback yet.
+
+Gates, all on the Round 19 strip-debug binary under
+Xvfb :97 (test servers 18080/18099/18101, fresh
+`r19-config`/`r19-data`, no-blocklist launch for
+the media gates):
+
+- Full test suite: 87/87 (54 + 17 + 8 + 8),
+  serialized, `CARGO_BUILD_JOBS=1`. The fork code
+  compiles with no new warnings (two pre-existing
+  ones remain: an unused import in
+  `sourcebufferlist.rs`, an unused variable in
+  `document.rs`).
+- MSE probe (`r19-probe4`, `r19-probe4b`): ALL
+  PASS — `sourceopen`, `addSourceBuffer`, init +
+  5 segments each firing `updateend`, `buffered`
+  empty after init only, `buffered` [0.00–10.00]
+  after segments, `video.buffered` mirrors it,
+  `loadedmetadata` (readyState 4), duration settles
+  to 10 s once playing, `ms.duration` follows the
+  demuxer, `activeSourceBuffers` length 1,
+  `networkState` idle (1), video 320×240,
+  `remove(0,2)` → `buffered` starts at 2.00,
+  `playing` fires with `currentTime` 2.00 after
+  2 s, `endOfStream` → `sourceended` (`ended`).
+  Test media: `frag.mp4` re-encoded from the R17
+  moving clip (`-g 60 -frag_duration 2000000`,
+  `frag_keyframe+empty_moov+default_base_moof`),
+  split into `init.mp4` (1,281 B) + `seg0..4.mp4`
+  (23,048 / 22,842 / 22,353 / 13,973 / 4,448 B).
+- R18 probe still passes, 29/29 (`r19-r18probe`,
+  `r19-r18probe3`): `typeof MediaSource`,
+  `isTypeSupported`, attach, `addSourceBuffer`,
+  `endOfStream`, detach, `createObjectURL` blob
+  attach (networkState loading 2).
+- Regressions, all pass: homepage paints
+  (`r19-home`); youtube.com loads, 0 `SendRequest` /
+  `PROTOCOL_ERROR` in the log — the page reaches
+  its skeleton UI and then the "Try searching to
+  get started" state (`r19-youtube`, `r19-youtube2`);
+  split view, both panes render YouTube
+  (`r19-split`, `r19-split2`); Snowplow blocks in
+  both panes — blocked-img/js failed, allowed-img
+  loaded in each (`r19-snowplow-left`,
+  `r19-snowplow-right`); Freeze writes a correct
+  archive (`index.json` + HTML with `<base>` tag,
+  `r19-freeze`); Inspector F12, 35-node snapshot
+  (`r19-inspector`); strip-scroll paints on
+  `bands.html`, BAND 1→2→3→4→5 with clean solid
+  repaints (`r19-bands-top/mid/low`);
+  `frost://settings` fails plainly with the
+  no-internal-pages message (`r19-frostscheme`);
+  settings save + persist across relaunch (search
+  engine changed to Google, still Google after quit
+  + relaunch, `r19-settings*`); no Frost listener
+  (`ss` — only the loomtop `:9999` watcher and the
+  three test servers); GNOME-mode fallback titlebar
+  with min/max/close (`r19-gnome`). Local H.264
+  video still plays under the no-blocklist launch
+  ("playing t=5.00", the 5 s test-pattern clip
+  played to the end, `r19-localvideo1/2`).
+
+Harness notes for the next round: Xvfb :97 and the
+18080/18101 test servers died during the long
+builds — restart both before gating (servers with
+`setsid nohup` so they survive a shell exit; the
+hang server on 18099 survived because it was
+started that way). Never `pkill -f` with a pattern
+that appears in your own command line — it kills
+your own shell; use `pgrep -x frost` + `kill`
+instead. `xclose` takes a title substring
+(`xclose "Settings"`); bare `xclose` exits 2.
+example.org fits the viewport, so it cannot prove
+scrolling — use `bands.html` for the scroll gate.
+The R18 harness quirk still applies: media gates
+need the no-blocklist launch, Snowplow gates the
+blocklist one. Next: Round 20, YouTube's DASH
+segments through the MSE pipeline (was: "GStreamer
+appsrc pipeline" — the pipeline is already there).

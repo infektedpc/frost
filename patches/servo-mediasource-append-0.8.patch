@@ -1,0 +1,1110 @@
+From f638be46466c3415cb9dc160b13db4fed7a28310 Mon Sep 17 00:00:00 2001
+From: Joel Horrell <infektedpc@gmail.com>
+Date: Tue, 17 Nov 2026 08:41:17 +0000
+Subject: [PATCH] =?UTF-8?q?F-012:=20MSE=20slice=202=20=E2=80=94=20appendBu?=
+ =?UTF-8?q?ffer=20=E2=86=92=20media=20thread=20(Round=2019)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../html/embedded_content/htmlmediaelement.rs | 115 +++-
+ components/script/dom/media/mediasource.rs    |  52 +-
+ components/script/dom/media/mod.rs            |   1 +
+ components/script/dom/media/mp4.rs            | 585 ++++++++++++++++++
+ components/script/dom/media/sourcebuffer.rs   | 177 +++++-
+ 5 files changed, 904 insertions(+), 26 deletions(-)
+ create mode 100644 components/script/dom/media/mp4.rs
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 70e74598c..35ca3533b 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -1686,6 +1686,76 @@ impl HTMLMediaElement {
+         }
+         self.attached_media_source.set(Some(media_source));
+         media_source.attach_to_media_element(self);
++        // Round 19: the page may already have appended bytes before
++        // the load algorithm attached the source; hand them to the
++        // player now that it exists.
++        self.drain_media_source_buffers();
++    }
++
++    /// Push one appended chunk into the media thread, the same way
++    /// the network fetch pushes downloaded bytes.
++    /// Round 19 (MSE): called by `SourceBuffer::drain_pending`.
++    pub(crate) fn push_media_source_data(&self, data: Vec<u8>) -> Result<(), PlayerError> {
++        let Some(ref player) = *self.player.borrow() else {
++            return Err(PlayerError::BufferPushFailed);
++        };
++        player.lock().unwrap().push_data(data)
++    }
++
++    /// Drain every attached source buffer's queued bytes into the
++    /// player. Called from the source buffers' `updateend` tasks, from
++    /// `NeedData`, and from attach.
++    pub(crate) fn drain_media_source_buffers(&self) {
++        let Some(media_source) = self.attached_media_source.get() else {
++            return;
++        };
++        for buffer in media_source.source_buffers() {
++            buffer.drain_pending();
++        }
++    }
++
++    /// Signal end of stream to the player (from
++    /// `MediaSource.endOfStream`).
++    pub(crate) fn end_of_stream_for_media_source(&self) {
++        if let Some(ref player) = *self.player.borrow() {
++            if let Err(error) = player.lock().unwrap().end_of_stream() {
++                warn!("MSE: could not signal end of stream: {error:?}");
++            }
++        }
++    }
++
++    /// Set the element duration from a page-set
++    /// `MediaSource.duration`. Routes through the demuxer-driven
++    /// duration path (set + `durationchange`, seek if past the end).
++    pub(crate) fn set_duration_from_media_source(&self, duration: f64) {
++        let duration = if duration.is_finite() {
++            Some(Duration::from_secs_f64(duration))
++        } else {
++            None
++        };
++        self.playback_duration_changed(duration);
++    }
++
++    /// Move source buffers whose tracks the media thread just
++    /// reported into `activeSourceBuffers` (Round 19).
++    fn activate_media_source_buffers(
++        &self,
++        cx: &mut JSContext,
++        metadata: &servo_media::player::metadata::Metadata,
++    ) {
++        let Some(media_source) = self.attached_media_source.get() else {
++            return;
++        };
++        let has_video = !metadata.video_tracks.is_empty();
++        let has_audio = !metadata.audio_tracks.is_empty();
++        for buffer in media_source.source_buffers() {
++            let mime = buffer.mime_type().str().to_lowercase();
++            let is_video = mime.contains("video");
++            let is_audio = mime.contains("audio");
++            if (is_video && has_video) || (is_audio && has_audio) {
++                media_source.add_to_active(cx, &buffer);
++            }
++        }
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+@@ -2858,6 +2928,15 @@ impl HTMLMediaElement {
+                 .clone()
+                 .unwrap_or(window.get_url().into_string()),
+         );
++
++        // Round 19: for a MediaSource element, the tracks the media
++        // thread just reported select the source buffers that carry
++        // them, and the network phase is over — data arrives via
++        // appends, not the network.
++        if self.attached_media_source.get().is_some() {
++            self.activate_media_source_buffers(cx, metadata);
++            self.network_state.set(NetworkState::Idle);
++        }
+     }
+ 
+     fn playback_duration_changed(&self, duration: Option<Duration>) {
+@@ -2869,6 +2948,12 @@ impl HTMLMediaElement {
+ 
+         self.duration.set(duration);
+ 
++        // Round 19: for a MediaSource element the demuxer-reported
++        // length is the stream's length.
++        if let Some(media_source) = self.attached_media_source.get() {
++            media_source.set_duration_from_media(duration);
++        }
++
+         // When the length of the media resource changes to a known value (e.g. from being unknown
+         // to known, or from a previously established length to a new length), the user agent must
+         // queue a media element task given the media element to fire an event named durationchange
+@@ -2917,6 +3002,12 @@ impl HTMLMediaElement {
+     }
+ 
+     fn playback_need_data(&self) {
++        // Round 19: for a MediaSource element there is no network
++        // fetch to resume — the data comes from the source buffers.
++        if self.attached_media_source.get().is_some() {
++            self.drain_media_source_buffers();
++            return;
++        }
+         // The media engine signals that the source needs more data. If we already have a valid
+         // fetch request, we do nothing. Otherwise, if we have no request and the previous request
+         // was cancelled because we got an EnoughData event, we restart fetching where we left.
+@@ -3681,7 +3772,17 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-buffered>
+     fn Buffered(&self, cx: &mut JSContext) -> DomRoot<TimeRanges> {
+         let mut buffered = TimeRangesContainer::default();
+-        if let Some(ref player) = *self.player.borrow() {
++        if let Some(media_source) = self.attached_media_source.get() {
++            // Round 19: for MSE the buffered ranges are the appended
++            // segments' ranges, not the player's query — the player
++            // needs a known total input size, which an open-ended MSE
++            // stream never has.
++            for buffer in media_source.source_buffers() {
++                for (start, end) in buffer.buffered_ranges() {
++                    let _ = buffered.add(start, end);
++                }
++            }
++        } else if let Some(ref player) = *self.player.borrow() {
+             let ranges = player.lock().unwrap().buffered();
+             for range in ranges {
+                 let _ = buffered.add(range.start, range.end);
+@@ -4494,7 +4595,17 @@ impl HTMLMediaElementEventHandler {
+                 element.playback_position_changed(cx, position)
+             },
+             PlayerEvent::SeekData(offset, seek_lock) => {
+-                element.fetch_request(cx, Some(offset), Some(seek_lock))
++                // Round 19: an MSE element has no network fetch to
++                // seek in — its bytes live in the source buffers and
++                // were already handed to the player. Report the seek
++                // as unserved so the pipeline does not wait forever;
++                // serving seeks from retained bytes is a later slice.
++                if element.attached_media_source.get().is_some() {
++                    warn!("MSE: seek to byte offset {offset} not served in this round");
++                    seek_lock.unlock(false);
++                } else {
++                    element.fetch_request(cx, Some(offset), Some(seek_lock))
++                }
+             },
+             PlayerEvent::SeekDone(position) => element.playback_seek_done(cx, position),
+             PlayerEvent::StateChanged(ref state) => element.playback_state_changed(cx, state),
+diff --git a/components/script/dom/media/mediasource.rs b/components/script/dom/media/mediasource.rs
+index f0ee22d41..154695fcf 100644
+--- a/components/script/dom/media/mediasource.rs
++++ b/components/script/dom/media/mediasource.rs
+@@ -150,6 +150,42 @@ impl MediaSource {
+         self.ready_state.set(MediaSourceReadyState::Closed);
+         self.queue_event("sourceclose");
+     }
++
++    /// The media element this source is attached to, if any.
++    pub(crate) fn attached_element(&self) -> Option<DomRoot<HTMLMediaElement>> {
++        self.attached_element.get()
++    }
++
++    /// The source buffers in `sourceBuffers`, in creation order.
++    pub(crate) fn source_buffers(&self) -> Vec<DomRoot<SourceBuffer>> {
++        let Some(list) = self.source_buffers.get() else {
++            return Vec::new();
++        };
++        (0..list.len())
++            .filter_map(|i| list.item(i))
++            .collect()
++    }
++
++    /// Add a buffer to `activeSourceBuffers` if it is not already
++    /// there. Called from the media element when the media thread
++    /// reports tracks (Round 19). The list is created on demand:
++    /// the page may never have read `activeSourceBuffers` before
++    /// the first metadata event, and adding to a not-yet-created
++    /// list must not silently drop the buffer.
++    pub(crate) fn add_to_active(&self, cx: &mut JSContext, buffer: &SourceBuffer) {
++        let list = self.active_source_buffers_list(cx);
++        if !list.contains(buffer) {
++            list.add(buffer);
++        }
++    }
++
++    /// Set the duration from the media thread (the demuxer reporting
++    /// the stream's length). Unlike the page-driven setter this does
++    /// not validate or propagate back to the element — the element is
++    /// where the value came from.
++    pub(crate) fn set_duration_from_media(&self, duration: f64) {
++        self.duration.set(duration);
++    }
+ }
+ 
+ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+@@ -197,6 +233,11 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+             ));
+         }
+         self.duration.set(duration);
++        // The media element's duration is the MediaSource duration:
++        // propagate a page-set value to the attached element.
++        if let Some(element) = self.attached_element.get() {
++            element.set_duration_from_media_source(duration);
++        }
+         Ok(())
+     }
+ 
+@@ -252,10 +293,15 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+                 "Cannot end a MediaSource stream that is not open".into(),
+             )));
+         }
+-        // A "decode" error would set the media element's error; the
+-        // element has no data yet in Round 18, so there is nothing to
+-        // fail — the state change below is the observable part.
++        // A "decode" error would set the media element's error; in
++        // Round 19 the player has whatever was appended, and the
++        // error is reported through its own event path.
+         let _ = error;
++        // Round 19: hand the end of stream to the player so it can
++        // finish decoding what was appended and fire `ended`.
++        if let Some(element) = self.attached_element.get() {
++            element.end_of_stream_for_media_source();
++        }
+         self.ready_state.set(MediaSourceReadyState::Ended);
+         self.queue_event("sourceended");
+         Ok(())
+diff --git a/components/script/dom/media/mod.rs b/components/script/dom/media/mod.rs
+index 8281a712e..7ddb82c2b 100644
+--- a/components/script/dom/media/mod.rs
++++ b/components/script/dom/media/mod.rs
+@@ -14,6 +14,7 @@ pub(crate) mod mediasession;
+ pub(crate) mod mediasource;
+ pub(crate) mod mediastream;
+ pub(crate) mod mediastreamtrack;
++pub(crate) mod mp4;
+ pub(crate) mod sourcebuffer;
+ pub(crate) mod sourcebufferlist;
+ pub(crate) mod videotrack;
+diff --git a/components/script/dom/media/mp4.rs b/components/script/dom/media/mp4.rs
+new file mode 100644
+index 000000000..1a3c097d7
+--- /dev/null
++++ b/components/script/dom/media/mp4.rs
+@@ -0,0 +1,585 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Minimal ISO BMFF (MP4) box parsing for MSE `buffered` ranges.
++//!
++//! Round 19: the media thread knows what it decoded, but the
++//! `SourceBuffer.buffered` attribute must report the time ranges of
++//! the segments the page appended — and the GStreamer player's
++//! `buffered()` query needs a known total input size, which MSE never
++//! has (the stream is open-ended), so it reports nothing useful here.
++//! Instead the ranges are computed at append time from the segment
++//! boxes themselves: the init segment gives each track's timescale,
++//! and each media segment's `tfdt` (base decode time) plus `trun`
++//! sample durations give its presentation-time range. This is the
++//! spec's own accounting — MSE buffered ranges come from the appended
++//! coded frames, not from the demuxer.
++//!
++//! Only the boxes MSE needs are parsed (`ftyp` skipped, `moov` with
++//! `mvhd`/`trak`/`tkhd`/`mdia`/`mdhd`/`hdlr`, `moof` with
++//! `traf`/`tfhd`/`tfdt`/`trun`); everything else (`mdat`, `mfra`,
++//! `free`, …) is skipped by size without copying. Malformed or
++//! truncated input yields `None`/empty ranges, never a panic.
++
++/// One track from the init segment.
++#[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf, PartialEq)]
++pub(crate) struct Mp4TrackInfo {
++    pub(crate) track_id: u32,
++    pub(crate) timescale: u32,
++    /// e.g. `b"vide"` or `b"soun"`.
++    pub(crate) handler: [u8; 4],
++}
++
++/// What the init segment tells us about the stream.
++#[derive(Clone, Debug, Default, JSTraceable, MallocSizeOf, PartialEq)]
++pub(crate) struct Mp4InitInfo {
++    pub(crate) movie_timescale: u32,
++    /// Movie duration in seconds (0.0 for fragmented presentations,
++    /// whose `mvhd` duration is 0).
++    pub(crate) movie_duration: f64,
++    pub(crate) tracks: Vec<Mp4TrackInfo>,
++}
++
++impl Mp4InitInfo {
++    fn timescale_for(&self, track_id: u32) -> Option<u32> {
++        self.tracks
++            .iter()
++            .find(|t| t.track_id == track_id)
++            .map(|t| t.timescale)
++    }
++}
++
++fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
++    data.get(offset..offset + 4)
++        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
++    data.get(offset..offset + 8)
++        .map(|b| u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
++}
++
++/// A parsed box header: type, where its content starts, and where the
++/// next sibling box starts. Returns `None` on truncated input.
++fn read_box(data: &[u8], offset: usize) -> Option<([u8; 4], usize, usize)> {
++    let size = read_u32(data, offset)? as u64;
++    let typ: [u8; 4] = data.get(offset + 4..offset + 8)?.try_into().ok()?;
++    let (header_size, total_size) = match size {
++        1 => (16, read_u64(data, offset + 8)?),
++        0 => (8, (data.len() - offset) as u64),
++        _ => (8, size),
++    };
++    if total_size < header_size as u64 || offset + total_size as usize > data.len() {
++        return None;
++    }
++    Some((
++        typ,
++        offset + header_size,
++        offset + total_size as usize,
++    ))
++}
++
++/// Iterate the child boxes of `data[start..end]`.
++fn children<F>(data: &[u8], start: usize, end: usize, mut f: F)
++where
++    F: FnMut([u8; 4], usize, usize),
++{
++    let mut offset = start;
++    while offset + 8 <= end {
++        let Some((typ, content, next)) = read_box(data, offset) else {
++            return;
++        };
++        if next > end {
++            return;
++        }
++        f(typ, content, next);
++        offset = next;
++    }
++}
++
++/// Parse an init segment (`ftyp` + `moov`). Returns `None` if no
++/// usable `moov` is present.
++pub(crate) fn parse_init_segment(bytes: &[u8]) -> Option<Mp4InitInfo> {
++    let mut init = Mp4InitInfo::default();
++    let mut found_moov = false;
++    children(bytes, 0, bytes.len(), |typ, content, next| {
++        if &typ != b"moov" {
++            return;
++        }
++        found_moov = true;
++        children(bytes, content, next, |typ, content, next| {
++            match &typ {
++                b"mvhd" => {
++                    let version = bytes.get(content).copied().unwrap_or(0);
++                    if version == 0 {
++                        if let (Some(timescale), Some(duration)) = (
++                            read_u32(bytes, content + 12),
++                            read_u32(bytes, content + 16),
++                        ) {
++                            init.movie_timescale = timescale;
++                            init.movie_duration = if timescale > 0 {
++                                duration as f64 / timescale as f64
++                            } else {
++                                0.0
++                            };
++                        }
++                    } else if let (Some(timescale), Some(duration)) = (
++                        read_u32(bytes, content + 20),
++                        read_u64(bytes, content + 24),
++                    ) {
++                        init.movie_timescale = timescale;
++                        init.movie_duration = if timescale > 0 {
++                            duration as f64 / timescale as f64
++                        } else {
++                            0.0
++                        };
++                    }
++                },
++                b"trak" => {
++                    let mut track_id = None;
++                    let mut timescale = None;
++                    let mut handler = None;
++                    children(bytes, content, next, |typ, content, next| {
++                        match &typ {
++                            b"tkhd" => {
++                                let version = bytes.get(content).copied().unwrap_or(0);
++                                let at = if version == 0 { content + 12 } else { content + 20 };
++                                track_id = read_u32(bytes, at);
++                            },
++                            b"mdia" => {
++                                children(bytes, content, next, |typ, content, _next| {
++                                    match &typ {
++                                        b"mdhd" => {
++                                            let version =
++                                                bytes.get(content).copied().unwrap_or(0);
++                                            let at = if version == 0 {
++                                                content + 12
++                                            } else {
++                                                content + 20
++                                            };
++                                            timescale = read_u32(bytes, at);
++                                        },
++                                        b"hdlr" => {
++                                            handler = bytes
++                                                .get(content + 8..content + 12)
++                                                .and_then(|b| b.try_into().ok());
++                                        },
++                                        _ => {},
++                                    }
++                                });
++                            },
++                            _ => {},
++                        }
++                    });
++                    if let (Some(track_id), Some(timescale), Some(handler)) =
++                        (track_id, timescale, handler)
++                    {
++                        init.tracks.push(Mp4TrackInfo {
++                            track_id,
++                            timescale,
++                            handler,
++                        });
++                    }
++                },
++                _ => {},
++            }
++        });
++    });
++    if found_moov {
++        Some(init)
++    } else {
++        None
++    }
++}
++
++/// Presentation-time ranges (seconds) covered by the media segments
++/// in `bytes`, using `init` for track timescales. A buffer may hold
++/// several segments; all their ranges are returned. Ranges from
++/// segments whose track is unknown, or whose sample durations cannot
++/// be determined, are skipped.
++pub(crate) fn segment_ranges(bytes: &[u8], init: &Mp4InitInfo) -> Vec<(f64, f64)> {
++    let mut ranges = Vec::new();
++    children(bytes, 0, bytes.len(), |typ, content, next| {
++        if &typ != b"moof" {
++            return;
++        }
++        children(bytes, content, next, |typ, content, next| {
++            if &typ != b"traf" {
++                return;
++            }
++            // One traf = one track's samples for this fragment.
++            let mut track_id = None;
++            let mut default_duration = None;
++            let mut base_decode_time = None;
++            // (trun start decode time offset, total duration) pairs,
++            // in file order; later truns continue where earlier ones end.
++            let mut trun_durations: Vec<u64> = Vec::new();
++            children(bytes, content, next, |typ, content, _next| {
++                match &typ {
++                    b"tfhd" => {
++                        track_id = read_u32(bytes, content + 4);
++                        let flags = read_u32(bytes, content).map(|v| v & 0x00ff_ffff);
++                        let flags = flags.unwrap_or(0);
++                        // Optional fields follow track_ID in flag order:
++                        // base-data-offset (8), sample-description-index (4),
++                        // default-sample-duration (4), default-sample-size (4),
++                        // default-sample-flags (4).
++                        let mut at = content + 8;
++                        if flags & 0x0000_01 != 0 {
++                            at += 8;
++                        }
++                        if flags & 0x0000_02 != 0 {
++                            at += 4;
++                        }
++                        if flags & 0x0000_08 != 0 {
++                            default_duration = read_u32(bytes, at).map(|v| v as u64);
++                        }
++                    },
++                    b"tfdt" => {
++                        let version = bytes.get(content).copied().unwrap_or(0);
++                        base_decode_time = if version == 0 {
++                            read_u32(bytes, content + 4).map(|v| v as u64)
++                        } else {
++                            read_u64(bytes, content + 4)
++                        };
++                    },
++                    b"trun" => {
++                        let flags = read_u32(bytes, content).map(|v| v & 0x00ff_ffff);
++                        let flags = flags.unwrap_or(0);
++                        let Some(count) = read_u32(bytes, content + 4).map(|v| v as usize) else {
++                            return;
++                        };
++                        let mut at = content + 8;
++                        if flags & 0x0000_01 != 0 {
++                            at += 4; // data-offset
++                        }
++                        if flags & 0x0000_04 != 0 {
++                            at += 4; // first-sample-flags
++                        }
++                        let per_sample = [
++                            flags & 0x0001_00 != 0, // sample-duration
++                            flags & 0x0002_00 != 0, // sample-size
++                            flags & 0x0004_00 != 0, // sample-flags
++                            flags & 0x0008_00 != 0, // sample-cts
++                        ];
++                        let entry_size =
++                            per_sample.iter().filter(|p| **p).count() * 4;
++                        let mut total = 0u64;
++                        let mut have_durations = false;
++                        for i in 0..count {
++                            let entry = at + i * entry_size;
++                            if per_sample[0] {
++                                if let Some(d) = read_u32(bytes, entry) {
++                                    total += d as u64;
++                                    have_durations = true;
++                                }
++                            }
++                        }
++                        if !have_durations {
++                            if let Some(default) = default_duration {
++                                total = default * count as u64;
++                                have_durations = true;
++                            }
++                        }
++                        if have_durations {
++                            trun_durations.push(total);
++                        }
++                    },
++                    _ => {},
++                }
++            });
++            let Some(track_id) = track_id else { return };
++            let Some(timescale) = init.timescale_for(track_id) else {
++                return;
++            };
++            let Some(mut decode_time) = base_decode_time else {
++                return;
++            };
++            if timescale == 0 {
++                return;
++            }
++            for total in trun_durations {
++                let start = decode_time as f64 / timescale as f64;
++                let end = (decode_time + total) as f64 / timescale as f64;
++                if end > start {
++                    ranges.push((start, end));
++                }
++                decode_time += total;
++            }
++        });
++    });
++    ranges
++}
++
++/// Parse one appended buffer, which may hold an init segment, media
++/// segments, or both (YouTube sometimes appends init + first segment
++/// in one call). Returns the init info found in this buffer (if any)
++/// and the segment ranges it covers. Pass the previously-known init
++/// info in `known_init` so segments appended before any init segment
++/// in the same buffer still resolve — the init segment is looked up
++/// first, then the ranges.
++pub(crate) fn parse_appended(
++    bytes: &[u8],
++    known_init: &Option<Mp4InitInfo>,
++) -> (Option<Mp4InitInfo>, Vec<(f64, f64)>) {
++    let found_init = parse_init_segment(bytes);
++    let init = found_init.clone().or_else(|| known_init.clone());
++    let ranges = match &init {
++        Some(init) => segment_ranges(bytes, init),
++        None => Vec::new(),
++    };
++    (found_init, ranges)
++}
++
++/// Apply a `SourceBuffer`'s `timestampOffset` and append window to a
++/// segment range. Returns `None` if the range falls entirely outside
++/// the window.
++pub(crate) fn apply_append_window(
++    range: (f64, f64),
++    timestamp_offset: f64,
++    window_start: f64,
++    window_end: f64,
++) -> Option<(f64, f64)> {
++    let start = (range.0 + timestamp_offset).max(window_start);
++    let end = (range.1 + timestamp_offset).min(window_end);
++    if end > start {
++        Some((start, end))
++    } else {
++        None
++    }
++}
++
++/// Remove `[start, end)` from `ranges`, splitting ranges that
++/// straddle the removed interval. Used by `SourceBuffer.remove()`.
++/// Note this is bookkeeping only: the player keeps the bytes it was
++/// already handed, and there is no player API to un-buffer them.
++pub(crate) fn subtract_range(ranges: &mut Vec<(f64, f64)>, start: f64, end: f64) {
++    let mut out = Vec::with_capacity(ranges.len());
++    for &(s, e) in ranges.iter() {
++        if e <= start || s >= end {
++            out.push((s, e));
++            continue;
++        }
++        if s < start {
++            out.push((s, start));
++        }
++        if e > end {
++            out.push((end, e));
++        }
++    }
++    *ranges = out;
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn bx(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
++        let mut out = Vec::new();
++        out.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
++        out.extend_from_slice(typ);
++        out.extend_from_slice(payload);
++        out
++    }
++
++    fn fullbx(typ: &[u8; 4], version: u8, payload: &[u8]) -> Vec<u8> {
++        let mut p = vec![version, 0, 0, 0];
++        p.extend_from_slice(payload);
++        bx(typ, &p)
++    }
++
++    fn mvhd(timescale: u32, duration: u32) -> Vec<u8> {
++        let mut p = Vec::new();
++        p.extend_from_slice(&0u32.to_be_bytes()); // creation
++        p.extend_from_slice(&0u32.to_be_bytes()); // modification
++        p.extend_from_slice(&timescale.to_be_bytes());
++        p.extend_from_slice(&duration.to_be_bytes());
++        fullbx(b"mvhd", 0, &p)
++    }
++
++    fn trak(track_id: u32, timescale: u32, handler: &[u8; 4]) -> Vec<u8> {
++        let mut tkhd = Vec::new();
++        tkhd.extend_from_slice(&0u32.to_be_bytes());
++        tkhd.extend_from_slice(&0u32.to_be_bytes());
++        tkhd.extend_from_slice(&track_id.to_be_bytes());
++        let tkhd = fullbx(b"tkhd", 0, &tkhd);
++        let mut mdhd = Vec::new();
++        mdhd.extend_from_slice(&0u32.to_be_bytes());
++        mdhd.extend_from_slice(&0u32.to_be_bytes());
++        mdhd.extend_from_slice(&timescale.to_be_bytes());
++        mdhd.extend_from_slice(&0u32.to_be_bytes());
++        let mdhd = fullbx(b"mdhd", 0, &mdhd);
++        let mut hdlr = Vec::new();
++        hdlr.extend_from_slice(&0u32.to_be_bytes());
++        hdlr.extend_from_slice(handler);
++        let hdlr = fullbx(b"hdlr", 0, &hdlr);
++        let mut mdia = Vec::new();
++        mdia.extend_from_slice(&mdhd);
++        mdia.extend_from_slice(&hdlr);
++        let mdia = bx(b"mdia", &mdia);
++        let mut t = Vec::new();
++        t.extend_from_slice(&tkhd);
++        t.extend_from_slice(&mdia);
++        bx(b"trak", &t)
++    }
++
++    fn init_segment() -> Vec<u8> {
++        let mut moov = Vec::new();
++        moov.extend_from_slice(&mvhd(1000, 0));
++        moov.extend_from_slice(&trak(1, 15360, b"vide"));
++        moov.extend_from_slice(&trak(2, 44100, b"soun"));
++        let moov = bx(b"moov", &moov);
++        let mut out = bx(b"ftyp", b"isom\0\0\0\0isomiso2");
++        out.extend_from_slice(&moov);
++        out
++    }
++
++    /// A moof with one video traf: tfdt base, one trun. If
++    /// `per_sample` is true the trun carries per-sample durations,
++    /// otherwise the tfhd default duration applies.
++    fn moof(
++        track_id: u32,
++        base: u64,
++        default_duration: u32,
++        per_sample: bool,
++        durations: &[u32],
++    ) -> Vec<u8> {
++        let mut tfhd = Vec::new();
++        tfhd.extend_from_slice(&track_id.to_be_bytes());
++        tfhd.extend_from_slice(&default_duration.to_be_bytes());
++        // flags: default-base-is-moof (0x020000) | default-sample-duration (0x8).
++        // fullbx writes version 0 + flags 0, so patch the flags after.
++        let mut tfhd = fullbx(b"tfhd", 0, &tfhd);
++        // flags live at bytes 8..12 of the box (after size+type).
++        tfhd[8..12].copy_from_slice(&0x020008u32.to_be_bytes());
++        let mut tfdt = Vec::new();
++        tfdt.extend_from_slice(&(base as u32).to_be_bytes());
++        let tfdt = fullbx(b"tfdt", 0, &tfdt);
++        let trun_flags: u32 = if per_sample { 0x000101 } else { 0x000001 };
++        let mut trun = Vec::new();
++        trun.extend_from_slice(&(durations.len() as u32).to_be_bytes());
++        trun.extend_from_slice(&0i32.to_be_bytes()); // data-offset
++        for d in durations {
++            if per_sample {
++                trun.extend_from_slice(&d.to_be_bytes());
++            }
++        }
++        let mut trun = fullbx(b"trun", 0, &trun);
++        trun[8..12].copy_from_slice(&trun_flags.to_be_bytes());
++        let mut traf = Vec::new();
++        traf.extend_from_slice(&tfhd);
++        traf.extend_from_slice(&tfdt);
++        traf.extend_from_slice(&trun);
++        let traf = bx(b"traf", &traf);
++        let mut moof = Vec::new();
++        moof.extend_from_slice(&bx(b"mfhd", &1u32.to_be_bytes()));
++        moof.extend_from_slice(&traf);
++        bx(b"moof", &moof)
++    }
++
++    #[test]
++    fn parses_init_segment() {
++        let init = parse_init_segment(&init_segment()).expect("moov parses");
++        assert_eq!(init.movie_timescale, 1000);
++        assert_eq!(init.movie_duration, 0.0);
++        assert_eq!(init.tracks.len(), 2);
++        assert_eq!(
++            init.tracks[0],
++            Mp4TrackInfo {
++                track_id: 1,
++                timescale: 15360,
++                handler: *b"vide",
++            }
++        );
++        assert_eq!(
++            init.tracks[1],
++            Mp4TrackInfo {
++                track_id: 2,
++                timescale: 44100,
++                handler: *b"soun",
++            }
++        );
++    }
++
++    #[test]
++    fn segment_range_from_default_duration() {
++        let init = parse_init_segment(&init_segment()).unwrap();
++        // 60 samples x 512 ticks at 15360 Hz = 2.0 s.
++        let seg = moof(1, 0, 512, false, &[0; 60]);
++        assert_eq!(segment_ranges(&seg, &init), vec![(0.0, 2.0)]);
++        // Second segment continues at tfdt 30720.
++        let seg = moof(1, 30720, 512, false, &[0; 60]);
++        assert_eq!(segment_ranges(&seg, &init), vec![(2.0, 4.0)]);
++    }
++
++    #[test]
++    fn segment_range_from_per_sample_durations() {
++        let init = parse_init_segment(&init_segment()).unwrap();
++        // 3 samples of 512/1024/512 ticks = 2048/15360 s.
++        let seg = moof(1, 0, 0, true, &[512, 1024, 512]);
++        let ranges = segment_ranges(&seg, &init);
++        assert_eq!(ranges.len(), 1);
++        assert!((ranges[0].0 - 0.0).abs() < 1e-9);
++        assert!((ranges[0].1 - 2048.0 / 15360.0).abs() < 1e-9);
++    }
++
++    #[test]
++    fn audio_track_uses_its_own_timescale() {
++        let init = parse_init_segment(&init_segment()).unwrap();
++        // 84 samples x 1024 ticks at 44100 Hz.
++        let seg = moof(2, 0, 1024, false, &[0; 84]);
++        let ranges = segment_ranges(&seg, &init);
++        assert_eq!(ranges.len(), 1);
++        assert!((ranges[0].1 - 84.0 * 1024.0 / 44100.0).abs() < 1e-9);
++    }
++
++    #[test]
++    fn init_plus_segment_in_one_buffer() {
++        let mut buf = init_segment();
++        buf.extend_from_slice(&moof(1, 0, 512, false, &[0; 60]));
++        let (init, ranges) = parse_appended(&buf, &None);
++        assert!(init.is_some());
++        assert_eq!(ranges, vec![(0.0, 2.0)]);
++    }
++
++    #[test]
++    fn unknown_track_and_garbage_are_skipped() {
++        let init = parse_init_segment(&init_segment()).unwrap();
++        let seg = moof(99, 0, 512, false, &[0; 60]);
++        assert!(segment_ranges(&seg, &init).is_empty());
++        assert!(parse_init_segment(b"not a box at all").is_none());
++        assert!(segment_ranges(&[0, 0, 0], &init).is_empty());
++    }
++
++    #[test]
++    fn subtract_range_splits_and_trims() {
++        let mut r = vec![(0.0, 10.0)];
++        subtract_range(&mut r, 3.0, 7.0);
++        assert_eq!(r, vec![(0.0, 3.0), (7.0, 10.0)]);
++        subtract_range(&mut r, 0.0, 3.0);
++        assert_eq!(r, vec![(7.0, 10.0)]);
++        subtract_range(&mut r, 7.0, 10.0);
++        assert!(r.is_empty());
++        let mut r = vec![(0.0, 2.0), (4.0, 6.0)];
++        subtract_range(&mut r, 1.0, 5.0);
++        assert_eq!(r, vec![(0.0, 1.0), (5.0, 6.0)]);
++    }
++
++    #[test]
++    fn append_window_clips_and_offsets() {
++        assert_eq!(
++            apply_append_window((0.0, 2.0), 0.0, 0.0, f64::INFINITY),
++            Some((0.0, 2.0))
++        );
++        assert_eq!(
++            apply_append_window((0.0, 2.0), 10.0, 0.0, f64::INFINITY),
++            Some((10.0, 12.0))
++        );
++        assert_eq!(
++            apply_append_window((0.0, 2.0), 0.0, 0.5, 1.5),
++            Some((0.5, 1.5))
++        );
++        assert_eq!(apply_append_window((0.0, 2.0), 0.0, 5.0, 6.0), None);
++    }
++}
+diff --git a/components/script/dom/media/sourcebuffer.rs b/components/script/dom/media/sourcebuffer.rs
+index 125bc1b29..71e080bf8 100644
+--- a/components/script/dom/media/sourcebuffer.rs
++++ b/components/script/dom/media/sourcebuffer.rs
+@@ -10,15 +10,26 @@
+ //! queues bytes — `buffered` stays empty until Round 19 consumes the
+ //! queue in the media thread and reports decoded ranges. Nothing here
+ //! pretends a frame was decoded.
++//!
++//! Round 19: `appendBuffer` still queues bytes, but the `updateend`
++//! task now drains the queue into the attached media element's player
++//! (`push_data`, the same path the network fetch uses) before firing
++//! `updateend`, and `buffered` reports the presentation-time ranges
++//! parsed out of the appended segments (`dom/media/mp4.rs`). The
++//! player parses the init segment asynchronously, so the element's
++//! `readyState`/`duration` still advance via the player's own
++//! `MetadataUpdated`/`DurationChanged` events.
+ 
+ use std::cell::Cell;
+ 
+ use dom_struct::dom_struct;
+ use js::context::JSContext;
+ use js::rust::HandleObject;
++use log::warn;
+ use script_bindings::buffer_source::get_buffer_source_copy;
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::reflect_dom_object_with_proto;
++use servo_media::player::PlayerError;
+ use stylo_atoms::Atom;
+ 
+ use crate::dom::bindings::codegen::Bindings::MediaSourceBinding::MediaSourceReadyState;
+@@ -36,6 +47,9 @@ use crate::dom::bindings::str::DOMString;
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::audio::audiotracklist::AudioTrackList;
+ use crate::dom::media::mediasource::MediaSource;
++use crate::dom::media::mp4::{
++    apply_append_window, parse_appended, subtract_range, Mp4InitInfo,
++};
+ use crate::dom::media::videotracklist::VideoTrackList;
+ use crate::dom::timeranges::{TimeRanges, TimeRangesContainer};
+ use crate::dom::window::Window;
+@@ -58,11 +72,22 @@ pub(crate) struct SourceBuffer {
+     /// The MIME type this buffer was created for.
+     mime_type: DomRefCell<DOMString>,
+     media_source: Dom<MediaSource>,
+-    buffered: MutNullableDom<TimeRanges>,
+     audio_tracks: MutNullableDom<AudioTrackList>,
+     video_tracks: MutNullableDom<VideoTrackList>,
+-    /// Bytes appended but not yet decoded (Round 19 consumes this).
++    /// Bytes appended but not yet handed to the media thread.
++    /// `drain_pending` (Round 19) pushes them into the attached
++    /// element's player; bytes the player refuses (its queue is full)
++    /// stay here until its `NeedData` event asks for more.
+     pending_bytes: DomRefCell<Vec<QueuedAppend>>,
++    /// Presentation-time ranges of the segments successfully pushed
++    /// to the player, parsed from the segment boxes at drain time
++    /// (`dom/media/mp4.rs`). This is what `buffered` reports: the
++    /// player's own `buffered()` query needs a known total input
++    /// size, which an open-ended MSE stream never has.
++    buffered_ranges: DomRefCell<TimeRangesContainer>,
++    /// Track timescales from the init segment, once one has been
++    /// appended; `None` until then.
++    init_info: DomRefCell<Option<Mp4InitInfo>>,
+ }
+ 
+ impl SourceBuffer {
+@@ -76,10 +101,11 @@ impl SourceBuffer {
+             append_window_end: Cell::new(f64::INFINITY),
+             mime_type: DomRefCell::new(mime_type),
+             media_source: Dom::from_ref(media_source),
+-            buffered: MutNullableDom::new(None),
+             audio_tracks: MutNullableDom::new(None),
+             video_tracks: MutNullableDom::new(None),
+             pending_bytes: DomRefCell::new(Vec::new()),
++            buffered_ranges: DomRefCell::new(TimeRangesContainer::default()),
++            init_info: DomRefCell::new(None),
+         }
+     }
+ 
+@@ -115,11 +141,124 @@ impl SourceBuffer {
+     }
+ 
+     fn buffered_list(&self, cx: &mut JSContext) -> DomRoot<TimeRanges> {
+-        // Round 18: always empty — no data has been decoded yet.
++        // Round 19: the ranges parsed from the segments actually
++        // pushed to the player (see `drain_pending`). Before any
++        // segment is pushed the list is empty, as in Round 18.
++        // A fresh object per call: `TimeRanges` snapshots its
++        // container at creation, so caching it (as Round 18 did)
++        // would freeze `buffered` at its first-read value.
++        let ranges = self.buffered_ranges.borrow().clone();
+         let global = self.global();
+         let window = global.as_window();
+-        self.buffered
+-            .or_init(|| TimeRanges::new(cx, window, TimeRangesContainer::default()))
++        TimeRanges::new(cx, window, ranges)
++    }
++
++    /// The buffered ranges as plain `(start, end)` pairs, for the
++    /// media element's `buffered` union over its active buffers.
++    pub(crate) fn buffered_ranges(&self) -> Vec<(f64, f64)> {
++        let container = self.buffered_ranges.borrow();
++        let mut ranges = Vec::with_capacity(container.len() as usize);
++        for i in 0..container.len() {
++            if let (Ok(start), Ok(end)) = (container.start(i), container.end(i)) {
++                ranges.push((start, end));
++            }
++        }
++        ranges
++    }
++
++    /// The MIME type this buffer was created for (or last changed to).
++    pub(crate) fn mime_type(&self) -> DOMString {
++        self.mime_type.borrow().clone()
++    }
++
++    /// Hand queued bytes to the attached media element's player, in
++    /// append order, and record the presentation-time ranges of the
++    /// chunks the player accepts. Runs on the script thread (from the
++    /// `updateend` task, from `NeedData`, or from attach).
++    ///
++    /// Bytes the player refuses stay queued: `EnoughData` means its
++    /// queue is full, and the player's next `NeedData` event drains
++    /// the rest. Any other push failure also re-queues the chunk —
++    /// the player surfaces decode problems through its own error
++    /// events, and dropping bytes here would corrupt the stream.
++    /// If there is no attached element or no player yet, everything
++    /// stays queued for the attach drain.
++    pub(crate) fn drain_pending(&self) {
++        let mut pending = std::mem::take(&mut *self.pending_bytes.borrow_mut());
++        if pending.is_empty() {
++            return;
++        }
++        let Some(element) = self.media_source.attached_element() else {
++            *self.pending_bytes.borrow_mut() = pending;
++            return;
++        };
++        // Chunks are drained from the front in append order; a chunk
++        // the player refuses goes back at the front with the rest.
++        while !pending.is_empty() {
++            let chunk = pending.remove(0);
++            match element.push_media_source_data(chunk.bytes.clone()) {
++                Ok(()) => {
++                    // The player took the bytes: account for them.
++                    let (found_init, mut ranges) =
++                        parse_appended(&chunk.bytes, &self.init_info.borrow());
++                    if let Some(init) = found_init {
++                        *self.init_info.borrow_mut() = Some(init);
++                    }
++                    let timestamp_offset = self.timestamp_offset.get();
++                    let window_start = self.append_window_start.get();
++                    let window_end = self.append_window_end.get();
++                    let mut container = self.buffered_ranges.borrow_mut();
++                    for range in ranges.drain(..) {
++                        if let Some(range) = apply_append_window(
++                            range,
++                            timestamp_offset,
++                            window_start,
++                            window_end,
++                        ) {
++                            let _ = container.add(range.0, range.1);
++                        }
++                    }
++                    // `remove` consumed the chunk: the next chunk is
++                    // now at the same index.
++                },
++                Err(PlayerError::EnoughData) => {
++                    // Player queue full: keep this chunk and the rest
++                    // for the next `NeedData` drain.
++                    pending.insert(0, chunk);
++                    break;
++                },
++                Err(error) => {
++                    warn!("MSE: could not push segment to player: {error:?}");
++                    pending.insert(0, chunk);
++                    break;
++                },
++            }
++        }
++        if !pending.is_empty() {
++            let mut queue = self.pending_bytes.borrow_mut();
++            // Drained chunks were removed from the front, so the
++            // leftovers go back in order.
++            for chunk in pending.into_iter().rev() {
++                queue.insert(0, chunk);
++            }
++        }
++    }
++
++    fn finish_update(&self) {
++        let this = Trusted::new(self);
++        self.global()
++            .task_manager()
++            .dom_manipulation_task_source()
++            .queue(task!(source_buffer_update_end: move |cx| {
++                let this = this.root();
++                // Drain before firing `updateend`, so a page reading
++                // `buffered` in its `updateend` handler already sees
++                // the appended ranges.
++                this.drain_pending();
++                this.updating.set(false);
++                this.upcast::<EventTarget>()
++                    .fire_event(cx, Atom::from("updateend"));
++            }));
+     }
+ 
+     fn audio_tracks_list(&self, cx: &mut JSContext) -> DomRoot<AudioTrackList> {
+@@ -155,19 +294,6 @@ impl SourceBuffer {
+         }
+         Ok(())
+     }
+-
+-    fn finish_update(&self) {
+-        let this = Trusted::new(self);
+-        self.global()
+-            .task_manager()
+-            .dom_manipulation_task_source()
+-            .queue(task!(source_buffer_update_end: move |cx| {
+-                let this = this.root();
+-                this.updating.set(false);
+-                this.upcast::<EventTarget>()
+-                    .fire_event(cx, Atom::from("updateend"));
+-            }));
+-    }
+ }
+ 
+ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+@@ -318,8 +444,17 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+         if !(*start < *end) {
+             return Err(Error::Type(c"remove() requires start < end".to_owned()));
+         }
+-        // Round 18: nothing is buffered, so the range to remove is
+-        // empty — but the state machine still reports an update.
++        // Round 19: drop the range from the buffered bookkeeping.
++        // The player keeps the bytes it was already handed — there
++        // is no player API to un-buffer them — so this is the
++        // observable part a page can check.
++        let mut ranges = self.buffered_ranges();
++        subtract_range(&mut ranges, *start, *end);
++        let mut container = TimeRangesContainer::default();
++        for (start, end) in ranges {
++            let _ = container.add(start, end);
++        }
++        *self.buffered_ranges.borrow_mut() = container;
+         self.updating.set(true);
+         self.queue_event("updatestart");
+         self.queue_event("update");
+-- 
+2.43.0
+

@@ -322,6 +322,24 @@ No new features — this round finishes what Round 3 left open:
   `appendBuffer` QUEUES bytes — `buffered` stays
   empty, nothing is decoded, YouTube still does not
   play. The decode pipeline is Round 19.
+- Round 19 (done 2026-11-17, MSE project): MSE
+  slice 2, fork patch F-012. `appendBuffer` →
+  media thread: new fMP4 parser (`mp4.rs`, 7
+  fork-only unit tests), `SourceBuffer` drains queued
+  bytes into the player via the normal fetch path,
+  `buffered` [0.00–10.00] computed script-side,
+  `loadedmetadata` + duration 10 s + `networkState`
+  Idle + `activeSourceBuffers` length 1 from the
+  media thread. Stretch result, gated live: the
+  local segments decode and PLAY (`playing` fires,
+  `currentTime` advances, frames render) — so
+  Round 20 is re-scoped from "build an appsrc
+  pipeline" to "feed YouTube's DASH segments
+  through this one". Honest limits: YouTube still
+  does not play, seeking not supported, duration is
+  the demuxer's running estimate. Full suite 87/87;
+  R19 probe ALL PASS; R18 probe 29/29; all
+  regressions pass. No .deb, no push.
   Then: Frostbite tab hibernation (needs a tab system
   first), Snowdrift workspaces (needs tabs + sessions +
   persistence — biggest). Inspector v2 (docked panel,

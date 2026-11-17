@@ -1285,10 +1285,10 @@ as tasks, with `updating` staying true until the
 |---|---|
 | 1. HTTP/2 header fix (F-010) | DONE (R17) — youtube.com loads. |
 | 2. Media stack on (`media-gstreamer`) | DONE (R17) — local H.264 plays, frames advance. |
-| 3. MSE foundation (F-011) | DONE (R18) — this round. `MediaSource` exists, attaches, `isTypeSupported` answers. Bytes queue, nothing decodes. |
-| 4. `SourceBuffer.appendBuffer` → media thread | NEXT (R19) — drain `pending_bytes` into the media thread; report decoded ranges in `buffered`; wire `activeSourceBuffers` when tracks are selected. |
-| 5. GStreamer appsrc pipeline | R20 — a media-thread source feeding appended segments into an `appsrc`/`decodebin` pipeline behind the existing player; first MSE-backed frame on a local segment. |
-| 6. YouTube playback | R21 — YouTube's DASH player attaches, appends, and plays a real video. Gate: a watch page plays, not just loads. |
+| 3. MSE foundation (F-011) | DONE (R18) — `MediaSource` exists, attaches, `isTypeSupported` answers. Bytes queue, nothing decodes. |
+| 4. `SourceBuffer.appendBuffer` → media thread | DONE (R19) — `pending_bytes` drain into the player; `buffered` [0.00–10.00] script-side; `loadedmetadata`, duration 10 s, `networkState` Idle, `activeSourceBuffers` length 1. Stretch: the segments decode and PLAY through the existing ServoSrc pipeline. |
+| 5. YouTube's DASH segments through the MSE pipeline | R20 — was "GStreamer appsrc pipeline"; re-scoped in R19 because the pipeline already works for local segments. Drive a real watch page: the player's segment requests become `appendBuffer` calls; close whatever gaps that exposes (segment timing, `timestampOffset`, audio+video buffers). |
+| 6. YouTube playback | R21 — a watch page plays end to end, not just loads. Gate: video plays, not just the homepage. |
 | 7. Hardware decode | After R21 — VA-API H.264 on Joel's box (`gstreamer1.0-vaapi`); VP9/AV1 stay software on Haswell. |
 
 No unit tests were added in this round: the changes
@@ -1298,3 +1298,16 @@ the frost workspace suite anyway (same reasoning as
 Round 17). The guard is the live probe gate
 (`r18-media/probe.html`, all PASS) plus the full
 regression gate set.
+
+Round 19 update: 7 unit tests WERE added, for the
+new fMP4 parser (`mp4.rs`, hand-built boxes) — but
+they live in the fork's script crate, so they do not
+run in the frost workspace suite either (same cold
+`servo/target/` reason: `cargo check -p servo-script`
+in the fork was tried in R19 and killed mid-rebuild
+of mozjs). The probe gate exercises the parser
+end-to-end (`buffered` ranges, `remove`, duration),
+so it is the guard for the parser too. The fork
+unit tests are runnable on a machine with a warm
+fork target: `cargo test -p servo-script --lib mp4`
+inside `servo/`.
