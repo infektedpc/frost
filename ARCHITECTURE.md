@@ -1038,3 +1038,117 @@ needs EGL + GLESv2, and `libGLESv2.so`
 Depends lists. The next packaging must add it, or a
 fresh Debian install without it will fail to start on
 the GL path. No packaging changed in this round.
+
+## Round 17 — YouTube playback, staged (page loads; video blocked on MSE)
+
+### The stage-1 bug: h2's 16 KiB header-list limit
+
+Joel's 0.16.0 report — youtube.com doesn't load,
+"client error (SendRequest)" — reproduced in the
+sandbox, and the trace named the layer: the local h2
+stack resets the stream with `PROTOCOL_ERROR`
+(`initiator=Library`), because YouTube's `www`
+homepage response HEADERS frame decodes to a header
+list larger than h2 0.4.20's default
+`SETTINGS_MAX_HEADER_LIST_SIZE` (16,384 bytes). The
+homepage carries many `set-cookie` headers plus
+reporting and origin-trial headers; the encoded
+HEADERS frame alone is 14,129 bytes. The decoder
+flags the block oversize (`header list size over
+max` → `REQUEST_HEADER_FIELDS_TOO_LARGE`) and resets
+the stream before the page ever sees a byte. The
+`youtube.com` 301 works because its headers are
+tiny; google.com and wikipedia sit under the limit;
+curl works because nghttp2's limit is larger.
+
+The fix (fork patch F-010) is one builder call in
+`create_http_client` (`components/net/connector.rs`):
+`.http2_max_header_list_size(256 * 1024)` — Chrome's
+~256 KiB allowance. It lives in the fork because the
+HTTP client is built exactly once, inside the fork's
+net crate; there is no embedder-side knob for it.
+The value is a plain literal, not a named constant:
+hyper-util's legacy `Builder` exposes no getter for
+it and its `Debug` impl doesn't print the h2
+settings, so no frost-side unit test can observe the
+configuration — the guard is the live YouTube gate
+(0 `SendRequest`/`PROTOCOL_ERROR` in the log) plus
+the vendored patch. A fork-side behavioural test
+would need a TLS HTTP/2 test server in the net crate;
+that machinery is out of proportion for one config
+line, and the fork's tests aren't part of the frost
+workspace suite (`cargo test --workspace` covers the
+frost crates only), so it would never run in the
+counted suite anyway.
+
+### Enabling the media backend, and what it took to build
+
+`media-gstreamer` is a `servo`-crate feature
+(`dep:servo-media-gstreamer`, `dep:gstreamer`); the
+`servo` crate's `Servo::new` then calls
+`media_platform::init()`, which on Linux calls
+`ServoMedia::init::<GStreamerBackend>()` — no
+embedder code is needed. Frost just flips the
+feature in `crates/frost-engine/Cargo.toml`. The
+backend itself is `components/media/backends/gstreamer`:
+a `playbin3`-based player (`player.rs`), a registry
+scanner that answers `canPlayType` from the installed
+decoder/demuxer factories (`registry_scanner.rs`),
+and a renderer (`render.rs` + `render-unix/`) that
+takes frames either as GL textures
+(`glsinkbin`, when a GL context is available and
+`media_glvideo_enabled` is on — it defaults to
+**false** in the fork) or as raw BGRA CPU frames
+through `appsink`. The sandbox path is the CPU one,
+which is why video renders here with no GPU.
+
+Building it in the sandbox needed a dev sysroot
+(GStreamer 1.24.2 runtime present, no `-dev`
+files): 26 Ubuntu noble `.deb`s extracted into
+`~/workspace/harness-tmp/gst-dev/`, `.pc` prefixes
+rewritten to the sysroot, versioned runtime `.so`
+files copied in to satisfy the `-dev` symlinks, and
+a `libclang.so` symlink for bindgen. The chain is
+long because `gstreamer-1.0.pc` privately requires
+`libdw`/`libunwind` and `gstreamer-gl-1.0.pc`
+privately requires the whole GL/X11/Wayland stack
+(`glesv2`, `gl`, `egl`, `glx`, `wayland-client`,
+`x11`, `x11-xcb`, `gudev-1.0`, `libdrm`, `gbm`). The
+full list is in `r17-build-env.sh`. Two sharp
+edges: a dangling `.so` symlink in an earlier `-L`
+dir shadows the system lib dir at link time
+(`unable to find library -lgstgl-1.0`), so every
+symlink's versioned target must exist in the
+sysroot; and `cargo check` passing does not prove
+`cargo test` passing — the test build re-runs the
+`-sys` build scripts under a different fingerprint,
+and it was the test build that surfaced the missing
+`.pc` files.
+
+### Why YouTube videos don't play: no MSE
+
+The media backend works — a local H.264 MP4 plays,
+frames advance, `canPlayType` returns `probably`
+for every YouTube codec string. What YouTube needs
+and Servo 0.8.0 doesn't have is Media Source
+Extensions: `window.MediaSource` is `undefined`,
+there is no `MediaSource` WebIDL, no
+`mediasource.rs`, and the media element only holds
+a TODO for MediaSource detachment. YouTube's player
+checks for MSE up front and refuses before
+requesting any stream — zero `videoplayback`
+requests in the gate log, for the watch page, for
+"Me at the zoo", and for the embed player (which
+answers Error 153). Implementing MSE means a
+`MediaSource`/`SourceBuffer` DOM implementation, a
+media-thread source that feeds appended segments,
+and a GStreamer `appsrc` pipeline behind it — a
+multi-round engine project, and the honest next
+step after this round. Hardware decode (stage 4)
+is gated behind it: no stream, no decode. When MSE
+exists, the decoder question is separate — decodebin
+picks by rank, so on Joel's box VA-API H.264 needs
+`gstreamer1.0-vaapi` installed (`vaapih264dec`
+outranks `avdec_h264`); Haswell has no VP9/AV1
+hardware decode, so H.264 stays the accelerated
+path.

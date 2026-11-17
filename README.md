@@ -5,12 +5,13 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 16 — Lightweight: hardware rendering — the UI
-defaults to the GL backend (probed first) and the engine renders
-pages through a hardware surfman adapter (fork patch F-009), with
-software fallbacks on both halves.** Tests 87/87 (baseline 83/83
-+ 4 new Round 16 tests). Fork at `1136ffe68` (F-009). See
-[ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 17 — YouTube playback, staged: the page loads now
+(the HTTP/2 header fix, fork patch F-010), the player UI renders,
+but videos do not play — Servo 0.8.0 has no Media Source Extensions
+and YouTube's player requires them. The media stack itself is
+proven: a local H.264 video plays with frames advancing. Tests
+87/87. Fork at `c16cca72d` (F-010). See
+[ROADMAP.md](ROADMAP.md) for the plan.**
 
 ## Layout
 
@@ -20,7 +21,7 @@ frost/
 ├── rust-toolchain.toml   # Rust 1.99.1 (matches the Servo fork's pin)
 ├── FORK.md               # the Servo fork: point, patches, planned patches
 ├── clone-fork.sh         # recreate servo/ from scratch (shallow v0.8.0 + patches)
-├── patches/              # the nine proven 0.8.0 engine patches (vendored)
+├── patches/              # the ten proven 0.8.0 engine patches (vendored)
 ├── servo/                # the Servo fork (NESTED repo, gitignored, not in the zip)
 ├── crates/
 │   ├── frost/            # libcosmic app: toolbar, address bar, hamburger menu
@@ -34,10 +35,11 @@ frost/
 ## The fork
 
 Frost builds against its own Servo fork at `servo/`, not upstream. The
-fork point is **v0.8.0** (`4e136d8e…`) plus nine engine patches as fork
+fork point is **v0.8.0** (`4e136d8e…`) plus ten engine patches as fork
 commits (keypress charCode, damage rects, dmabuf export, F-001 stop,
 F-005 refresh-viewport, F-006 reload-notify, F-007 full-present,
-F-008 stop-aborts-pending, F-009 hardware rendering context). Full detail in [FORK.md](FORK.md). To recreate it on another machine:
+F-008 stop-aborts-pending, F-009 hardware rendering context,
+F-010 HTTP/2 max header list size). Full detail in [FORK.md](FORK.md). To recreate it on another machine:
 
 ```bash
 ./clone-fork.sh
@@ -2285,3 +2287,240 @@ WM-drawn titlebar itself (look, real min/max/close) —
 bare Xvfb has no window manager, so Joel's KDE box is
 the verdict for those. Next in the easiest-first order:
 Frostbite hibernation (needs tabs).
+
+## Round 17 — YouTube playback, staged (page loads; video blocked on MSE)
+
+Jumped the order ahead of Frostbite on Joel's
+"Yes — YouTube next" (2026-11-16 ~21:56). His report
+on 0.16.0: youtube.com doesn't even load, "i just get
+an error" — screenshot + log showed Frost "Error
+loading page", page text "Could not load the requested
+page: client error (SendRequest)", terminal
+`Network error: HTTP failure: client error
+(SendRequest)` and a truncated `hyper::Error(Ht...`.
+The goal was staged: (1) page loads, (2) player up,
+(3) video plays, (4) hardware-accelerated decode. The
+round delivers (1), proves the media stack, and finds
+(2)–(4) blocked on a missing engine feature — reported
+exactly, not papered over.
+
+### Stage 1: the page loads — root cause and fix (F-010)
+
+Reproduced firsthand in the sandbox (Round 16 gate
+binary, Xvfb :97): `https://www.youtube.com/` shows
+exactly Joel's error. The full error, from a trace
+(`RUST_LOG=info,h2=trace,hyper=trace,hyper_util=trace`):
+`hyper_util::client::legacy::Error(SendRequest,
+hyper::Error(Http2, Error { kind: Reset(StreamId(1),
+PROTOCOL_ERROR, Library) }))`. Joel's own log shows
+the same sequence: GET `https://youtube.com/` → 301
+(works), then GET `https://www.youtube.com/` → the
+reset. The trace proved the mechanism: the LOCAL h2
+stack resets the stream, not the server. YouTube's
+`www` homepage response HEADERS frame is 14,129 bytes
+encoded; its decoded header list exceeds h2 0.4.20's
+default `SETTINGS_MAX_HEADER_LIST_SIZE` of 16,384
+bytes (many `set-cookie` headers plus reporting and
+origin-trial headers). Trace lines: `load_hpack;
+header list size over max`, then `stream error
+REQUEST_HEADER_FIELDS_TOO_LARGE -- recv_headers:
+frame is over size`, then a local `send_reset...
+reason=PROTOCOL_ERROR, initiator=Library`. Confirmed
+in h2 source (`src/proto/streams/recv.rs:221-238`):
+an oversize header block → error → PROTOCOL_ERROR
+reset. youtube.com's 301 has tiny headers (works);
+google.com/wikipedia headers are under the limit
+(work); curl works because nghttp2's limit is
+larger/unlimited.
+
+Fix — fork patch F-010, one line plus a comment in
+`create_http_client` (`components/net/connector.rs`,
+the single `Client::builder` site in the fork):
+`.http2_max_header_list_size(256 * 1024)`. 256 KiB
+matches Chrome's ~256 KiB response-header allowance.
+Fork commit `c16cca72d`; patch vendored at
+`patches/servo-http2-header-list-size-0.8.patch`
+(reverse-applies clean); `clone-fork.sh` and
+`FORK.md` updated (ten patches). Gate proof:
+`https://www.youtube.com/` loads with no error, no
+`SendRequest`/`PROTOCOL_ERROR` anywhere in the gate
+log (0 occurrences), status "YouTube", the homepage
+skeleton paints and switches to dark mode. The
+homepage feed itself stays on skeleton placeholders
+after a minute — the feed fetch never fires in the
+log (`youtubei/v1/browse` absent) — a separate
+YouTube-JS gap, not the network layer; the page
+itself loads, which is what stage 1 asked for.
+
+### The media stack: enabled, built, and proven working
+
+Frost's engine did NOT enable `media-gstreamer`
+before this round, so `<video>` had no backend at
+all. Round 17 flips it on in
+`crates/frost-engine/Cargo.toml` (`"media-gstreamer"`
+in the `servo` features list). Building it in the
+sandbox needed a GStreamer dev sysroot, because the
+sandbox has the GStreamer 1.24.2 runtime but no `-dev`
+packages and no apt/dpkg: 26 Ubuntu noble `.deb`s
+extracted with `dpkg-deb --fsys-tarfile` into
+`~/workspace/harness-tmp/gst-dev/` (headers + `.pc`
+files with `prefix` rewritten to the sysroot +
+versioned runtime `.so` files copied in so the
+linker can resolve the `-dev` symlinks) — the
+GStreamer/GLib `-dev` packages plus the chain their
+`.pc` files pull in (`libdw`, `libelf`, `libunwind`,
+`libzstd`, `liblzma`, `liborc-0.4`, `libdrm`, the
+`libglvnd` GL dev family, `libgbm`, `libwayland-dev`,
+the X11 dev family, `libgudev`, `libudev`) — plus a
+`libclang.so -> libclang.so.1` symlink for bindgen
+(the system has llvm-18's `libclang.so.1` only).
+Build env is documented in
+`~/workspace/harness-tmp/frost/r17-build-env.sh`
+(`PKG_CONFIG_PATH` + `LIBCLANG_PATH` +
+`CARGO_BUILD_JOBS=1`). On another machine, install
+the `-dev` packages system-wide instead
+(`libgstreamer1.0-dev`,
+`libgstreamer-plugins-base1.0-dev`,
+`libgstreamer-plugins-bad1.0-dev`, `libglib2.0-dev`,
+plus the chain above) — building from source now
+requires them; the packaged `.deb` does not (it only
+needs the runtime libs, already present). Two
+sandbox lessons, recorded for the next round: the
+`-dev` dependency cascade is long (each fix reveals
+the next missing `.pc` — `liblzma`, then `orc-0.4`,
+then `glesv2`, `gl`, `glx`, `x11-xcb`, …), and the
+sysroot's dangling `.so` symlinks must have their
+versioned targets copied in or the link fails with
+`unable to find library -lgstgl-1.0` (a dangling
+symlink in an earlier `-L` dir shadows the system
+dir). `cargo check` passed early while `cargo test`
+failed on the same sysroot — the test build re-runs
+the `-sys` build scripts under a different
+fingerprint, so check-passing does not prove
+test-passing; run the suite.
+
+Proof the stack works (local control, NOT YouTube):
+a 5 s H.264 + AAC MP4 (320x240, generated with
+`gst-launch-1.0`, served from the harness test
+server) plays in Frost — SMPTE bars render, status
+`playing t=5.00`, player `00:05 / 00:05`, and the
+gate log shows the player metadata (`video_tracks:
+["H.264 (High 4:4:4 Profile)"]`, `audio_tracks:
+["MPEG-4 AAC"]`, duration 5 s). Frames genuinely
+advance: a 10 s moving-ball video, screenshotted
+twice 3 s apart while playing, differs in 378
+sampled pixels in the video area (ball mid-left in
+one shot, top-right in the other). Decoder in the
+sandbox is necessarily `avdec_h264` (software) —
+`vaapih264dec` is not installed, so decodebin has
+nothing else to pick. No audio output exists in the
+sandbox; audio is verified via pipeline state
+(metadata lists the AAC track), not by listening.
+
+### Stages 2–4: BLOCKED — Servo 0.8.0 has no Media Source Extensions
+
+The watch page renders — player UI up (play button,
+volume, `0:00 / 10:35` for Big Buck Bunny 4K 60fps,
+CC/settings/theater/fullscreen, title in the status
+bar) — but the player shows "Your browser can't play
+this video. Learn more". Same for "Me at the zoo"
+(`0:00 / 0:19`), a low-res video that certainly has
+a progressive format. The embed player
+(`/embed/jNQXAC9IVRw`) fails the same way: "Video
+player configuration error — Error 153".
+
+The evidence pins it to MSE, not codecs and not
+fetching:
+
+- A probe page run in Frost reports
+  `MediaSource: undefined` — and `canPlayType`
+  returns `[probably]` for every YouTube-relevant
+  codec string (`video/mp4; codecs="avc1.42001E,
+  mp4a.40.2"`, `video/webm; codecs="vp9, opus"`,
+  `video/mp4; codecs="av01.0.05M.08"`, …). The
+  GStreamer registry scanner works; the codecs are
+  all supported.
+- The gate log contains ZERO `videoplayback`
+  requests across all three YouTube pages — the
+  player never asks for a video stream. It decides
+  up front, before fetching.
+- The fork has no MSE: no `MediaSource` WebIDL, no
+  `mediasource.rs` in `components/script/dom/media/`,
+  and `htmlmediaelement.rs` carries only a TODO
+  ("Step 7.3. If the media element's assigned media
+  provider object is a MediaSource object, then
+  detach it"). The `gstreamer-mse` `.pc` file in the
+  sysroot is irrelevant — Servo doesn't use it.
+
+YouTube's current player requires MSE (DASH) for
+playback and shows exactly this error without it.
+Implementing MSE — `MediaSource`/`SourceBuffer`
+WebIDL, media-thread integration, a GStreamer
+`appsrc` pipeline — is a multi-round engine project,
+not a Round 17-sized fix. It is the next step, and
+it is NOT attempted here. Stage 4 (hardware decode)
+is not reached for YouTube: there is no stream to
+decode. On Joel's box, VA-API would additionally
+need `gstreamer1.0-vaapi` installed (decodebin picks
+`vaapih264dec` by rank for H.264 when present);
+Haswell VA-API decodes H.264 in hardware, VP9/AV1
+have no Haswell hardware decode, so H.264 remains
+the realistic accelerated path once MSE exists.
+
+Gates, all on the Round 17 strip-debug binary under
+Xvfb :97 (test servers 18080/18099/18101, fresh
+`r17-config`/`r17-data`):
+
+- YouTube page loads, no error (`r17-02`, `r17-03`;
+  0 `SendRequest`/`PROTOCOL_ERROR` in the log).
+- YouTube watch page renders the player UI
+  (`r17-05`); "can't play this video" recorded as
+  the MSE finding, not a pass.
+- Local H.264 video plays, frames advance
+  (`r17-06`, `r17-10`–`r17-13`; 378 differing
+  sampled pixels).
+- Media probe: `MediaSource: undefined`,
+  `canPlayType` `[probably]` for all codecs
+  (`r17-08`).
+- Embed player: Error 153 (`r17-09`).
+- Regressions, all pass: homepage paints
+  (`r17-01`, `r17-26`); split view, both panes
+  painted with per-pane playback state (`r17-17`);
+  Snowplow blocks in both panes — left "blocked 4",
+  right "blocked 2", allowed image loads in both
+  (`r17-18`, `r17-19`); Freeze writes a correct
+  archive (`index.json` + HTML with `<base>` tag and
+  live DOM, `r17-15`); Inspector F12, 26-node
+  snapshot (`r17-21`); strip-scroll paints
+  (`r17-23`); `frost://settings` fails plainly with
+  the no-internal-pages message (`r17-22`); no Frost
+  listener (`ss` — only the loomtop `:9999`
+  watcher); settings save + persist across relaunch
+  (search engine changed to Google, still Google
+  after quit + relaunch, `r17-27`; restored to
+  DuckDuckGo afterwards); GNOME-mode fallback
+  titlebar with min/max/close (`r17-26`, `r17-27`).
+
+Harness notes for the next round: the runtime
+restart mid-round killed Xvfb :97 and all three
+test servers — restart them before gating
+(`Xvfb :97 -screen 0 1280x800x24`, `python3 -m
+http.server` on 18080/18099/18101 in
+`harness-tmp/frost/r13-test/`). The F12 keycode is
+96 (88 is not F12). Menu rows are ~35 px apart —
+measure with visual grounding, don't estimate:
+"Split view" is at (1019, 287), "Freeze this
+page…" at (1047, 324); a click at y=308 hit Freeze
+instead of Split view. Ctrl+K does not open the
+palette while a video page holds focus (went to the
+page); use the menu for split view in that state.
+One transient, unrelated log line: a TLS
+`UnexpectedEof` for `docs.rs` at 06:16 (server
+closed without `close_notify`), not a YouTube or
+F-010 failure. No `.deb`, no push — there is
+nothing new for Joel to install that changes
+YouTube playback; the page-load fix (F-010) is real
+and testable on his box from this tree, but
+playback needs MSE first. Next in the easiest-first
+order: Frostbite hibernation (needs tabs) — unless
+Joel wants the MSE project instead.

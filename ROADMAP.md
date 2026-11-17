@@ -289,6 +289,24 @@ No new features — this round finishes what Round 3 left open:
   GLESv2 and `libGLESv2.so` (`libgles2-mesa`) is NOT in
   the 0.11.0/0.14.0 .deb Depends — the next packaging
   must add it.
+- Round 17 (done 2026-11-17, JUMPED the order ahead of
+  Frostbite on Joel's "YouTube next" 2026-11-16):
+  YouTube playback, staged. Stage 1 DONE: youtube.com
+  loads — fork patch F-010 raises the HTTP/2 client's
+  max header list size to 256 KiB (h2's 16 KiB default
+  made the local stack reset YouTube's oversize header
+  block with PROTOCOL_ERROR — "client error
+  (SendRequest)"). The media stack is enabled
+  (`media-gstreamer` feature) and PROVEN working: a
+  local H.264 + AAC MP4 plays with frames advancing
+  (software decode `avdec_h264` in the sandbox).
+  Stages 2–4 BLOCKED: Servo 0.8.0 has NO Media Source
+  Extensions (`MediaSource: undefined`, `canPlayType`
+  `probably` for all codecs, zero `videoplayback`
+  requests, embed player Error 153) — YouTube's player
+  requires MSE and refuses before fetching. Implementing
+  MSE is a multi-round engine project, not attempted
+  here. No .deb, no push.
   Then: Frostbite tab hibernation (needs a tab system
   first), Snowdrift workspaces (needs tabs + sessions +
   persistence — biggest). Inspector v2 (docked panel,

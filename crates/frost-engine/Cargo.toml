@@ -7,10 +7,15 @@ publish = false
 [dependencies]
 # Servo fork, one directory up: ../.. is the frost repo root, servo/ is the
 # nested fork (see FORK.md). Feature set mirrors the proven servo-de
-# embedder: the same features servoshell enables MINUS webgl / webxr /
-# media-gstreamer, which the sandbox cannot build (no libclang for
-# mozangle's bindgen, no gstreamer-1.0.pc). Round 1 needs no WebGL, no
-# video, no XR. `subtlecrypto` is the 0.8.0 name for the old `webcrypto`.
+# embedder: the same features servoshell enables MINUS webgl / webxr,
+# which the sandbox cannot build (no libclang for mozangle's bindgen).
+# Round 17 enables `media-gstreamer` (video/audio playback): it builds
+# in the sandbox only with the gst-dev sysroot (GStreamer + GLib -dev
+# files extracted from Ubuntu noble .debs into
+# ~/workspace/harness-tmp/gst-dev — see r17-build-env.sh and README
+# Round 17). Without that sysroot (or system -dev packages on another
+# machine), the build fails at the gstreamer-sys build scripts.
+# `subtlecrypto` is the 0.8.0 name for the old `webcrypto`.
 servo = { path = "../../servo/components/servo", default-features = false, features = [
     "background_hang_monitor",
     "bluetooth",
@@ -25,6 +30,7 @@ servo = { path = "../../servo/components/servo", default-features = false, featu
     "gamepad",
     "webgpu",
     "devtools",
+    "media-gstreamer",
 ] }
 dpi = "0.1"
 keyboard-types = "0.8"

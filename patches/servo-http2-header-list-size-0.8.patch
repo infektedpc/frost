@@ -1,0 +1,32 @@
+From c16cca72d2756678492bfdc5638d898f73b357d3 Mon Sep 17 00:00:00 2001
+From: Joel Horrell <infektedpc@gmail.com>
+Date: Tue, 17 Nov 2026 05:03:58 +0000
+Subject: [PATCH] F-010: Raise HTTP/2 max header list size to 256 KiB (Round
+ 17)
+
+---
+ components/net/connector.rs | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/components/net/connector.rs b/components/net/connector.rs
+index b1bf34315..00a2dc5c1 100644
+--- a/components/net/connector.rs
++++ b/components/net/connector.rs
+@@ -677,5 +677,14 @@ pub fn create_http_client(tls_config: TlsConfig) -> ServoClient {
+         // limit controls the maximum idle connections per host, which we still don't want to grow
+         // without bound.
+         .pool_max_idle_per_host(6)
++        // h2's default SETTINGS_MAX_HEADER_LIST_SIZE is 16 KiB, and the
++        // decoder resets any stream whose decoded response headers exceed
++        // it with PROTOCOL_ERROR. YouTube's homepage response headers
++        // (many Set-Cookie headers plus reporting and origin-trial
++        // headers) decode to more than 16 KiB, so youtube.com loaded
++        // but www.youtube.com failed with "client error (SendRequest)".
++        // Browsers allow far larger response headers (Chrome allows
++        // ~256 KiB); match that so large-header sites load.
++        .http2_max_header_list_size(256 * 1024)
+         .build(InstrumentedConnector::from(connector))
+ }
+-- 
+2.43.0
+
