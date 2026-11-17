@@ -270,6 +270,25 @@ No new features — this round finishes what Round 3 left open:
   patch. Honest v1 limits: heavy JS apps may not replay
   perfectly (scripts re-run against the static DOM), no
   incremental updates — re-freeze to refresh.
+- Round 16 (done 2026-11-17, JUMPED the order ahead of
+  Frostbite on Joel's "lightweight next" 2026-11-16):
+  hardware rendering. UI side: `WGPU_BACKEND=gl` baked in
+  as the default in `main.rs`, but only when a wgpu probe
+  finds a GL adapter first (a retry was considered and
+  rejected — on libcosmic's multi-window path the app's
+  init runs before the compositor, so a second `app::run()`
+  would panic in the engine's one-shot `setup_logging()`).
+  Engine side: fork patch F-009 adds
+  `HardwareRenderingContext` (same offscreen surfman shape
+  as the software context, `Connection::create_adapter()`
+  instead of `create_software_adapter()`), tried first with
+  a software fallback and a `FROST_RENDERER=software`
+  escape hatch. Honest limit: the sandbox has no GPU, so
+  no CPU win was measured there — Joel's box is the
+  verdict. Packaging note: the GLES backend needs EGL +
+  GLESv2 and `libGLESv2.so` (`libgles2-mesa`) is NOT in
+  the 0.11.0/0.14.0 .deb Depends — the next packaging
+  must add it.
   Then: Frostbite tab hibernation (needs a tab system
   first), Snowdrift workspaces (needs tabs + sessions +
   persistence — biggest). Inspector v2 (docked panel,

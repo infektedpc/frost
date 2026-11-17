@@ -902,3 +902,139 @@ live page."), one row per archive (title, URL · date ·
 size, Open / Delete buttons), an empty state, and a
 Close button. No fork patch, no new crate: the feature
 is one module plus two message arms plus one popup kind.
+
+## Round 16 — Lightweight (hardware rendering)
+
+Joel's 0.14.0 box showed Frost at 228% CPU: four
+llvmpipe threads at ~45–55% each, Servo/tokio threads
+at 0%. Software rasterization, not the engine. And
+`WGPU_BACKEND=gl frost` barely moved it (228% → 201%),
+because the env var only steers the UI compositor —
+Servo's page rendering used a hardcoded
+`SoftwareRenderingContext` that ignores it. Round 16
+fixes both halves so Frost renders on the GPU where
+one exists (his Haswell HD 4600 via Mesa crocus).
+
+Two halves, deliberately separate knobs:
+
+**UI side — `crates/frost/src/main.rs`.** `main()`
+calls `ensure_gl_backend_default()` before any iced
+code runs: if `WGPU_BACKEND` is already set the user
+wins and nothing changes; otherwise a probe
+(`gl_adapter_available()`) asks wgpu itself whether a
+GL adapter exists — a bare `wgpu::Instance` with
+`backends: GL`, `enumerate_adapters(GL)` blocked on
+with `futures_executor::block_on`, no window. Adapter
+found → set `WGPU_BACKEND=gl`; none → leave it unset
+(iced's normal Vulkan-first path, lavapipe on a machine
+with no hardware GL) and print one stderr line
+("frost: no GL adapter found; using the default Vulkan
+path"). New direct deps on the frost crate for the
+probe: `wgpu = "28"` and `futures-executor = "0.3"`,
+both already in the tree (wgpu via libcosmic). The env
+var is used because libcosmic's iced wgpu compositor
+reads `WGPU_BACKEND` itself (`Backends::from_env`)
+when it creates the adapter — there is no public
+settings knob. Setting it in `main` covers every launch
+path; a `.desktop` `Exec=` line would only cover
+desktop launches and is not used.
+
+A retry ("set the default, run, and re-run without it
+on graphics failure") was implemented first and then
+REMOVED, because it cannot work: Frost runs on
+libcosmic's multi-window (daemon) path, where
+`iced_winit::run` calls the program's `init` (and the
+engine's one-shot `setup_logging()`) BEFORE the first
+window — and therefore before the compositor is
+created. A second `app::run()` after a graphics failure
+would panic in `setup_logging()`
+(`log::set_boxed_logger` can only run once per
+process). The probe decides before anything starts,
+which is the only safe shape. The first version's
+`is_graphics_creation_failed` helper and its test were
+deleted with the retry; the probe is covered by
+`gl_adapter_probe_finds_the_sandbox_gl_adapter`
+(llvmpipe GL exists in the sandbox, so it answers true
+there) and by the gate that breaks EGL (below).
+
+**Engine side — fork patch F-009 + `frost-engine`.**
+`components/shared/paint/rendering_context.rs` gains
+`HardwareRenderingContext`: the same offscreen surfman
+shape as `SoftwareRenderingContext` (same fields, same
+`RenderingContext` impl, same swap-chain lifecycle),
+but `Connection::create_adapter()` (an alias for
+`create_hardware_adapter()` — prefers hardware, no
+software fallback) instead of
+`create_software_adapter()`. Exported from
+`components/servo/lib.rs` next to the software one.
+No extra log line was needed in the fork: WebRender
+already logs its GL renderer at device creation
+(`webrender::device::gl` — `Renderer: ...`), which is
+the confirmation signal on Joel's box. The patch file
+is `patches/servo-hardware-rendering-context-0.8.patch`
+(171 lines, fork commit `1136ffe68`), applied last by
+`clone-fork.sh` (nine patches now) and documented in
+`FORK.md`. `SurfmanRenderingContext` itself is private,
+so the fork patch was unavoidable — the embedder cannot
+build a hardware context from exported pieces alone.
+
+`crates/frost-engine/src/lib.rs` tries hardware first:
+`create_rendering_context(width, height)` builds a
+`HardwareRenderingContext` and falls back to
+`SoftwareRenderingContext` with a `log::warn!` when the
+hardware constructor fails, so Frost still launches on
+a machine with no hardware GL. `FrostWebView.ctx`
+widened from `Rc<SoftwareRenderingContext>` to
+`Rc<dyn RenderingContext>` (only trait methods were
+ever used). `FROST_RENDERER=software` skips the
+hardware attempt entirely — the escape hatch if a
+hardware driver misbehaves. The preference parsing is
+pure (`renderer_preference_from_env_value`, 2 unit
+tests); the engine gained a `log = "0.4"` dependency
+for the fallback warning. The examples need no change
+— they go through `Engine::spawn_webview`.
+
+**What the sandbox can and cannot prove.** The sandbox
+has no GPU: every adapter here is llvmpipe, so the
+hardware attempt "succeeds" against llvmpipe and the
+sandbox cannot measure any CPU win. Do not claim one
+from sandbox numbers — Joel's box, with the same
+`ps`/`top -H` commands, is the verdict. What the gates
+did prove: the UI lands on the GL backend
+(`Selected: AdapterInfo { ..., backend: Gl }`) with the
+probe default and on Vulkan with `WGPU_BACKEND=vulkan`;
+the probe declines cleanly when EGL is broken
+(`frost: no GL adapter found; using the default Vulkan
+path` as the log's first line); the engine's hardware
+attempt succeeds and pages paint; `FROST_RENDERER=software`
+still renders through the software context; and the full
+regression (split view, Snowplow both panes, Freeze +
+Archives, settings persist, Inspector, strip-scroll,
+frost://, GNOME fallback) passes unchanged.
+
+Two findings from the broken-EGL gate, both documented
+honestly: (1) With EGL totally broken, the engine
+panics in surfman's `Connection::new`
+(`connection.rs:293`, `assert_ne!(ok, egl::FALSE)` on
+`egl.Initialize`) — before the UI backend ever matters,
+because `init` runs before the compositor on the daemon
+path. That assert is upstream surfman code, not Frost's,
+and it fires for the software context too (both call
+`Connection::new()` first), so it is pre-existing, not a
+Round 16 regression — but it means the engine's software
+fallback cannot save a machine with no working EGL at
+all. The probe covers "no GL adapter", not "no EGL".
+(2) The engine's software-fallback branch itself
+(hardware attempt fails → software) is not exercisable
+in the sandbox: llvmpipe always presents as a GL
+adapter here, so the hardware attempt never fails. It
+is code-reviewed and unit-tested at the preference
+level; a machine where `create_adapter()` actually
+fails is the live proof still owed.
+
+**Packaging note (not done here).** The GLES backend
+needs EGL + GLESv2, and `libGLESv2.so`
+(`libgles2-mesa`) is NOT in the 0.11.0/0.14.0 .deb
+Depends lists. The next packaging must add it, or a
+fresh Debian install without it will fail to start on
+the GL path. No packaging changed in this round.

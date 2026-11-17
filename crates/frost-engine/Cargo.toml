@@ -29,6 +29,9 @@ servo = { path = "../../servo/components/servo", default-features = false, featu
 dpi = "0.1"
 keyboard-types = "0.8"
 url = "2"
+# Round 16 (F-009): the hardware-first rendering fallback logs when it
+# falls back to software, so the engine needs the `log` facade.
+log = "0.4"
 # Round 4 (F-003): print preview encodes the screenshot as PNG.
 png = "0.17"
 

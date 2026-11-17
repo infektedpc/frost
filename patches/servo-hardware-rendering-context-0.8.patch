@@ -1,0 +1,171 @@
+From 1136ffe681ee203563ccadcb9474de2cabb6b99b Mon Sep 17 00:00:00 2001
+From: Joel Horrell <infektedpc@gmail.com>
+Date: Tue, 17 Nov 2026 03:19:39 +0000
+Subject: [PATCH] F-009: Add HardwareRenderingContext (Round 16)
+
+---
+ components/servo/lib.rs                      |   3 +-
+ components/shared/paint/rendering_context.rs | 133 +++++++++++++++++++
+ 2 files changed, 135 insertions(+), 1 deletion(-)
+
+diff --git a/components/servo/lib.rs b/components/servo/lib.rs
+index 02a9d4cc5..07ed3ed5f 100644
+--- a/components/servo/lib.rs
++++ b/components/servo/lib.rs
+@@ -80,7 +80,8 @@ pub use net_traits::CookieSource;
+ pub use net_traits::pub_domains::is_reg_domain;
+ pub use paint::WebRenderDebugOption;
+ pub use paint_api::rendering_context::{
+-    OffscreenRenderingContext, RenderingContext, SoftwareRenderingContext, WindowRenderingContext,
++    HardwareRenderingContext, OffscreenRenderingContext, RenderingContext,
++    SoftwareRenderingContext, WindowRenderingContext,
+ };
+ // Expose our profile traits for servoshell, so we can instrument code there, but don't
+ // add it as an official API.
+diff --git a/components/shared/paint/rendering_context.rs b/components/shared/paint/rendering_context.rs
+index be0b80f5c..206e1d69d 100644
+--- a/components/shared/paint/rendering_context.rs
++++ b/components/shared/paint/rendering_context.rs
+@@ -421,6 +421,139 @@ impl RenderingContext for SoftwareRenderingContext {
+     }
+ }
+ 
++/// A hardware rendering context that renders Servo with the best hardware
++/// OpenGL adapter on the system (Frost fork patch F-009, Round 16).
++///
++/// This is the same shape as [`SoftwareRenderingContext`] — an offscreen
++/// surfman surface whose pixels the embedder reads back with
++/// [`RenderingContext::read_to_image`] — but it asks surfman for a hardware
++/// adapter (`Connection::create_adapter`, an alias for
++/// `create_hardware_adapter`) instead of the software adapter, so pages
++/// rasterize on the GPU where one exists instead of on llvmpipe. If no
++/// hardware adapter exists the constructor fails and the embedder falls
++/// back to [`SoftwareRenderingContext`].
++///
++/// Which adapter was actually picked is visible in the log without any
++/// extra code here: WebRender logs its GL renderer at device creation
++/// (`webrender::device::gl` — `Renderer: ...`).
++pub struct HardwareRenderingContext {
++    size: Cell<PhysicalSize<u32>>,
++    surfman_rendering_info: SurfmanRenderingContext,
++    swap_chain: SwapChain<Device>,
++}
++
++impl HardwareRenderingContext {
++    pub fn new(size: PhysicalSize<u32>) -> Result<Self, Error> {
++        if size.width == 0 || size.height == 0 {
++            log::error!(
++                "Unable to create HardwareRenderingContext with size under 1x1 ({size:?} provided)"
++            );
++            return Err(Error::Failed);
++        }
++
++        let connection = Connection::new()?;
++        let adapter = connection.create_adapter()?;
++        let surfman_rendering_info = SurfmanRenderingContext::new(&connection, &adapter, None)?;
++
++        let surfman_size = Size2D::new(size.width as i32, size.height as i32);
++        let surface =
++            surfman_rendering_info.create_surface(SurfaceType::Generic { size: surfman_size })?;
++        surfman_rendering_info.bind_surface(surface)?;
++        surfman_rendering_info.make_current()?;
++
++        let swap_chain = surfman_rendering_info.create_attached_swap_chain()?;
++        Ok(HardwareRenderingContext {
++            size: Cell::new(size),
++            surfman_rendering_info,
++            swap_chain,
++        })
++    }
++}
++
++impl Drop for HardwareRenderingContext {
++    fn drop(&mut self) {
++        let device = &mut self.surfman_rendering_info.device.borrow_mut();
++        let context = &mut self.surfman_rendering_info.context.borrow_mut();
++        let _ = self.swap_chain.destroy(device, context);
++    }
++}
++
++impl RenderingContext for HardwareRenderingContext {
++    fn prepare_for_rendering(&self) {
++        self.surfman_rendering_info.prepare_for_rendering();
++    }
++
++    fn read_to_image(&self, source_rectangle: DeviceIntRect) -> Option<RgbaImage> {
++        self.surfman_rendering_info.read_to_image(source_rectangle)
++    }
++
++    fn size(&self) -> PhysicalSize<u32> {
++        self.size.get()
++    }
++
++    fn resize(&self, size: PhysicalSize<u32>) {
++        assert!(
++            size.width > 0 && size.height > 0,
++            "Dimensions must be at least 1x1, got {size:?}",
++        );
++
++        if self.size.get() == size {
++            return;
++        }
++
++        self.size.set(size);
++
++        let device = &mut self.surfman_rendering_info.device.borrow_mut();
++        let context = &mut self.surfman_rendering_info.context.borrow_mut();
++        let size = Size2D::new(size.width as i32, size.height as i32);
++        let _ = self.swap_chain.resize(device, context, size);
++    }
++
++    #[servo_tracing::instrument(skip_all, name = "HardwareRenderingContext::present")]
++    fn present(&self) {
++        let device = &mut self.surfman_rendering_info.device.borrow_mut();
++        let context = &mut self.surfman_rendering_info.context.borrow_mut();
++        let _ = self
++            .swap_chain
++            .swap_buffers(device, context, PreserveBuffer::No);
++    }
++
++    fn make_current(&self) -> Result<(), Error> {
++        self.surfman_rendering_info.make_current()
++    }
++
++    fn gleam_gl_api(&self) -> Rc<dyn gleam::gl::Gl> {
++        self.surfman_rendering_info.gleam_gl.clone()
++    }
++
++    fn glow_gl_api(&self) -> Arc<glow::Context> {
++        self.surfman_rendering_info.glow_gl.clone()
++    }
++
++    fn create_texture(
++        &self,
++        surface: Surface,
++    ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
++        self.surfman_rendering_info.create_texture(surface)
++    }
++
++    fn destroy_texture(&self, surface_texture: SurfaceTexture) -> Option<Surface> {
++        self.surfman_rendering_info.destroy_texture(surface_texture)
++    }
++
++    fn take_pending_surface(&self) -> Option<Surface> {
++        self.swap_chain.take_pending_surface()
++    }
++
++    fn recycle_surface(&self, surface: Surface) {
++        self.swap_chain.recycle_surface(surface);
++    }
++
++    fn connection(&self) -> Option<Connection> {
++        self.surfman_rendering_info.connection()
++    }
++}
++
+ /// A [`RenderingContext`] that uses the `surfman` library to render to a
+ /// `raw-window-handle` identified window. `surfman` will attempt to create an
+ /// OpenGL context and surface for this window. This is a simple implementation
+-- 
+2.43.0
+

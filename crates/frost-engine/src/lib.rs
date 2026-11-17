@@ -3,7 +3,11 @@
 //! This crate owns everything Servo-shaped: creating the engine, owning one
 //! [`FrostWebView`] per tab, pumping the event loop, turning Servo
 //! notifications into [`EngineEvent`]s on a channel, and reading rendered
-//! frames out of the software rendering context as RGBA pixels.
+//! frames out of the rendering context as RGBA pixels. Round 16: the
+//! context is hardware-first — [`HardwareRenderingContext`] (fork patch
+//! F-009) when a hardware GL adapter exists, falling back to the
+//! software context with a warning when it does not, so pages rasterize
+//! on the GPU instead of llvmpipe where possible.
 //!
 //! What it deliberately does NOT do (Round 1):
 //!
@@ -31,11 +35,12 @@ use std::sync::{mpsc, Arc};
 
 use dpi::PhysicalSize;
 use servo::{
-    Code, DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePoint, EventLoopWaker, InputEvent,
-    JSValue, JavaScriptEvaluationError, Key, KeyState, KeyboardEvent, LoadStatus, Location,
-    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, PrefValue,
-    RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext, Theme, WebView,
-    WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
+    Code, DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePoint, EventLoopWaker,
+    HardwareRenderingContext, InputEvent, JSValue, JavaScriptEvaluationError, Key, KeyState,
+    KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction,
+    MouseButtonEvent, MouseMoveEvent, PrefValue, RenderingContext, Servo, ServoBuilder,
+    SoftwareRenderingContext, Theme, WebView, WebViewBuilder, WebViewDelegate, WheelDelta,
+    WheelEvent, WheelMode,
 };
 use url::Url;
 
@@ -100,9 +105,7 @@ impl Frame {
     /// True when every pixel is the same color (used by the smoke test to
     /// catch a blank/never-painted frame).
     pub fn is_solid_color(&self) -> bool {
-        self.rgba
-            .chunks_exact(4)
-            .all(|px| px == &self.rgba[0..4])
+        self.rgba.chunks_exact(4).all(|px| px == &self.rgba[0..4])
     }
 
     /// Number of distinct RGBA colors in the frame.
@@ -244,14 +247,14 @@ impl From<FrostInputEvent> for InputEvent {
 
 // Re-export the input types the UI needs to build `FrostInputEvent`s,
 // so Round 2 does not have to depend on the `servo` crate directly.
-pub use servo::{
-    Code as FrostCode, Key as FrostKey, KeyState as FrostKeyState,
-    Location as FrostLocation, Modifiers as FrostModifiers, NamedKey as FrostNamedKey,
-};
-pub use servo::{MouseButton as FrostMouseButton, MouseButtonAction as FrostMouseButtonAction};
 /// Re-exported so the UI can name the id the delegate tags every
 /// [`EngineEvent`] with (Round 14: split view routes events to panes).
 pub use servo::WebViewId;
+pub use servo::{
+    Code as FrostCode, Key as FrostKey, KeyState as FrostKeyState, Location as FrostLocation,
+    Modifiers as FrostModifiers, NamedKey as FrostNamedKey,
+};
+pub use servo::{MouseButton as FrostMouseButton, MouseButtonAction as FrostMouseButtonAction};
 
 /// Minimal [`EventLoopWaker`]: Servo calls `wake()` when it wants the
 /// embedder to spin soon. The smoke test and (later) the UI poll on a short
@@ -290,9 +293,7 @@ impl WebViewDelegate for FrostDelegate {
     }
 
     fn notify_url_changed(&self, webview: WebView, url: Url) {
-        let _ = self
-            .tx
-            .send(EngineEvent::UrlChanged(webview.id(), url));
+        let _ = self.tx.send(EngineEvent::UrlChanged(webview.id(), url));
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
@@ -316,9 +317,7 @@ impl WebViewDelegate for FrostDelegate {
     }
 
     fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
-        let _ = self
-            .tx
-            .send(EngineEvent::Crashed(webview.id(), reason));
+        let _ = self.tx.send(EngineEvent::Crashed(webview.id(), reason));
     }
 
     /// Round 13 (Snowplow): every HTTP fetch reaches the embedder
@@ -338,6 +337,65 @@ pub struct Engine {
     /// Shared Snowplow state (Round 13): the delegate enforces it,
     /// the app toggles it. Same `Rc` in both places.
     snowplow: Rc<RefCell<Snowplow>>,
+}
+
+/// Which rendering context a new webview prefers (Round 16).
+///
+/// The default is hardware-first: try [`HardwareRenderingContext`]
+/// (fork patch F-009) and fall back to the software context on failure.
+/// `FROST_RENDERER=software` forces the software context (the escape
+/// hatch if a hardware driver misbehaves on a given machine).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererPreference {
+    HardwareFirst,
+    SoftwareOnly,
+}
+
+/// Pure preference parsing, kept separate from the environment read so
+/// tests can drive it without touching process state.
+pub fn renderer_preference_from_env_value(value: Option<&str>) -> RendererPreference {
+    match value {
+        Some(v) if v.eq_ignore_ascii_case("software") => RendererPreference::SoftwareOnly,
+        _ => RendererPreference::HardwareFirst,
+    }
+}
+
+/// Read the renderer preference from the process environment.
+pub fn renderer_preference() -> RendererPreference {
+    renderer_preference_from_env_value(std::env::var("FROST_RENDERER").ok().as_deref())
+}
+
+/// Create a rendering context for a new webview (Round 16).
+///
+/// Hardware-first by default: [`HardwareRenderingContext`] when a
+/// hardware GL adapter exists, falling back to
+/// [`SoftwareRenderingContext`] (llvmpipe) with a warning when it does
+/// not — Frost must still launch on machines with no hardware GL.
+/// `FROST_RENDERER=software` skips the hardware attempt entirely.
+/// Which adapter was actually picked is visible in the log: WebRender
+/// logs its GL renderer at device creation
+/// (`webrender::device::gl` — `Renderer: ...`).
+pub fn create_rendering_context(
+    width: u32,
+    height: u32,
+) -> Result<Rc<dyn RenderingContext>, EngineError> {
+    let size = PhysicalSize::new(width, height);
+    if renderer_preference() == RendererPreference::SoftwareOnly {
+        return Ok(Rc::new(SoftwareRenderingContext::new(size).map_err(
+            |e| EngineError::Servo(format!("rendering context: {e:?}")),
+        )?));
+    }
+    match HardwareRenderingContext::new(size) {
+        Ok(ctx) => Ok(Rc::new(ctx)),
+        Err(e) => {
+            log::warn!(
+                "frost-engine: hardware rendering context failed ({e:?}); falling back to software rendering"
+            );
+            Ok(Rc::new(SoftwareRenderingContext::new(size).map_err(
+                |e| EngineError::Servo(format!("rendering context: {e:?}")),
+            )?))
+        }
+    }
 }
 
 impl Engine {
@@ -379,10 +437,9 @@ impl Engine {
         height: u32,
     ) -> Result<FrostWebView, EngineError> {
         let url = Url::parse(url).map_err(|e| EngineError::InvalidUrl(e.to_string()))?;
-        let ctx = Rc::new(
-            SoftwareRenderingContext::new(PhysicalSize::new(width, height))
-                .map_err(|e| EngineError::Servo(format!("rendering context: {e:?}")))?,
-        );
+        // Round 16: hardware-first rendering context (F-009), with a
+        // software fallback inside `create_rendering_context`.
+        let ctx = create_rendering_context(width, height)?;
         let _ = ctx.make_current();
         let delegate = FrostDelegate {
             tx: self.tx.clone(),
@@ -422,7 +479,11 @@ impl Engine {
 /// One tab's worth of Servo: a webview plus its rendering context.
 pub struct FrostWebView {
     inner: WebView,
-    ctx: Rc<SoftwareRenderingContext>,
+    /// The rendering context this webview paints into. Round 16: the
+    /// concrete type is either the hardware context (F-009) or the
+    /// software one — only trait methods are used, so the field is a
+    /// trait object.
+    ctx: Rc<dyn RenderingContext>,
     width: u32,
     height: u32,
 }
@@ -501,9 +562,10 @@ impl FrostWebView {
         script: &str,
         tx: std::sync::mpsc::Sender<Result<String, String>>,
     ) {
-        self.inner.evaluate_javascript(script.to_string(), move |result| {
-            let _ = tx.send(js_string_result(result));
-        });
+        self.inner
+            .evaluate_javascript(script.to_string(), move |result| {
+                let _ = tx.send(js_string_result(result));
+            });
     }
 
     /// Capture the current page as PNG bytes (Round 4, F-003 print
@@ -513,10 +575,7 @@ impl FrostWebView {
     /// rendering is up to date; the result is PNG bytes or an error
     /// string, delivered on the caller's channel (polled by the app's
     /// Tick). `None` rect means the whole webview.
-    pub fn request_screenshot_png(
-        &self,
-        tx: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
-    ) {
+    pub fn request_screenshot_png(&self, tx: std::sync::mpsc::Sender<Result<Vec<u8>, String>>) {
         self.inner.take_screenshot(None, move |result| {
             let out = match result {
                 Ok(img) => {
@@ -532,7 +591,7 @@ impl FrostWebView {
                         Ok(()) => Ok(bytes),
                         Err(e) => Err(format!("PNG encode failed: {e}")),
                     }
-                },
+                }
                 Err(e) => Err(format!("screenshot failed: {e:?}")),
             };
             let _ = tx.send(out);
@@ -649,7 +708,7 @@ pub fn data_url_page(title: &str, body_html: &str) -> String {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 out.push(byte as char)
-            },
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -666,7 +725,9 @@ mod tests {
         let solid = Frame {
             width: 2,
             height: 2,
-            rgba: vec![255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            rgba: vec![
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            ],
         };
         assert!(solid.is_solid_color());
         assert_eq!(solid.distinct_colors(), 1);
@@ -709,10 +770,7 @@ mod tests {
         for strip in strips {
             for row in 0..strip.height {
                 let px = &strip.rgba[(row as usize) * (strip.width as usize) * 4..][..4];
-                assert_eq!(
-                    px[0], y as u8,
-                    "strip row {row} must carry source row {y}"
-                );
+                assert_eq!(px[0], y as u8, "strip row {row} must carry source row {y}");
                 y += 1;
             }
         }
@@ -833,5 +891,42 @@ mod tests {
         }
         .into();
         assert!(matches!(ev, InputEvent::Keyboard(_)));
+    }
+
+    #[test]
+    fn renderer_preference_defaults_to_hardware_first() {
+        assert_eq!(
+            renderer_preference_from_env_value(None),
+            RendererPreference::HardwareFirst
+        );
+        assert_eq!(
+            renderer_preference_from_env_value(Some("")),
+            RendererPreference::HardwareFirst
+        );
+        assert_eq!(
+            renderer_preference_from_env_value(Some("hardware")),
+            RendererPreference::HardwareFirst
+        );
+        // Unknown values do not change the default — only "software" opts out.
+        assert_eq!(
+            renderer_preference_from_env_value(Some("bogus")),
+            RendererPreference::HardwareFirst
+        );
+    }
+
+    #[test]
+    fn renderer_preference_software_is_case_insensitive() {
+        assert_eq!(
+            renderer_preference_from_env_value(Some("software")),
+            RendererPreference::SoftwareOnly
+        );
+        assert_eq!(
+            renderer_preference_from_env_value(Some("Software")),
+            RendererPreference::SoftwareOnly
+        );
+        assert_eq!(
+            renderer_preference_from_env_value(Some("SOFTWARE")),
+            RendererPreference::SoftwareOnly
+        );
     }
 }

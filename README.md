@@ -5,14 +5,12 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 15 — Deep Freeze archives: freeze any page into a
-self-contained HTML snapshot and reopen it offline.** "Freeze this
-page…" in the menu (9 items) and the Ctrl+K palette saves the
-ACTIVE pane's live DOM with absolute subresource URLs and a
-`<base>` tag; "Archived pages…" opens a native window listing
-archives with Open/Delete. Tests 83/83 (baseline 72/72 + 11 new
-Round 15 tests). No fork patch; the fork is untouched at
-`f9462dbb7`. See [ROADMAP.md](ROADMAP.md) for the plan.
+**Status: Round 16 — Lightweight: hardware rendering — the UI
+defaults to the GL backend (probed first) and the engine renders
+pages through a hardware surfman adapter (fork patch F-009), with
+software fallbacks on both halves.** Tests 87/87 (baseline 83/83
++ 4 new Round 16 tests). Fork at `1136ffe68` (F-009). See
+[ROADMAP.md](ROADMAP.md) for the plan.
 
 ## Layout
 
@@ -22,7 +20,7 @@ frost/
 ├── rust-toolchain.toml   # Rust 1.99.1 (matches the Servo fork's pin)
 ├── FORK.md               # the Servo fork: point, patches, planned patches
 ├── clone-fork.sh         # recreate servo/ from scratch (shallow v0.8.0 + patches)
-├── patches/              # the eight proven 0.8.0 engine patches (vendored)
+├── patches/              # the nine proven 0.8.0 engine patches (vendored)
 ├── servo/                # the Servo fork (NESTED repo, gitignored, not in the zip)
 ├── crates/
 │   ├── frost/            # libcosmic app: toolbar, address bar, hamburger menu
@@ -36,10 +34,10 @@ frost/
 ## The fork
 
 Frost builds against its own Servo fork at `servo/`, not upstream. The
-fork point is **v0.8.0** (`4e136d8e…`) plus eight engine patches as fork
+fork point is **v0.8.0** (`4e136d8e…`) plus nine engine patches as fork
 commits (keypress charCode, damage rects, dmabuf export, F-001 stop,
 F-005 refresh-viewport, F-006 reload-notify, F-007 full-present,
-F-008 stop-aborts-pending). Full detail in [FORK.md](FORK.md). To recreate it on another machine:
+F-008 stop-aborts-pending, F-009 hardware rendering context). Full detail in [FORK.md](FORK.md). To recreate it on another machine:
 
 ```bash
 ./clone-fork.sh
@@ -2048,3 +2046,207 @@ latency, the Round 6 flashing fix on real hardware, and
 the WM-drawn titlebar itself (look, real min/max/close)
 — bare Xvfb has no window manager, so Joel's KDE box is
 the verdict for those.
+
+## Round 16 — Lightweight: hardware rendering (what is proven, what is not)
+
+Jumped the order ahead of Frostbite on Joel's
+"lightweight next" (2026-11-16 ~20:12). The evidence
+from his box (0.14.0 .deb, Haswell HD 4600): Frost at
+228% CPU after 5 s — four `llvmpipe` threads at
+~45–55% each, main thread 18%, Servo/tokio threads 0%.
+Software rasterization, not the engine. And
+`WGPU_BACKEND=gl frost` barely moved it (228% → 201%
+after 2:01, llvmpipe threads still at 50–60%): the env
+var only steers the UI compositor, NOT Servo's software
+rendering context.
+
+Design, two halves, separate knobs:
+
+(a) UI side (`crates/frost/src/main.rs`): the GL
+default is baked in — `WGPU_BACKEND=gl` is set in
+`main()` ONLY if unset (a user-set value is never
+touched: `WGPU_BACKEND=vulkan` still takes the Vulkan
+path, gated) AND only if a wgpu probe finds a GL
+adapter first (`gl_adapter_available()`: a bare wgpu
+instance, `backends: GL`, `enumerate_adapters(GL)` —
+new direct deps `wgpu = "28"` and
+`futures-executor = "0.3"` on the frost crate, both
+already in the tree). No GL adapter → the default is
+simply not set, one stderr line ("frost: no GL adapter
+found; using the default Vulkan path"), and Frost takes
+iced's normal Vulkan-first path. The env var (not a
+code setting, not the `.desktop` `Exec=` line) is used
+because libcosmic's iced wgpu compositor reads
+`WGPU_BACKEND` itself (`Backends::from_env`) and there
+is no public settings knob; setting it in `main` covers
+every launch path. A retry ("set it, run, re-run
+without it on failure") was implemented first and then
+REMOVED: on libcosmic's multi-window (daemon) path the
+app's `init` — and the engine's one-shot
+`setup_logging()` — runs BEFORE the compositor is
+created, so a second `app::run()` after a graphics
+failure would panic in `setup_logging()`. The probe
+decides before anything starts, which is the only safe
+shape.
+
+(b) Engine side (fork patch F-009, the bigger half):
+`HardwareRenderingContext` in the fork
+(`components/shared/paint/rendering_context.rs`, same
+offscreen surfman shape as `SoftwareRenderingContext`,
+`Connection::create_adapter()` instead of
+`create_software_adapter()`), exported from
+`components/servo/lib.rs`; patch file
+`patches/servo-hardware-rendering-context-0.8.patch`,
+fork commit `1136ffe68`, applied last by
+`clone-fork.sh` (nine patches now). The fork patch was
+unavoidable: `SurfmanRenderingContext` is private, so
+the embedder cannot build a hardware context from
+exported pieces. `frost-engine` tries hardware first
+(`create_rendering_context`) and falls back to the
+software context with a `log::warn!` on failure;
+`FROST_RENDERER=software` skips the hardware attempt
+entirely. `FrostWebView.ctx` is now
+`Rc<dyn RenderingContext>`. No extra log line in the
+fork: WebRender already logs its GL renderer at device
+creation (`webrender::device::gl` — `Renderer: ...`),
+which is the confirmation signal on Joel's box.
+
+Gates, all on the Round 16 strip-debug binary
+(516,995,648 B, `-C link-arg=-Wl,--strip-debug` via
+`cargo rustc -p frost --bin frost` — the plain 2 GB link
+OOM-kills in the sandbox, same as Rounds 14/15) under
+Xvfb :97: (a) launch + homepage paints (example.org,
+Dark, banner live, `r16-01-home.jpg`, and again with
+the final probe binary, `r16-25-home2.jpg`); the log's
+`Selected: AdapterInfo` line reads `backend: Gl`
+(llvmpipe here — the sandbox has no GPU), and there is
+no engine fallback warning (the hardware attempt
+succeeds against llvmpipe). (b) Split view from the
+Ctrl+K palette — both panes example.org
+(`r16-02-split.jpg`). (c) Snowplow in both panes: right
+pane first ("blocked-img: failed", "allowed-img:
+loaded", "blocked-js: failed", status "Snowplow
+blocked 3", `r16-03-snowplow-right.jpg`), then the
+left pane the same (status "Snowplow blocked 4" —
+the count sums across panes, the known cosmetic quirk
+from R13/R15; the per-pane behavior is correct in
+both, `r16-04-snowplow-left.jpg`). (d) Freeze from the
+menu writes `snowplow-test-page-20261117-0402.html`
+(1,617 B) with a correct `index.json` entry and status
+"Frozen: Snowplow test page" (`r16-06-frozen.jpg`);
+the archive file is correct on disk (doctype,
+comment, `<base href="http://127.0.0.1:18080/snowplow.html">`,
+one copy of each status line) — the live left pane
+shows the statuses duplicated because the page's own
+script re-ran after the capture evaluation, the
+documented v1 limit in action, not a capture bug.
+Archived pages lists it ("Snowplow test page",
+"http://127.0.0.1:18080/snowplow.html · 2026-11-17
+04:02:22 UTC · 1 KB", Open/Delete,
+`r16-07-archives.jpg`); Open from the list loads the
+archive `file://` in the active pane
+(`r16-08-archive-open.jpg` — the archive's script
+re-runs on the static DOM, again the v1 limit);
+Delete removes the file, `index.json` becomes `[]`,
+and the window shows the empty state
+(`r16-09-after-delete.jpg`). (e) Menu 9 items with the
+dynamic "Close split view" (`r16-05-menu.jpg`,
+`r16-16-menu-close-split2.jpg`); Close split view
+keeps the active pane (`r16-17-split-closed.jpg`).
+(f) Full regression: settings save + persist across
+relaunch (homepage example.org → example.com, theme
+Dark → Light, `settings.json` shows both, relaunch
+opens example.com in Light, `r16-13-settings-saved.jpg`,
+`r16-15-settings-saved2.jpg`, `r16-21-relaunch.jpg`;
+banner correctly absent on example.com); Inspector F12
+gives a real 37-node snapshot of the archive page
+(`r16-18-inspector.jpg`); strip-scroll paints BAND 4 /
+BAND 5 fully (`r16-19-bands.jpg`); `frost://settings`
+fails plainly with the "no longer has internal pages"
+status (`r16-20-frost-scheme.jpg`); `ss` shows no Frost
+listener. (g) GNOME-mode launch shows Frost's own
+titlebar "Frost — Example Domain" with min/max/close
+above the toolbar, in the persisted Light theme
+(`r16-22-gnome.jpg`).
+
+Round 16's own gates, on the final probe binary: the
+UI lands on GL (`Selected: ... backend: Gl`,
+`r16-25-home2.jpg`); with `WGPU_BACKEND=vulkan` it
+lands on Vulkan (`backend: Vulkan`,
+`r16-24-vulkan.jpg` and `r16-27-vulkan2.jpg`); with
+`FROST_RENDERER=software` the engine renders through
+the software context and the page still paints
+(`r16-26-software.jpg`); and with EGL broken
+(`__EGL_VENDOR_LIBRARY_DIRS` pointed at an empty
+directory) the probe declines cleanly — the log's first
+line is "frost: no GL adapter found; using the default
+Vulkan path" — before the app reaches the engine, which
+then panics in surfman's `Connection::new`
+(`connection.rs:293`, `assert_ne!(ok, egl::FALSE)` on
+`egl.Initialize`). That assert is upstream surfman
+code, not Frost's, and it fires for the software
+context too (both call `Connection::new()` first), so
+it is pre-existing, not a Round 16 regression — but it
+means the engine's software fallback cannot save a
+machine with no working EGL at all. The probe covers
+"no GL adapter", not "no EGL".
+
+Honest limits (stated, not oversold): the sandbox has
+no Haswell GPU (SwiftShader/llvmpipe either way), so
+the sandbox CANNOT measure the CPU win — no CPU
+improvement is claimed from sandbox numbers. Joel's
+box is the verdict: run Frost, watch `top -H` / `ps`
+the way he did for the 228% reading, and read the two
+log lines (`Selected: AdapterInfo` for the UI backend,
+`webrender::device::gl — Renderer:` for the engine's
+GL renderer — "Mesa Intel(R) HD Graphics 4600" / crocus
+means hardware, "llvmpipe" means software). Also
+unproven in the sandbox: the engine's software-fallback
+branch (hardware attempt fails → software) — llvmpipe
+always presents as a GL adapter here, so the hardware
+attempt never fails; it is code-reviewed and
+unit-tested at the preference level, and a machine
+where `create_adapter()` actually fails is the live
+proof still owed.
+
+Packaging note (not done here): the GLES backend needs
+EGL + GLESv2 and `libGLESv2.so` (`libgles2-mesa`) is
+NOT in the 0.11.0/0.14.0 .deb Depends lists — the next
+packaging must add it, or a fresh Debian install
+without it will fail to start on the GL path. No .deb,
+no push in this round.
+
+Harness notes for the next round: the runtime restart
+killed Xvfb :97 and the 18080/18099/18101 test servers
+— restart all three (Xvfb :97 1280x800x24; 18080 +
+18101 `python3 -m http.server` in `r13-test/`; 18099
+`hang-server.py`) before gating. The Settings popup is
+its own X window: focus it by title (`xfocus
+"Settings"`) BEFORE typing into its fields — clicking
+the field is not enough, and keystrokes otherwise land
+in the main window (this round's first homepage edit
+went to the page's text selection instead of the
+field). The palette's Enter key did not run the
+filtered entry under `xinject key 36` this round;
+clicking the result row did — click, don't Enter, for
+palette picks. Menu item rows: measure from the
+screenshot — "Close split view" is at y≈283, and a
+click at y≈311 lands in the gap and just closes the
+menu. The example.org "book" icon above the first
+paragraph is pre-existing (same pixels in the Round 15
+screenshot), not a Round 16 regression.
+
+Carried over, unchanged: the stale "Capturing…"
+status after a capture (Round 7); Settings has no
+in-content Close button (OS close works, and in WM mode
+the popup has a real WM close button); theme applies on
+Save, not per click; the Back-button engine quirk
+(Rounds 11/12/15); the Snowplow status count summing
+across panes in split view (cosmetic). Not verified in
+the sandbox, as before: real mouse/keyboard,
+mouse-wheel scroll over the page, drag latency, the
+Round 6 flashing fix on real hardware, and the
+WM-drawn titlebar itself (look, real min/max/close) —
+bare Xvfb has no window manager, so Joel's KDE box is
+the verdict for those. Next in the easiest-first order:
+Frostbite hibernation (needs tabs).

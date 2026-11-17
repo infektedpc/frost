@@ -25,6 +25,12 @@ frost-extensions = { path = "../frost-extensions" }
 # Round 5: the inspector (DOM walker script + snapshot parsing).
 frost-inspector = { path = "../frost-inspector" }
 url = "2"
+# Round 16: the GL-default probe in main.rs asks wgpu itself whether
+# a GL adapter exists before setting `WGPU_BACKEND=gl` (wgpu 28 is
+# already in the tree via libcosmic, so this unifies to the same
+# version; futures-executor only provides `block_on` for the probe).
+wgpu = "28"
+futures-executor = "0.3"
 # Round 3: settings persistence (serde_json), internal-page Markdown
 # rendering (pulldown-cmark 0.13 — cached in the registry).
 serde = { version = "1", features = ["derive"] }

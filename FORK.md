@@ -34,7 +34,8 @@ git -C servo fetch --unshallow
 
 The first three were proven earlier in the servo-de embedder against
 Servo 0.8.0; the fourth is Frost's own F-001 (Round 2), the fifth is
-F-005 (Round 3), and the last three are Round 4 (F-006, F-007, F-008).
+F-005 (Round 3), the next three are Round 4 (F-006, F-007, F-008),
+and the ninth is F-009 (Round 16).
 Each was verified with `git apply --check` against this
 fork point before applying, one commit per patch. The patch files are
 vendored in `patches/` so the fork is reproducible from this repo alone
@@ -50,6 +51,7 @@ vendored in `patches/` so the fork is reproducible from this repo alone
 | `fba674cc3` | `patches/servo-reload-notify-0.8.patch` | F-006 (Round 4): `WebView::reload()` now goes through `set_load_status(LoadStatus::Started)`, so the delegate is notified and the engine reports `LoadStarted` on reload. One line, no new message type. The app-side Reload workaround is retired. |
 | `f4886bf57` | `patches/servo-full-present-0.8.patch` | F-007 (Round 4): WebRender `max_partial_present_rects: 1 → 0` (full present, the upstream default) in `Painter::new`, with the mechanism documented in a comment — partial present requires the embedder to keep its own full-frame backing buffers, which Frost does not (it reads the GL back buffer wholesale and `Painter::render` clears it first). Also adds two permanent `debug!` diagnostics: display-list arrival (pipeline, epoch, first_reflow, viewport/device size, byte counts) and the root-wrapper rect. The Round 2 resize jiggle retires with this. |
 | `f9462dbb7` | `patches/servo-stop-abort-pending-0.8.patch` | F-008 (Round 4): `handle_stop_msg` also drains the webview's pending session-history changes for the top-level browsing context and closes their pipelines, mirroring `handle_abort_load_url_msg` — so Stop aborts a navigation stuck at the constellation, which `Stop` alone could never reach (it only goes to the CURRENT pipeline, and the embedder cannot name the pending pipeline). |
+| `1136ffe68` | `patches/servo-hardware-rendering-context-0.8.patch` | F-009 (Round 16): add `HardwareRenderingContext` — the same offscreen surfman shape as `SoftwareRenderingContext`, but `Connection::create_adapter()` (hardware) instead of `create_software_adapter()` (llvmpipe), so pages rasterize on the GPU where one exists. The embedder tries it first and falls back to software on failure. Which adapter was picked is visible in the log without extra code: WebRender logs its GL renderer at device creation (`webrender::device::gl` — `Renderer: ...`). |
 
 Fork log:
 

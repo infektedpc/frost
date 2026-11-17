@@ -64,6 +64,18 @@
 //!   the upstream default), so the first paint is complete and no
 //!   post-load jiggle is needed. F-005's `refresh_viewport` stays
 //!   (harmless viewport re-send).
+//! * Round 16: the UI compositor defaults to the GL backend
+//!   (`WGPU_BACKEND=gl` set in `main` only if unset AND only if a
+//!   wgpu probe finds a GL adapter — see `ensure_gl_backend_default`
+//!   and `gl_adapter_available`), and the engine renders pages
+//!   through a hardware surfman adapter (fork patch F-009) with a
+//!   software fallback. If no GL adapter exists, the default is
+//!   simply not set and the app takes iced's normal Vulkan-first
+//!   path, so a machine without GL still launches. A user-set
+//!   `WGPU_BACKEND` is never overridden. (A retry was considered
+//!   and rejected: on libcosmic's multi-window path the app's init
+//!   runs before the compositor, so a second `app::run()` would
+//!   panic in the engine's one-shot `setup_logging()`.)
 //!
 //! Chrome geometry is fixed by construction (toolbar 48, status 28,
 //! plus Frost's own titlebar 40 only in the GNOME fallback — 0 in
@@ -98,7 +110,66 @@ mod app;
 
 #[cfg(feature = "ui-libcosmic")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_gl_backend_default();
     app::run()
+}
+
+/// Round 16: is there a GL adapter on this machine? (Probe for the
+/// `WGPU_BACKEND=gl` default — see `ensure_gl_backend_default`.)
+///
+/// A bare wgpu instance with the GL backend only, no window: if it
+/// enumerates at least one adapter, the compositor's later GL request
+/// will find one too. wgpu-hal reports a broken EGL as "no adapters",
+/// never a panic, so a machine with no working EGL just answers false
+/// here. (That does not save a machine with no EGL at all: the engine
+/// still needs EGL to render pages, and there surfman's
+/// `Connection::new` asserts on `eglInitialize` — see ARCHITECTURE.md.
+/// The probe covers "no GL adapter", not "no EGL".)
+#[cfg(feature = "ui-libcosmic")]
+fn gl_adapter_available() -> bool {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::GL,
+        ..Default::default()
+    });
+    !futures_executor::block_on(instance.enumerate_adapters(wgpu::Backends::GL)).is_empty()
+}
+
+/// Round 16: default the wgpu backend to GL (hardware OpenGL via Mesa)
+/// — but only when a GL adapter actually exists.
+///
+/// Why the env var, not a code setting: libcosmic's iced wgpu
+/// compositor reads `WGPU_BACKEND` itself (`Backends::from_env`) when
+/// it creates the adapter, and there is no public settings knob for
+/// it — the env var is the supported mechanism. Setting it in `main`
+/// (before any iced code runs) covers every launch path, including a
+/// plain `frost` from a terminal; a `.desktop` `Exec=` line would only
+/// cover desktop launches, so it is the weaker choice and is not used.
+///
+/// Why a probe instead of "set it and retry on failure": a retry
+/// cannot work. Frost runs on libcosmic's multi-window (daemon) path,
+/// where the app's `init` — and the engine's one-shot
+/// `setup_logging()` — runs BEFORE the compositor is created, so a
+/// second `app::run()` after a graphics failure would panic in
+/// `setup_logging()` (`log::set_boxed_logger` can only run once per
+/// process). The probe decides before anything starts: GL adapter
+/// present → set the default; absent → leave the backend unset and
+/// Frost takes iced's normal Vulkan-first path (lavapipe on a machine
+/// with no hardware GL — slow, but it launches). A user-set value is
+/// never touched: `WGPU_BACKEND=vulkan` (or anything else) keeps
+/// working exactly as before.
+///
+/// Returns true when Frost set the GL default.
+#[cfg(feature = "ui-libcosmic")]
+fn ensure_gl_backend_default() -> bool {
+    if std::env::var_os("WGPU_BACKEND").is_some() {
+        return false;
+    }
+    if gl_adapter_available() {
+        std::env::set_var("WGPU_BACKEND", "gl");
+        return true;
+    }
+    eprintln!("frost: no GL adapter found; using the default Vulkan path");
+    false
 }
 
 #[cfg(not(feature = "ui-libcosmic"))]
@@ -107,4 +178,34 @@ fn main() {
     eprintln!("frost: run with `cargo run -p frost --features ui-libcosmic` for the window.");
     eprintln!("frost: the engine is headless — prove it with:");
     eprintln!("frost:   cargo run -p frost-engine --example smoke");
+}
+
+#[cfg(all(test, feature = "ui-libcosmic"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gl_adapter_probe_finds_the_sandbox_gl_adapter() {
+        // The sandbox's vendored Mesa EGL always offers a GL adapter
+        // (llvmpipe), so the probe answers true here. On a machine
+        // with no GL adapter it answers false — that branch is covered
+        // by the gate (launch with GL broken), not by this test.
+        assert!(gl_adapter_available());
+    }
+
+    #[test]
+    fn gl_backend_default_respects_user_value() {
+        // Save and restore: no other test touches WGPU_BACKEND.
+        let saved = std::env::var_os("WGPU_BACKEND");
+        std::env::remove_var("WGPU_BACKEND");
+        assert!(ensure_gl_backend_default());
+        assert_eq!(std::env::var("WGPU_BACKEND").as_deref(), Ok("gl"));
+        std::env::set_var("WGPU_BACKEND", "vulkan");
+        assert!(!ensure_gl_backend_default());
+        assert_eq!(std::env::var("WGPU_BACKEND").as_deref(), Ok("vulkan"));
+        match saved {
+            Some(v) => std::env::set_var("WGPU_BACKEND", v),
+            None => std::env::remove_var("WGPU_BACKEND"),
+        }
+    }
 }

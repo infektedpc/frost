@@ -3195,11 +3195,13 @@ dependencies = [
  "frost-engine",
  "frost-extensions",
  "frost-inspector",
+ "futures-executor",
  "libcosmic",
  "pulldown-cmark",
  "serde",
  "serde_json",
  "url",
+ "wgpu",
 ]
 
 [[package]]
@@ -3208,6 +3210,7 @@ version = "0.1.0"
 dependencies = [
  "dpi 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "keyboard-types",
+ "log",
  "png 0.17.16",
  "servo",
  "url",
