@@ -1287,8 +1287,8 @@ as tasks, with `updating` staying true until the
 | 2. Media stack on (`media-gstreamer`) | DONE (R17) — local H.264 plays, frames advance. |
 | 3. MSE foundation (F-011) | DONE (R18) — `MediaSource` exists, attaches, `isTypeSupported` answers. Bytes queue, nothing decodes. |
 | 4. `SourceBuffer.appendBuffer` → media thread | DONE (R19) — `pending_bytes` drain into the player; `buffered` [0.00–10.00] script-side; `loadedmetadata`, duration 10 s, `networkState` Idle, `activeSourceBuffers` length 1. Stretch: the segments decode and PLAY through the existing ServoSrc pipeline. |
-| 5. YouTube's DASH segments through the MSE pipeline | R20 — was "GStreamer appsrc pipeline"; re-scoped in R19 because the pipeline already works for local segments. Drive a real watch page: the player's segment requests become `appendBuffer` calls; close whatever gaps that exposes (segment timing, `timestampOffset`, audio+video buffers). |
-| 6. YouTube playback | R21 — a watch page plays end to end, not just loads. Gate: video plays, not just the homepage. |
+| 5. YouTube's DASH segments through the MSE pipeline | DONE (R20) — the remuxer (F-013): one buffer passes through byte-identical; two buffers merge into one combined init + re-ordered `moof`s. Real YouTube DASH segments ("Me at the zoo", itag 134 + 140) play end to end through the MSE pipeline: video `buffered` [0.00–18.93], audio [0.00–19.06], `playing` fires, `currentTime` advances, decoded frame renders. |
+| 6. YouTube playback | R21 — a watch page plays end to end, not just loads. Gate: video plays, not just the homepage. What R20 learned: the real watch page gets metadata and a poster (duration 0:19 known) but the progressive itag 18 path returns HTTP 403 in the sandbox (bot-checked IP) and the player errors out; SABR/DASH POSTs return 200 but playback never starts. R21's job is the SABR/MSE handoff: drive the DASH path (possibly by keeping itag 18 out of the player's way) + add MSE append logging so the appends are observable. If the 403 is sandbox-IP-only, Joel's box is the real test. |
 | 7. Hardware decode | After R21 — VA-API H.264 on Joel's box (`gstreamer1.0-vaapi`); VP9/AV1 stay software on Haswell. |
 
 No unit tests were added in this round: the changes
@@ -1311,3 +1311,162 @@ so it is the guard for the parser too. The fork
 unit tests are runnable on a machine with a warm
 fork target: `cargo test -p servo-script --lib mp4`
 inside `servo/`.
+
+## Round 20 — MSE slice 3 (the remuxer, F-013)
+
+### Why a remuxer exists at all
+
+One media element has ONE push source: a single
+`ServoSrc` → `qtdemux` byte stream per player. A
+real YouTube player appends one init segment per
+track — video `ftyp`+`moov` (track 1) and audio
+`ftyp`+`moov` (also track 1) — so the byte stream
+the player saw had TWO `moov` boxes and two
+tracks both numbered 1. `qtdemux` cannot negotiate
+that: the pipeline died with `not-negotiated (-4)`
+and every later push failed (`BufferPushFailed`).
+A single combined mux (one `moov`, two tracks,
+interleaved `moof`s) plays fine, so the fix is to
+merge at the MSE layer, before pushing. The
+combined init the remuxer emits is built from the
+buffers' own init segments: the first track's
+`ftyp` plus a fresh `moov` (new `mvhd`, timescale
+1000, duration = longest track's duration; the
+copied `trak` boxes with track IDs reassigned so
+they are distinct; a fresh `mvex` with one `trex`
+per track). `mdat` bytes are never touched.
+
+### `MseMuxer` — `components/script/dom/media/mux.rs`
+
+Owned by `MediaSource` (`DomRefCell<MseMuxer>`,
+reset on detach). Per-buffer creation-order keys
+come from `AddSourceBuffer` (`next_track_key:
+Cell<u32>` on `MediaSource`; `SourceBuffer::new`
+gains a key parameter — one call site). The API
+is one method:
+
+```rust
+feed(key, bytes, buffer_count) -> FeedResult {
+    accepted: bool,            // false = held for a later drain
+    chunks: Vec<Vec<u8>>,      // bytes to push to the player
+}
+```
+
+- One buffer only (`buffer_count == 1` at first
+  feed): pass-through. Chunks go to the player
+  byte-identical to Round 19 — no rebuild, no
+  rewrite. A second buffer's chunks in this mode
+  are dropped with a warning.
+- Two or more buffers: hold init segments and
+  media chunks until every existing buffer has
+  supplied its init, then emit ONE combined init
+  followed by the held media in presentation-time
+  order (each `moof`'s `tfdt` divided by its
+  track's timescale, ties broken by arrival
+  order). After that, each `moof` has its `tfhd`
+  track ID rewritten to the merged ID and its
+  `mfhd` sequence number renumbered in emission
+  order. A chunk arriving for a buffer whose init
+  is still missing is held until that init
+  arrives; an init arriving after the combined
+  init went out is too late — it and its buffer's
+  media are dropped with a warning (documented
+  limit: all buffers must append their init
+  before any media flows).
+- `feed()` is idempotent on inits: a re-fed chunk
+  whose init is already stored is ignored.
+  Re-feeding a media chunk would duplicate it, so
+  the muxer never re-feeds — see `push_pending`
+  below.
+- `mp4.rs` gained `duration_secs: f64` on
+  `Mp4TrackInfo` (parsed from `mdhd`:
+  v0 timescale at content+12, duration at
+  content+16; v1 timescale at content+20,
+  duration u64 at content+24) and
+  `read_box`/`children` went `pub(crate)` for
+  the muxer. 7 unit tests (single-buffer
+  pass-through byte-identical; two inits →
+  combined `moov` parses back via
+  `parse_init_segment` with 2 tracks IDs 1,2 +
+  `mvex` with 2 `trex`; `moof` `tfhd` rewritten
+  + `mfhd` renumbered; held media flushed in
+  timestamp order; media-before-init held then
+  emitted; late init + its media dropped;
+  single-buffer late second buffer dropped) —
+  fork-only, NOT run in the sandbox (cold fork
+  test target: mozjs C++ rebuild ~2.5
+  objects/min; killed after ~30 min at ~590
+  objects, same status as R19's `mp4` tests).
+  Runnable on a warm fork target:
+  `cargo test -p servo-script --lib mux`
+  inside `servo/`.
+
+### Wiring — `SourceBuffer::drain_pending`
+
+`drain_pending` feeds each queued chunk through
+the muxer and pushes each emitted chunk via
+`push_media_source_data`. On any push failure
+the FAILED chunk and the remaining emitted
+chunks go into a new `push_pending:
+DomRefCell<Vec<Vec<u8>>>` queue on the
+`SourceBuffer`; on the next drain they go
+straight to the player, ahead of anything new,
+bypassing the muxer. `buffered` accounting
+(`parse_appended`) runs on the ORIGINAL chunk
+and is recorded when the muxer accepts it (held
+or emitted), using this buffer's own init info —
+so the merged stream's reassigned track IDs
+never leak into accounting, and the combined
+init chunk is never parsed by
+`parse_appended`. `mfhd` sequence gaps on
+retry are acceptable: `qtdemux` tolerates
+non-consecutive sequence numbers.
+
+### What the real watch page actually does (R20, gated)
+
+The watch page loads, the player initializes, the
+poster frame renders, the full controls render,
+and the duration (0:19) is known — but it does
+NOT play. Fresh-Frost log evidence: 6× HTTP 403
+on the itag 18 progressive `videoplayback` URLs;
+4× `Player error ... GstTypeFindElement: Could
+not determine type of stream` (the 403 bodies
+have no media to typefind); clicking play shows
+YouTube's generic error screen. SABR/DASH POSTs
+return 200 (16×, 7× 200) — segments do arrive —
+but playback never starts, and the fork logs no
+MediaSource/SourceBuffer/appendBuffer activity at
+info level, so whether the player appends SABR
+segments to MSE is UNPROVEN. The 403s are most
+plausibly YouTube bot-checking the sandbox IP
+(the same IP was bot-checked for `yt-dlp`
+re-downloads earlier in R20), so on Joel's
+residential IP the progressive path would likely
+succeed — hypothesis, not a claim. R21's work:
+drive the SABR/MSE path (possibly by keeping
+itag 18 out of the player's way) + add MSE
+append logging so the appends are observable.
+
+### Harness findings (R20)
+
+- **MSE probes must be the first media page in
+  a fresh Frost.** The 5th media page in one
+  process failed to produce metadata (readyState
+  stayed 0, networkState 2, no error logged)
+  while script-side `buffered` still recorded
+  ranges; a fresh Frost with the same probe
+  passed ALL PASS. Restart Frost between MSE
+  probes. The remuxer is exonerated — the
+  effect is pre-existing engine/media-thread
+  behavior, and it also hit the R19 probe
+  shape (buffered records, no metadata).
+- **Servo caches aggressively.** A re-run of an
+  edited probe page served the old copy (one
+  GET in the server log for two runs); use a
+  `?cache-buster` query when re-running an
+  edited probe page.
+- A probe that waits for `loadedmetadata` must
+  register its listener BEFORE the appends —
+  the event can fire during the first append,
+  and a listener registered after the appends
+  misses it.

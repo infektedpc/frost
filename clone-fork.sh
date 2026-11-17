@@ -3,7 +3,7 @@
 #
 # What it does:
 #   1. Shallow-clones servo/servo at tag v0.8.0 into ./servo/
-#   2. Applies the twelve proven 0.8.0 engine patches from ./patches/,
+#   2. Applies the thirteen proven 0.8.0 engine patches from ./patches/,
 #      one commit per patch (the three servo-de patches + Frost's own
 #      F-001 stop patch, which the engine's stop() depends on, the
 #      F-005 viewport-refresh patch, which the engine's refresh_viewport()
@@ -12,7 +12,8 @@
 #      patch: F-009 hardware rendering context, the Round 17
 #      patch: F-010 HTTP/2 max header list size, and the Round 18
 #      patch: F-011 MSE foundation, and the Round 19 patch: F-012
-#      MSE appendBuffer → media thread).
+#      MSE appendBuffer → media thread, and the Round 20 patch: F-013
+#      MSE remuxer).
 #
 # Usage (from the frost repo root):
 #   ./clone-fork.sh
@@ -58,7 +59,7 @@ git config user.email "infektedpc@gmail.com"
 
 echo "Fork point: $(git rev-parse HEAD) ($(git log --oneline -1))"
 
-for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8 servo-stop-0.8 servo-refresh-viewport-0.8 servo-reload-notify-0.8 servo-full-present-0.8 servo-stop-abort-pending-0.8 servo-hardware-rendering-context-0.8 servo-http2-header-list-size-0.8 servo-mediasource-foundation-0.8 servo-mediasource-append-0.8; do
+for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8 servo-stop-0.8 servo-refresh-viewport-0.8 servo-reload-notify-0.8 servo-full-present-0.8 servo-stop-abort-pending-0.8 servo-hardware-rendering-context-0.8 servo-http2-header-list-size-0.8 servo-mediasource-foundation-0.8 servo-mediasource-append-0.8 servo-mediasource-remux-0.8; do
     echo "Applying $patch..."
     git apply --check "$PATCHES_DIR/$patch.patch"
     git apply "$PATCHES_DIR/$patch.patch"
@@ -99,6 +100,9 @@ for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8
             ;;
         servo-mediasource-append-0.8)
             git commit -qm "F-012: MSE slice 2 — appendBuffer → media thread (Round 19)"
+            ;;
+        servo-mediasource-remux-0.8)
+            git commit -qm "F-013: MSE slice 3 — remux per-track DASH streams into one player stream (Round 20)"
             ;;
     esac
 done

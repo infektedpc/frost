@@ -5,15 +5,17 @@ parts, every step committed, no giant rewrites: the extension host and the
 HTML inspector are scaffolded from day one so they never need bolting on
 later.
 
-**Status: Round 19 — MSE slice 2: `SourceBuffer.appendBuffer`
-→ media thread (fork patch F-012). Appended fMP4 segments
-reach the player, `buffered` reports [0.00–10.00],
-`loadedmetadata` fires with duration 10 s and 320×240,
-and — beyond the slice's scope — the segments decode
-and PLAY through the existing ServoSrc pipeline.
-YouTube still does NOT play — its DASH player has not
-been driven yet; that is Round 20/21. Tests 87/87.
-Fork at F-012. See [ROADMAP.md](ROADMAP.md) for the plan.**
+**Status: Round 20 — MSE slice 3: the remuxer (fork patch
+F-013). Real YouTube DASH segments ("Me at the zoo", itag
+134 video + itag 140 audio) play end to end through the
+MSE pipeline: two `SourceBuffer`s, `buffered` [0.00–18.93]
+video / [0.00–19.06] audio, `playing` fires, `currentTime`
+advances, and a decoded frame renders. The real YouTube
+watch page still does NOT play — its player hits HTTP 403
+on the progressive stream (sandbox IP is bot-checked) and
+shows its generic error screen; that gap is Round 21.
+Tests 87/87. Fork at F-013. See [ROADMAP.md](ROADMAP.md)
+for the plan.**
 
 ## Layout
 
@@ -2789,3 +2791,208 @@ need the no-blocklist launch, Snowplow gates the
 blocklist one. Next: Round 20, YouTube's DASH
 segments through the MSE pipeline (was: "GStreamer
 appsrc pipeline" — the pipeline is already there).
+
+## Round 20 — MSE slice 3 (the remuxer: real YouTube DASH segments play)
+
+The third slice of the MSE project Joel chose
+2026-11-16 ("MSE project next", ahead of Frostbite).
+Fork patch F-013 is the remuxer (`MseMuxer`,
+`components/script/dom/media/mux.rs`, 7 unit tests
+— fork-only, same status as F-012's parser tests:
+the cold fork test target needs a mozjs C++ rebuild
+that runs ~2.5 objects/min in the sandbox, so the
+fork tests were not run; the live probe gate is the
+guard, as in R18/R19).
+
+The diagnosis, proven by probe1/2 vs probe3 in
+this round: the player has ONE push source
+(`ServoSrc` → `qtdemux`) per media element, and a
+real YouTube player appends one init segment per
+track — video `ftyp`+`moov` (track 1) and audio
+`ftyp`+`moov` (also track 1). The byte stream the
+player saw had TWO `moov` boxes and two tracks
+both numbered 1, and `qtdemux` cannot negotiate
+that: the pipeline died with `not-negotiated (-4)`
+and every later push failed (`BufferPushFailed`).
+A single combined mux (one `moov`, two tracks,
+interleaved `moof`s) plays fine, so the fix is to
+merge at the MSE layer, before pushing:
+
+- One `SourceBuffer` only: pass-through. Chunks go
+  to the player byte-identical to Round 19 — no
+  rebuild, no rewrite. The R19 probe still passes
+  unchanged through this path.
+- Two or more buffers: hold init segments and media
+  chunks until every existing buffer has supplied
+  its init, then emit ONE combined init — the first
+  track's `ftyp` plus a fresh `moov` built from the
+  copied `trak` boxes (track IDs reassigned so they
+  are distinct) and a fresh `mvex` with one `trex`
+  per track — followed by the held media in
+  presentation-time order (from each `moof`'s
+  `tfdt` and its track's timescale). After that,
+  each `moof` has its `tfhd` track ID rewritten to
+  the merged ID and its `mfhd` sequence number
+  renumbered in emission order. `mdat` bytes are
+  never touched. The new `mvhd` uses timescale
+  1000 and the longest track's duration; `mp4.rs`
+  gained a `duration_secs` field on `Mp4TrackInfo`
+  for it, and `read_box`/`children` went
+  `pub(crate)` for the muxer.
+- `MediaSource` owns the muxer (per-buffer
+  creation-order keys handed out by
+  `AddSourceBuffer`; reset on detach).
+  `SourceBuffer::drain_pending` feeds each chunk
+  through it and records `buffered` ranges from
+  the ORIGINAL chunk when the muxer accepts it —
+  held or emitted — using this buffer's own init
+  info, so the merged stream's reassigned track
+  IDs never leak into accounting. A chunk the
+  player refuses is NOT re-fed through the muxer
+  (that would duplicate it): the refused emitted
+  bytes wait in a new `push_pending` queue and go
+  straight to the player on the next drain, ahead
+  of anything new.
+
+Honest limits, stated up front: all `SourceBuffer`s
+must append their init segment before any media
+flows — media appended while an init is missing is
+held, not dropped, and flushes once the init
+arrives; a buffer that never appends an init stalls
+the stream. A buffer created after the combined
+init went out, or an init appended after it, is too
+late: its track is not in the stream, so its init
+and media are dropped with a warning. Seeking is
+still not supported (R19 limit). The audio in the
+R20 test segments is re-containerized, not
+byte-identical to YouTube's file: YouTube
+bot-checked the sandbox IP mid-round (android/tv/
+ios clients and direct Innertube all refused), so
+the already-downloaded itag 140 audio was
+re-fragmented with ffmpeg stream-copy — the AAC
+sample data is byte-identical to YouTube's itag 140
+stream, only the box structure was regenerated
+into fMP4. The video segments are untouched real
+DASH. The real YouTube watch page still does NOT
+play — see below. No `.deb`, no push.
+
+Real segments, gated live — the round's core
+deliverable: "Me at the zoo" (jNQXAC9IVRw), itag
+134 video (avc1.4D400C, 320×240, 18.93 s) + itag
+140 audio (mp4a.40.2, 19.06 s), appended to two
+`SourceBuffer`s exactly as a real player does
+(`r20-media/probe.html`): ALL PASS — `sourceopen`,
+both `addSourceBuffer`s, all 15 appends firing
+`updateend`, video `buffered` [0.00–18.93], audio
+`buffered` [0.00–19.06], element `buffered`
+mirrors both, `loadedmetadata` (readyState 4),
+320×240, duration 18.933, audioTracks 1,
+videoTracks 1, networkState 1, error none,
+`endOfStream` → `sourceended`, `playing` fires
+with `currentTime` 0.00 → 2.51, and the decoded
+frame renders Jawed at the zoo with the elephants
+behind him. Zero `Player error`, zero `MSE: could
+not push`, zero `not-negotiated`, zero remux
+warnings in the gate log. The single-buffer
+combined mux (`probe3.html`) also passes ALL PASS
+(`buffered` [0.00–19.13], `currentTime` 0.00 →
+2.54, frame renders) — the pass-through path is
+intact.
+
+The real watch page, attempted honestly (part 2 of
+the round): it gets much further than Round 17 —
+the page loads, the player initializes, the poster
+frame renders, the full controls render, and the
+duration 0:19 is known — but it does NOT play.
+The evidence pins it down: the player first
+requests the progressive itag 18 MP4 and YouTube
+answers **HTTP 403** (×6), so GStreamer typefind
+fails on the error body ("Could not determine
+type of stream. Stream doesn't contain enough
+data.", ×4, one per attempt) and clicking play
+shows YouTube's generic error screen ("An error
+occurred. Please try again later.", Playback ID
+logged). The player also issues SABR/DASH POSTs
+(16×) that return **200** — segments do arrive —
+but playback never starts, and there is no MSE
+logging at info level to prove whether the player
+appends them to the MSE buffers or not. The 403s
+are most plausibly YouTube bot-checking the
+sandbox IP — the same IP was bot-checked for
+`yt-dlp` re-downloads earlier in this round, and
+the sandbox has no login — so on Joel's residential
+IP the progressive path would likely succeed; that
+is a hypothesis, not a claim. What R21 takes up:
+whether the SABR/MSE path plays once the
+progressive path stops failing first (or is kept
+out of the player's way), with MSE append logging
+so the appends themselves are visible.
+
+Gates, all on the Round 20 strip-debug binary
+(522,325,608 B) under Xvfb :97 (test servers
+18080/18099/18101, fresh `r20-config`/`r20-data`):
+
+- Full test suite: 87/87 (54 + 17 + 8 + 8),
+  serialized, `CARGO_BUILD_JOBS=1`. `cargo check
+  -p servo-script` clean (only the 2 pre-existing
+  warnings). The fork's own `mux`/`mp4` unit tests
+  were NOT run (cold fork test target — the mozjs
+  C++ rebuild runs ~2.5 objects/min in the
+  sandbox; killed after ~30 min at ~590/800
+  objects, same status as R19's `mp4` tests).
+- R20 two-buffer probe (`r20-01/02/03`): ALL PASS
+  (see above). probe3 single-buffer
+  (`r20-04/05`, then `r20-08/09` after the probe
+  fix): ALL PASS.
+- R18 probe still passes, 29/29 (`r20-41/42`);
+  R19 probe still passes, ALL PASS (`r20-43/44`,
+  duration settles to 10, `currentTime` 1.51 after
+  2 s playing, decoded white-ball frame).
+- Regressions, all pass: homepage paints
+  (`r20-20-home`); youtube.com loads, 0
+  `SendRequest` / `PROTOCOL_ERROR` in the log —
+  skeleton UI (`r20-21-youtube`); split view, both
+  panes render YouTube (`r20-22-split`); Snowplow
+  blocks in both panes — blocked-img/js failed,
+  allowed-img loaded in each (`r20-36/37`); Freeze
+  writes a correct archive (`index.json` + HTML
+  with `<base>` tag, `r20-23-freeze`); Inspector
+  F12, 35-node snapshot (`r20-24-inspector`);
+  strip-scroll paints on `bands.html`, BAND 1→2→3
+  with clean solid repaints (`r20-28/29/30`);
+  `frost://settings` fails plainly with the
+  no-internal-pages message (`r20-31-frostscheme`);
+  settings save + persist across relaunch (search
+  engine changed to Google, still Google after quit
+  + relaunch, `r20-33/34/35`); no Frost listener
+  (`ss` — only the loomtop `:9999` watcher and the
+  three test servers); GNOME-mode fallback titlebar
+  with min/max/close (`r20-38-gnome`). Local H.264
+  video still plays under the no-blocklist launch
+  ("playing t=5.00", the 5 s test-pattern clip
+  played to the end, `r20-39/40`).
+
+Harness notes for the next round: the runtime
+restarted mid-round (killed Xvfb :97, Frost, and
+all three test servers — restart all three with
+`setsid nohup` before gating; the check in flight
+was killed with an empty log and had to be
+re-run). Two findings that change how media gates
+run: (1) **MSE probes must be the first media
+page in a fresh Frost** — the 5th media page in
+one process failed to produce metadata
+(readyState stayed 0, networkState 2, no error
+logged); a fresh Frost with the same probe passed
+ALL PASS. Restart Frost between MSE probes.
+(2) **Servo caches aggressively** — a re-run of
+an edited probe page served the old copy (one GET
+in the server log); use a `?cache-buster` query
+when re-running an edited probe. Also: a probe
+that waits for `loadedmetadata` must register its
+listener BEFORE the appends — the event can fire
+during the first append, and a listener registered
+after the appends misses it (probe race, fixed in
+`probe.html`/`probe3.html` this round). Next:
+Round 21, YouTube playback end-to-end — the SABR/
+MSE path on the real watch page, with MSE append
+logging.

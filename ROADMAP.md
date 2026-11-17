@@ -340,6 +340,48 @@ No new features — this round finishes what Round 3 left open:
   the demuxer's running estimate. Full suite 87/87;
   R19 probe ALL PASS; R18 probe 29/29; all
   regressions pass. No .deb, no push.
+- Round 20 (done 2026-11-17, MSE project): MSE
+  slice 3, fork patch F-013 — the remuxer
+  (`mux.rs`, 7 fork-only unit tests). A real YouTube
+  player appends one init segment per track, so the
+  single `ServoSrc` byte stream had TWO `moov`
+  boxes and two tracks both numbered 1, and
+  `qtdemux` could not negotiate it (`not-negotiated
+  (-4)`). The remuxer merges the buffers' streams
+  before pushing: one buffer passes through
+  byte-identical (Round 19 behavior); two or more
+  buffers hold inits + media until every buffer has
+  its init, then emit ONE combined init (fresh
+  `moov`, reassigned track IDs, one `trex` per
+  track) followed by media in presentation-time
+  order with `tfhd` track IDs rewritten and `mfhd`
+  sequence numbers renumbered. Gated live: real
+  YouTube DASH segments ("Me at the zoo", itag 134
+  + 140) play end to end through the MSE pipeline —
+  video `buffered` [0.00–18.93], audio
+  [0.00–19.06], `playing` fires, `currentTime`
+  advances, decoded frame renders. Honest limits:
+  the real watch page still does NOT play — its
+  player requests progressive itag 18, YouTube
+  answers HTTP 403 in the sandbox (bot-checked IP)
+  and the player errors out; SABR/DASH POSTs return
+  200 but playback never starts, and whether the
+  player appends them to MSE is unproven (no MSE
+  logging at info level). The audio in the R20 test
+  segments is re-containerized (ffmpeg stream-copy
+  of the downloaded itag 140 audio — AAC sample
+  data byte-identical, box structure regenerated);
+  the video is untouched real DASH. Seeking still
+  not supported. Full suite 87/87; R20 two-buffer
+  probe ALL PASS, probe3 ALL PASS, R18 probe 29/29,
+  R19 probe ALL PASS; all regressions pass. No
+  .deb, no push.
+- Round 21 (next, MSE project): YouTube playback
+  end-to-end — drive the SABR/MSE path on the real
+  watch page (possibly by keeping itag 18 out of
+  the player's way) + add MSE append logging so the
+  appends are observable. If the 403 is
+  sandbox-IP-only, Joel's box is the real test.
   Then: Frostbite tab hibernation (needs a tab system
   first), Snowdrift workspaces (needs tabs + sessions +
   persistence — biggest). Inspector v2 (docked panel,

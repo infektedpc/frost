@@ -1,0 +1,1169 @@
+From 2d0d4dd097b152601f43bceca3d03295fbd8afc7 Mon Sep 17 00:00:00 2001
+From: Joel Horrell <infektedpc@gmail.com>
+Date: Tue, 17 Nov 2026 10:31:08 +0000
+Subject: [PATCH] =?UTF-8?q?F-013:=20MSE=20slice=203=20=E2=80=94=20remux=20?=
+ =?UTF-8?q?per-track=20DASH=20streams=20into=20one=20player=20stream=20(Ro?=
+ =?UTF-8?q?und=2020)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ components/script/dom/media/mediasource.rs  |  24 +-
+ components/script/dom/media/mod.rs          |   1 +
+ components/script/dom/media/mp4.rs          |  42 +-
+ components/script/dom/media/mux.rs          | 761 ++++++++++++++++++++
+ components/script/dom/media/sourcebuffer.rs | 149 ++--
+ 5 files changed, 920 insertions(+), 57 deletions(-)
+ create mode 100644 components/script/dom/media/mux.rs
+
+diff --git a/components/script/dom/media/mediasource.rs b/components/script/dom/media/mediasource.rs
+index 154695fcf..2d18a56b9 100644
+--- a/components/script/dom/media/mediasource.rs
++++ b/components/script/dom/media/mediasource.rs
+@@ -34,6 +34,7 @@ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+ use crate::dom::bindings::str::DOMString;
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::html::htmlmediaelement::HTMLMediaElement;
++use crate::dom::media::mux::MseMuxer;
+ use crate::dom::media::sourcebuffer::SourceBuffer;
+ use crate::dom::media::sourcebufferlist::SourceBufferList;
+ use crate::dom::window::Window;
+@@ -48,6 +49,11 @@ pub(crate) struct MediaSource {
+     /// The media element this source is attached to, if any.
+     attached_element: MutNullableDom<HTMLMediaElement>,
+     live_seekable_range: DomRefCell<Option<(f64, f64)>>,
++    /// The remuxer merging this source's buffers into one stream
++    /// for the player (Round 20). Reset on detach.
++    muxer: DomRefCell<MseMuxer>,
++    /// Next track key handed out to a new `SourceBuffer`.
++    next_track_key: Cell<u32>,
+ }
+ 
+ impl MediaSource {
+@@ -60,6 +66,8 @@ impl MediaSource {
+             active_source_buffers: MutNullableDom::new(None),
+             attached_element: MutNullableDom::new(None),
+             live_seekable_range: DomRefCell::new(None),
++            muxer: DomRefCell::new(MseMuxer::default()),
++            next_track_key: Cell::new(0),
+         }
+     }
+ 
+@@ -147,10 +155,20 @@ impl MediaSource {
+         self.attached_element.set(None);
+         self.duration.set(f64::NAN);
+         self.live_seekable_range.borrow_mut().take();
++        // A detached source starts a fresh stream next time.
++        *self.muxer.borrow_mut() = MseMuxer::default();
+         self.ready_state.set(MediaSourceReadyState::Closed);
+         self.queue_event("sourceclose");
+     }
+ 
++    /// Feed one appended chunk from the `SourceBuffer` with `key`
++    /// through the remuxer. Returns the remuxer's result (see
++    /// `MseMuxer::feed`).
++    pub(crate) fn mux_feed(&self, key: u32, bytes: Vec<u8>) -> crate::dom::media::mux::FeedResult {
++        let buffer_count = self.source_buffers().len();
++        self.muxer.borrow_mut().feed(key, bytes, buffer_count)
++    }
++
+     /// The media element this source is attached to, if any.
+     pub(crate) fn attached_element(&self) -> Option<DomRoot<HTMLMediaElement>> {
+         self.attached_element.get()
+@@ -259,7 +277,11 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+         }
+         let global = self.global();
+         let window = global.as_window();
+-        let buffer = SourceBuffer::new(cx, window, None, self, type_);
++        // Each buffer gets a creation-order key the remuxer uses to
++        // tell its tracks apart (Round 20).
++        let key = self.next_track_key.get();
++        self.next_track_key.set(key + 1);
++        let buffer = SourceBuffer::new(cx, window, None, self, type_, key);
+         self.source_buffers_list(cx).add(&buffer);
+         Ok(buffer)
+     }
+diff --git a/components/script/dom/media/mod.rs b/components/script/dom/media/mod.rs
+index 7ddb82c2b..a43104d28 100644
+--- a/components/script/dom/media/mod.rs
++++ b/components/script/dom/media/mod.rs
+@@ -15,6 +15,7 @@ pub(crate) mod mediasource;
+ pub(crate) mod mediastream;
+ pub(crate) mod mediastreamtrack;
+ pub(crate) mod mp4;
++pub(crate) mod mux;
+ pub(crate) mod sourcebuffer;
+ pub(crate) mod sourcebufferlist;
+ pub(crate) mod videotrack;
+diff --git a/components/script/dom/media/mp4.rs b/components/script/dom/media/mp4.rs
+index 1a3c097d7..5e9900d88 100644
+--- a/components/script/dom/media/mp4.rs
++++ b/components/script/dom/media/mp4.rs
+@@ -29,6 +29,10 @@ pub(crate) struct Mp4TrackInfo {
+     pub(crate) timescale: u32,
+     /// e.g. `b"vide"` or `b"soun"`.
+     pub(crate) handler: [u8; 4],
++    /// Track duration in seconds, from `mdhd` (0.0 if the header
++    /// carries none). Round 20: the MSE remuxer needs it to size the
++    /// combined `mvhd` it builds for multi-track streams.
++    pub(crate) duration_secs: f64,
+ }
+ 
+ /// What the init segment tells us about the stream.
+@@ -62,7 +66,9 @@ fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
+ 
+ /// A parsed box header: type, where its content starts, and where the
+ /// next sibling box starts. Returns `None` on truncated input.
+-fn read_box(data: &[u8], offset: usize) -> Option<([u8; 4], usize, usize)> {
++/// `pub(crate)` for the MSE remuxer (`dom/media/mux.rs`), which walks
++/// the same boxes to copy and rewrite them.
++pub(crate) fn read_box(data: &[u8], offset: usize) -> Option<([u8; 4], usize, usize)> {
+     let size = read_u32(data, offset)? as u64;
+     let typ: [u8; 4] = data.get(offset + 4..offset + 8)?.try_into().ok()?;
+     let (header_size, total_size) = match size {
+@@ -81,7 +87,8 @@ fn read_box(data: &[u8], offset: usize) -> Option<([u8; 4], usize, usize)> {
+ }
+ 
+ /// Iterate the child boxes of `data[start..end]`.
+-fn children<F>(data: &[u8], start: usize, end: usize, mut f: F)
++/// `pub(crate)` for the MSE remuxer (`dom/media/mux.rs`).
++pub(crate) fn children<F>(data: &[u8], start: usize, end: usize, mut f: F)
+ where
+     F: FnMut([u8; 4], usize, usize),
+ {
+@@ -139,6 +146,7 @@ pub(crate) fn parse_init_segment(bytes: &[u8]) -> Option<Mp4InitInfo> {
+                 b"trak" => {
+                     let mut track_id = None;
+                     let mut timescale = None;
++                    let mut duration_secs = 0.0;
+                     let mut handler = None;
+                     children(bytes, content, next, |typ, content, next| {
+                         match &typ {
+@@ -153,12 +161,29 @@ pub(crate) fn parse_init_segment(bytes: &[u8]) -> Option<Mp4InitInfo> {
+                                         b"mdhd" => {
+                                             let version =
+                                                 bytes.get(content).copied().unwrap_or(0);
+-                                            let at = if version == 0 {
+-                                                content + 12
++                                            if version == 0 {
++                                                let at = content + 12;
++                                                timescale = read_u32(bytes, at);
++                                                if let (Some(ts), Some(d)) = (
++                                                    read_u32(bytes, at),
++                                                    read_u32(bytes, at + 4),
++                                                ) {
++                                                    if ts > 0 {
++                                                        duration_secs = d as f64 / ts as f64;
++                                                    }
++                                                }
+                                             } else {
+-                                                content + 20
+-                                            };
+-                                            timescale = read_u32(bytes, at);
++                                                let at = content + 20;
++                                                timescale = read_u32(bytes, at);
++                                                if let (Some(ts), Some(d)) = (
++                                                    read_u32(bytes, at),
++                                                    read_u64(bytes, at + 4),
++                                                ) {
++                                                    if ts > 0 {
++                                                        duration_secs = d as f64 / ts as f64;
++                                                    }
++                                                }
++                                            }
+                                         },
+                                         b"hdlr" => {
+                                             handler = bytes
+@@ -179,6 +204,7 @@ pub(crate) fn parse_init_segment(bytes: &[u8]) -> Option<Mp4InitInfo> {
+                             track_id,
+                             timescale,
+                             handler,
++                            duration_secs,
+                         });
+                     }
+                 },
+@@ -490,6 +516,7 @@ mod tests {
+                 track_id: 1,
+                 timescale: 15360,
+                 handler: *b"vide",
++                duration_secs: 0.0,
+             }
+         );
+         assert_eq!(
+@@ -498,6 +525,7 @@ mod tests {
+                 track_id: 2,
+                 timescale: 44100,
+                 handler: *b"soun",
++                duration_secs: 0.0,
+             }
+         );
+     }
+diff --git a/components/script/dom/media/mux.rs b/components/script/dom/media/mux.rs
+new file mode 100644
+index 000000000..fa723de48
+--- /dev/null
++++ b/components/script/dom/media/mux.rs
+@@ -0,0 +1,761 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! MSE remuxer: merge the per-track fragmented-MP4 streams of a
++//! `MediaSource`'s `SourceBuffer`s into the single valid stream the
++//! player can consume.
++//!
++//! Round 20: the player has ONE push source (`ServoSrc` → `qtdemux`)
++//! per media element, and every `SourceBuffer` drains into it
++//! (`SourceBuffer::drain_pending`). A real YouTube player appends one
++//! init segment per track — video `ftyp`+`moov` (track 1) and audio
++//! `ftyp`+`moov` (also track 1) — so the byte stream the player saw
++//! had TWO `moov` boxes and two tracks both numbered 1. `qtdemux`
++//! cannot negotiate that stream: the pipeline died with
++//! `not-negotiated (-4)` and every later push failed
++//! (`BufferPushFailed`). A single combined mux (one `moov`, two
++//! tracks, interleaved `moof`s) plays fine — probe3 proved it — so
++//! the fix is to merge here, at the MSE layer, before pushing.
++//!
++//! What the muxer does, per attached `MediaSource`:
++//! * One `SourceBuffer` only: pass-through. Chunks go to the player
++//!   byte-identical to Round 19 — no rebuild, no rewrite.
++//! * Two or more buffers: hold init segments and media chunks until
++//!   every existing buffer has supplied its init, then emit ONE
++//!   combined init — the first track's `ftyp` plus a fresh `moov`
++//!   built from the copied `trak` boxes (track IDs reassigned so
++//!   they are distinct) and a fresh `mvex` — followed by the held
++//!   media in presentation-time order. After that, each `moof` has
++//!   its `tfhd` track ID rewritten to the merged ID and its `mfhd`
++//!   sequence number renumbered in emission order. `mdat` bytes are
++//!   never touched.
++//!
++//! Limits (documented, not hidden):
++//! * All `SourceBuffer`s must append their init segment before any
++//!   media flows — media appended while an init is missing is held,
++//!   not dropped, and flushes once the init arrives. A buffer that
++//!   never appends an init stalls the stream.
++//! * A buffer created after the combined init was emitted, or an
++//!   init appended after it, is too late: its track is not in the
++//!   stream, so its init and media are dropped with a warning.
++//! * Media appended before its own buffer's init is held until the
++//!   init arrives (the MSE spec requires init first).
++
++use std::cmp::Ordering;
++
++use log::warn;
++
++use crate::dom::media::mp4::{
++    children, parse_init_segment, read_box, segment_ranges, Mp4InitInfo,
++};
++
++/// Write a plain box: 32-bit big-endian size, four-byte type, payload.
++fn bx(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(payload.len() + 8);
++    out.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
++    out.extend_from_slice(typ);
++    out.extend_from_slice(payload);
++    out
++}
++
++/// Write a FullBox: version 0, flags 0, then the payload.
++fn fullbx(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
++    let mut p = vec![0u8, 0, 0, 0];
++    p.extend_from_slice(payload);
++    bx(typ, &p)
++}
++
++/// Top-level boxes of `data`: (type, box start, content start, next
++/// box start). `read_box` gives content/next; the box start is the
++/// offset we walked from.
++fn top_boxes(data: &[u8]) -> Vec<([u8; 4], usize, usize, usize)> {
++    let mut out = Vec::new();
++    let mut offset = 0;
++    while offset + 8 <= data.len() {
++        let Some((typ, content, next)) = read_box(data, offset) else {
++            break;
++        };
++        if next > data.len() {
++            break;
++        }
++        out.push((typ, offset, content, next));
++        offset = next;
++    }
++    out
++}
++
++/// One track's init segment, as fed by its `SourceBuffer`.
++#[derive(Clone, Debug, JSTraceable, MallocSizeOf)]
++struct MuxTrack {
++    /// Creation-order key of the `SourceBuffer` that owns this track.
++    key: u32,
++    /// Track ID assigned in the merged stream (1, 2, …).
++    new_track_id: u32,
++    /// The `ftyp` box of this track's init segment.
++    ftyp: Vec<u8>,
++    /// The raw `trak` box bytes of this track's init segment.
++    trak: Vec<u8>,
++    /// Parsed init info (timescales, durations, handlers).
++    init: Mp4InitInfo,
++}
++
++/// A media chunk held back until the combined init can be emitted.
++#[derive(Clone, Debug, JSTraceable, MallocSizeOf)]
++struct HeldMedia {
++    key: u32,
++    bytes: Vec<u8>,
++    /// Presentation start in seconds (from the chunk's `tfdt`).
++    start: f64,
++    /// Arrival order, for stable sorting of equal starts.
++    order: u64,
++}
++
++/// The per-`MediaSource` remuxer state.
++#[derive(Debug, Default, JSTraceable, MallocSizeOf)]
++pub(crate) struct MseMuxer {
++    tracks: Vec<MuxTrack>,
++    /// The combined init has been emitted to the player.
++    init_emitted: bool,
++    /// Single-buffer mode, decided at the first feed: chunks pass
++    /// through byte-identical (Round 19 behavior).
++    passthrough: bool,
++    /// The one buffer allowed through in pass-through mode.
++    passthrough_key: u32,
++    /// Media chunks held while the combined init is not ready.
++    held: Vec<HeldMedia>,
++    /// Next `mfhd` sequence number for emitted `moof`s.
++    sequence: u32,
++    /// Arrival counter for stable held-media ordering.
++    order: u64,
++}
++
++/// What a chunk splits into: an init part (`ftyp`/`moov`, if any)
++/// and media units (each a `moof` plus its following `mdat`s).
++struct ChunkParts {
++    init: Option<Vec<u8>>,
++    media: Vec<Vec<u8>>,
++}
++
++fn split_chunk(bytes: &[u8]) -> ChunkParts {
++    let mut init = Vec::new();
++    let mut media = Vec::new();
++    let mut current: Option<Vec<u8>> = None;
++    for (typ, start, _content, next) in top_boxes(bytes) {
++        match &typ {
++            b"ftyp" | b"moov" => {
++                init.extend_from_slice(&bytes[start..next]);
++            },
++            b"moof" => {
++                if let Some(unit) = current.take() {
++                    media.push(unit);
++                }
++                current = Some(bytes[start..next].to_vec());
++            },
++            b"mdat" => {
++                if let Some(unit) = current.as_mut() {
++                    unit.extend_from_slice(&bytes[start..next]);
++                }
++                // An `mdat` with no preceding `moof` is dropped.
++            },
++            // `sidx`, `mfra`, `free`, … carry no media; dropped.
++            _ => {},
++        }
++    }
++    if let Some(unit) = current.take() {
++        media.push(unit);
++    }
++    ChunkParts {
++        init: if init.is_empty() { None } else { Some(init) },
++        media,
++    }
++}
++
++/// Patch the track ID of the `tkhd` box inside copied `trak` bytes.
++/// `tkhd` is a FullBox: version/flags, then creation/modification
++/// times (4 bytes each for v0, 8 for v1), then the track ID.
++fn patch_tkhd_track_id(trak: &mut [u8], new_id: u32) {
++    // Find the track ID offset first, then patch: the `children`
++    // walk borrows `trak`, so it cannot be mutated inside it.
++    let mut tkhd_at: Option<usize> = None;
++    children(trak, 8, trak.len(), |typ, content, _next| {
++        if &typ == b"tkhd" {
++            let version = trak.get(content).copied().unwrap_or(0);
++            tkhd_at = Some(if version == 0 { content + 12 } else { content + 20 });
++        }
++    });
++    if let Some(at) = tkhd_at {
++        if let Some(slot) = trak.get_mut(at..at + 4) {
++            slot.copy_from_slice(&new_id.to_be_bytes());
++        }
++    }
++}
++
++/// Build a fresh `mvhd`: timescale 1000, duration the longest track.
++fn build_mvhd(duration_ms: u32, next_track_id: u32) -> Vec<u8> {
++    let mut p = Vec::new();
++    p.extend_from_slice(&0u32.to_be_bytes()); // creation_time
++    p.extend_from_slice(&0u32.to_be_bytes()); // modification_time
++    p.extend_from_slice(&1000u32.to_be_bytes()); // timescale
++    p.extend_from_slice(&duration_ms.to_be_bytes()); // duration
++    p.extend_from_slice(&0x00010000u32.to_be_bytes()); // rate 1.0
++    p.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0
++    p.extend_from_slice(&0u16.to_be_bytes()); // reserved
++    p.extend_from_slice(&0u64.to_be_bytes()); // reserved
++    for v in [0x00010000u32, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000] {
++        p.extend_from_slice(&v.to_be_bytes());
++    }
++    p.extend_from_slice(&[0u8; 24]); // pre_defined
++    p.extend_from_slice(&next_track_id.to_be_bytes());
++    fullbx(b"mvhd", &p)
++}
++
++/// Build one `trex`: all sample defaults zero except the description
++/// index (each track's `stsd` has exactly one entry).
++fn build_trex(track_id: u32) -> Vec<u8> {
++    let mut p = Vec::new();
++    p.extend_from_slice(&track_id.to_be_bytes());
++    p.extend_from_slice(&1u32.to_be_bytes()); // default_sample_description_index
++    p.extend_from_slice(&0u32.to_be_bytes()); // default_sample_duration
++    p.extend_from_slice(&0u32.to_be_bytes()); // default_sample_size
++    p.extend_from_slice(&0u32.to_be_bytes()); // default_sample_flags
++    fullbx(b"trex", &p)
++}
++
++/// A minimal `ftyp` fallback, used only if no fed init had one
++/// (YouTube inits always do).
++fn fallback_ftyp() -> Vec<u8> {
++    bx(b"ftyp", b"isom\0\0\0\0isomiso6mp41")
++}
++
++/// The result of feeding one chunk to the remuxer.
++#[derive(Debug, Default)]
++pub(crate) struct FeedResult {
++    /// The chunk was taken by the muxer (held for the combined init
++    /// or emitted). If false, the chunk was dropped — its track is
++    /// not in the stream (a late init or a late buffer) — and the
++    /// caller should discard it.
++    pub(crate) accepted: bool,
++    /// Byte chunks to push to the player, in order.
++    pub(crate) chunks: Vec<Vec<u8>>,
++}
++
++impl MseMuxer {
++    /// Feed one appended chunk from the `SourceBuffer` with `key`.
++    /// `buffer_count` is the number of `SourceBuffer`s on the
++    /// `MediaSource` right now. Returns the chunks to push to the
++    /// player, in order — possibly empty (chunk held for the
++    /// combined init) or several (combined init plus flushed media).
++    pub(crate) fn feed(
++        &mut self,
++        key: u32,
++        bytes: Vec<u8>,
++        buffer_count: usize,
++    ) -> FeedResult {
++        // Single-buffer mode, decided at the first feed: pass chunks
++        // through byte-identical (Round 19 behavior). A buffer that
++        // appears later cannot join a stream that already committed
++        // to one track.
++        if self.passthrough {
++            if key == self.passthrough_key {
++                return FeedResult {
++                    accepted: true,
++                    chunks: vec![bytes],
++                };
++            }
++            warn!("MSE remux: dropping data from a SourceBuffer created after playback started (single-track stream)");
++            return FeedResult::default();
++        }
++        if self.tracks.is_empty() && self.held.is_empty() && !self.init_emitted {
++            // First feed ever: one buffer means pass-through.
++            if buffer_count <= 1 {
++                self.passthrough = true;
++                self.passthrough_key = key;
++                return FeedResult {
++                    accepted: true,
++                    chunks: vec![bytes],
++                };
++            }
++        }
++
++        let parts = split_chunk(&bytes);
++        let mut out = Vec::new();
++        let mut accepted = false;
++
++        // Init part: register the track (unless it is too late).
++        if let Some(init_bytes) = parts.init {
++            if self.init_emitted {
++                warn!("MSE remux: dropping late init segment (track not in the emitted stream)");
++                // The chunk's media belongs to the same late track.
++                return FeedResult::default();
++            }
++            if self.register_init(key, &init_bytes).is_none() {
++                warn!("MSE remux: dropping unparseable init segment");
++                return FeedResult::default();
++            }
++            accepted = true;
++        }
++
++        // Media parts: rewrite now if the stream is open, else hold.
++        for unit in parts.media {
++            if self.init_emitted {
++                match self.rewrite_moof(unit, key) {
++                    Some(rewritten) => {
++                        out.push(rewritten);
++                        accepted = true;
++                    },
++                    None => {
++                        warn!("MSE remux: dropping media from an unknown track");
++                    },
++                }
++            } else {
++                let start = self.media_start(&unit, key);
++                self.held.push(HeldMedia {
++                    key,
++                    bytes: unit,
++                    start,
++                    order: self.order,
++                });
++                self.order += 1;
++                accepted = true;
++            }
++        }
++
++        // Emit the combined init once every existing buffer has
++        // supplied its init, flushing held media in time order.
++        if !self.init_emitted && self.all_buffers_have_inits(buffer_count) {
++            let mut flushed = vec![self.build_combined_init()];
++            self.init_emitted = true;
++            self.held.sort_by(|a, b| {
++                a.start
++                    .partial_cmp(&b.start)
++                    .unwrap_or(Ordering::Equal)
++                    .then_with(|| a.order.cmp(&b.order))
++            });
++            for held in std::mem::take(&mut self.held) {
++                if let Some(rewritten) = self.rewrite_moof(held.bytes, held.key) {
++                    flushed.push(rewritten);
++                }
++            }
++            flushed.extend(out);
++            return FeedResult {
++                accepted: true,
++                chunks: flushed,
++            };
++        }
++        FeedResult {
++            accepted,
++            chunks: out,
++        }
++    }
++
++    /// Do all existing buffers have a registered init?
++    fn all_buffers_have_inits(&self, buffer_count: usize) -> bool {
++        !self.tracks.is_empty() && self.tracks.len() >= buffer_count
++    }
++
++    /// Parse and store one buffer's init segment. Returns the parsed
++    /// info, or `None` if no usable `moov` is present. Re-registering
++    /// a key replaces its track (same buffer appending a new init
++    /// before the combined init went out).
++    fn register_init(&mut self, key: u32, init_bytes: &[u8]) -> Option<()> {
++        let init = parse_init_segment(init_bytes)?;
++        if init.tracks.is_empty() {
++            return None;
++        }
++        // Capture the raw `trak` bytes (one per track in this init)
++        // and the `ftyp` for the combined init.
++        let mut ftyp = Vec::new();
++        let mut traks: Vec<Vec<u8>> = Vec::new();
++        for (typ, start, content, next) in top_boxes(init_bytes) {
++            match &typ {
++                b"ftyp" => {
++                    if ftyp.is_empty() {
++                        ftyp = init_bytes[start..next].to_vec();
++                    }
++                },
++                b"moov" => {
++                    children(init_bytes, content, next, |typ, content, next| {
++                        if &typ == b"trak" {
++                            // The `trak` box starts 8 bytes before its
++                            // content (size + type header).
++                            let box_start = content - 8;
++                            traks.push(init_bytes[box_start..next].to_vec());
++                        }
++                    });
++                },
++                _ => {},
++            }
++        }
++        if traks.is_empty() {
++            return None;
++        }
++        // One init per buffer in practice; if an init carries several
++        // tracks, keep the first and warn about the rest (their
++        // `moof`s would have no buffer to attribute them to).
++        if traks.len() > 1 {
++            warn!("MSE remux: init segment carries {} tracks, keeping the first", traks.len());
++        }
++        let new_track_id = match self.tracks.iter().find(|t| t.key == key) {
++            Some(track) => track.new_track_id,
++            None => (self.tracks.len() + 1) as u32,
++        };
++        let track = MuxTrack {
++            key,
++            new_track_id,
++            ftyp,
++            trak: traks.remove(0),
++            init,
++        };
++        if let Some(slot) = self.tracks.iter_mut().find(|t| t.key == key) {
++            *slot = track;
++        } else {
++            self.tracks.push(track);
++        }
++        Some(())
++    }
++
++    /// Build the combined init: first track's `ftyp` + fresh `moov`
++    /// (new `mvhd`, copied `trak`s with reassigned IDs, fresh `mvex`).
++    fn build_combined_init(&self) -> Vec<u8> {
++        let ftyp = self
++            .tracks
++            .first()
++            .map(|t| t.ftyp.clone())
++            .filter(|f| !f.is_empty())
++            .unwrap_or_else(fallback_ftyp);
++        let max_duration = self
++            .tracks
++            .iter()
++            .flat_map(|t| t.init.tracks.iter().map(|tr| tr.duration_secs))
++            .fold(0.0f64, f64::max);
++        let next_id = self
++            .tracks
++            .iter()
++            .map(|t| t.new_track_id)
++            .max()
++            .unwrap_or(0)
++            + 1;
++        let mut moov_payload = build_mvhd((max_duration * 1000.0).round() as u32, next_id);
++        for track in &self.tracks {
++            let mut trak = track.trak.clone();
++            patch_tkhd_track_id(&mut trak, track.new_track_id);
++            moov_payload.extend_from_slice(&trak);
++        }
++        let mut mvex_payload = Vec::new();
++        for track in &self.tracks {
++            mvex_payload.extend_from_slice(&build_trex(track.new_track_id));
++        }
++        moov_payload.extend_from_slice(&bx(b"mvex", &mvex_payload));
++        let mut out = ftyp;
++        out.extend_from_slice(&bx(b"moov", &moov_payload));
++        out
++    }
++
++    /// Presentation start of a media unit, in seconds, from its first
++    /// `moof`'s `tfdt` and its track's timescale. `f64::MAX` when it
++    /// cannot be determined (sorts last).
++    fn media_start(&self, unit: &[u8], key: u32) -> f64 {
++        let Some(track) = self.tracks.iter().find(|t| t.key == key) else {
++            return f64::MAX;
++        };
++        segment_ranges(unit, &track.init)
++            .first()
++            .map(|r| r.0)
++            .unwrap_or(f64::MAX)
++    }
++
++    /// Rewrite one media unit for the merged stream: `tfhd` track IDs
++    /// become the track's merged ID, `mfhd` sequence numbers run
++    /// consecutively in emission order. Returns `None` if the unit's
++    /// track is not in the merged stream.
++    fn rewrite_moof(&mut self, mut bytes: Vec<u8>, key: u32) -> Option<Vec<u8>> {
++        let new_id = self.tracks.iter().find(|t| t.key == key)?.new_track_id;
++        let mut offset = 0;
++        while offset + 8 <= bytes.len() {
++            let Some((typ, content, next)) = read_box(&bytes, offset) else {
++                break;
++            };
++            if next > bytes.len() {
++                break;
++            }
++            if &typ == b"moof" {
++                // Walk the moof's children: `mfhd` (renumber) and
++                // `traf` → `tfhd` (retarget the track).
++                let mut child = content;
++                while child + 8 <= next {
++                    let Some((ctyp, ccontent, cnext)) = read_box(&bytes, child) else {
++                        break;
++                    };
++                    if cnext > next {
++                        break;
++                    }
++                    if &ctyp == b"mfhd" {
++                        self.sequence += 1;
++                        if let Some(slot) = bytes.get_mut(ccontent + 4..ccontent + 8) {
++                            slot.copy_from_slice(&self.sequence.to_be_bytes());
++                        }
++                    } else if &ctyp == b"traf" {
++                        let mut inner = ccontent;
++                        while inner + 8 <= cnext {
++                            let Some((ityp, icontent, inext)) = read_box(&bytes, inner) else {
++                                break;
++                            };
++                            if inext > cnext {
++                                break;
++                            }
++                            if &ityp == b"tfhd" {
++                                if let Some(slot) = bytes.get_mut(icontent + 4..icontent + 8) {
++                                    slot.copy_from_slice(&new_id.to_be_bytes());
++                                }
++                            }
++                            inner = inext;
++                        }
++                    }
++                    child = cnext;
++                }
++            }
++            offset = next;
++        }
++        Some(bytes)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::dom::media::mp4::parse_init_segment;
++
++    fn mvhd(timescale: u32, duration: u32) -> Vec<u8> {
++        let mut p = Vec::new();
++        p.extend_from_slice(&0u32.to_be_bytes());
++        p.extend_from_slice(&0u32.to_be_bytes());
++        p.extend_from_slice(&timescale.to_be_bytes());
++        p.extend_from_slice(&duration.to_be_bytes());
++        fullbx(b"mvhd", &p)
++    }
++
++    fn trak(track_id: u32, timescale: u32, duration: u32, handler: &[u8; 4]) -> Vec<u8> {
++        let mut tkhd = Vec::new();
++        tkhd.extend_from_slice(&0u32.to_be_bytes());
++        tkhd.extend_from_slice(&0u32.to_be_bytes());
++        tkhd.extend_from_slice(&track_id.to_be_bytes());
++        let tkhd = fullbx(b"tkhd", &tkhd);
++        let mut mdhd = Vec::new();
++        mdhd.extend_from_slice(&0u32.to_be_bytes());
++        mdhd.extend_from_slice(&0u32.to_be_bytes());
++        mdhd.extend_from_slice(&timescale.to_be_bytes());
++        mdhd.extend_from_slice(&duration.to_be_bytes());
++        let mdhd = fullbx(b"mdhd", &mdhd);
++        let mut hdlr = Vec::new();
++        hdlr.extend_from_slice(&0u32.to_be_bytes());
++        hdlr.extend_from_slice(handler);
++        let hdlr = fullbx(b"hdlr", &hdlr);
++        let mut mdia = Vec::new();
++        mdia.extend_from_slice(&mdhd);
++        mdia.extend_from_slice(&hdlr);
++        let mdia = bx(b"mdia", &mdia);
++        let mut t = Vec::new();
++        t.extend_from_slice(&tkhd);
++        t.extend_from_slice(&mdia);
++        bx(b"trak", &t)
++    }
++
++    fn init_segment(track_id: u32, timescale: u32, duration: u32, handler: &[u8; 4]) -> Vec<u8> {
++        let mut moov = Vec::new();
++        moov.extend_from_slice(&mvhd(1000, 0));
++        moov.extend_from_slice(&trak(track_id, timescale, duration, handler));
++        let moov = bx(b"moov", &moov);
++        let mut out = bx(b"ftyp", b"isom\0\0\0\0isomiso2");
++        out.extend_from_slice(&moov);
++        out
++    }
++
++    /// A moof with one traf: tfdt base, one trun, `count` samples of
++    /// `sample_duration` ticks (tfhd default duration).
++    fn moof(track_id: u32, base: u64, sample_duration: u32, count: u32) -> Vec<u8> {
++        let mut tfhd = Vec::new();
++        tfhd.extend_from_slice(&track_id.to_be_bytes());
++        tfhd.extend_from_slice(&sample_duration.to_be_bytes());
++        let mut tfhd = fullbx(b"tfhd", &tfhd);
++        tfhd[8..12].copy_from_slice(&0x020008u32.to_be_bytes());
++        let mut tfdt = Vec::new();
++        tfdt.extend_from_slice(&(base as u32).to_be_bytes());
++        let tfdt = fullbx(b"tfdt", &tfdt);
++        let mut trun = Vec::new();
++        trun.extend_from_slice(&count.to_be_bytes());
++        trun.extend_from_slice(&0i32.to_be_bytes());
++        let mut trun = fullbx(b"trun", &trun);
++        trun[8..12].copy_from_slice(&0x000001u32.to_be_bytes());
++        let mut traf = Vec::new();
++        traf.extend_from_slice(&tfhd);
++        traf.extend_from_slice(&tfdt);
++        traf.extend_from_slice(&trun);
++        let traf = bx(b"traf", &traf);
++        let mut moof = Vec::new();
++        moof.extend_from_slice(&bx(b"mfhd", &1u32.to_be_bytes()));
++        moof.extend_from_slice(&traf);
++        bx(b"moof", &moof)
++    }
++
++    /// Read the `tfhd` track ID and `mfhd` sequence out of a moof.
++    fn moof_ids(bytes: &[u8]) -> (u32, u32) {
++        let mut track_id = 0;
++        let mut sequence = 0;
++        for (typ, content, next) in top_boxes(bytes) {
++            if &typ != b"moof" {
++                continue;
++            }
++            children(bytes, content, next, |typ, content, next| {
++                if &typ == b"mfhd" {
++                    sequence = u32::from_be_bytes(
++                        bytes[content + 4..content + 8].try_into().unwrap(),
++                    );
++                } else if &typ == b"traf" {
++                    children(bytes, content, next, |typ, content, _next| {
++                        if &typ == b"tfhd" {
++                            track_id = u32::from_be_bytes(
++                                bytes[content + 4..content + 8].try_into().unwrap(),
++                            );
++                        }
++                    });
++                }
++            });
++        }
++        (track_id, sequence)
++    }
++
++    /// Count the `trex` boxes in a `moov` and collect their track IDs.
++    fn trex_ids(init: &[u8]) -> Vec<u32> {
++        let mut ids = Vec::new();
++        for (typ, content, next) in top_boxes(init) {
++            if &typ != b"moov" {
++                continue;
++            }
++            children(init, content, next, |typ, content, next| {
++                if &typ == b"mvex" {
++                    children(init, content, next, |typ, content, _next| {
++                        if &typ == b"trex" {
++                            ids.push(u32::from_be_bytes(
++                                init[content + 4..content + 8].try_into().unwrap(),
++                            ));
++                        }
++                    });
++                }
++            });
++        }
++        ids
++    }
++
++    #[test]
++    fn single_buffer_passes_through_unchanged() {
++        let mut muxer = MseMuxer::default();
++        let init = init_segment(1, 15360, 288000, b"vide");
++        let seg = moof(1, 0, 512, 60);
++        let mut chunk = init.clone();
++        chunk.extend_from_slice(&seg);
++        // One buffer: the chunk goes out byte-identical.
++        let result = muxer.feed(0, chunk.clone(), 1);
++        assert!(result.accepted);
++        assert_eq!(result.chunks, vec![chunk]);
++        // A later media chunk is likewise untouched.
++        let result = muxer.feed(0, seg.clone(), 1);
++        assert!(result.accepted);
++        assert_eq!(result.chunks, vec![seg]);
++    }
++
++    #[test]
++    fn two_buffers_merge_into_one_moov() {
++        let mut muxer = MseMuxer::default();
++        let v_init = init_segment(1, 15360, 288000, b"vide");
++        let a_init = init_segment(1, 44100, 840000, b"soun");
++        // Video init alone: held (audio init still missing).
++        assert!(muxer.feed(0, v_init, 2).chunks.is_empty());
++        // Audio init completes the set: the combined init comes out.
++        let out = muxer.feed(1, a_init, 2).chunks;
++        assert_eq!(out.len(), 1);
++        let combined = &out[0];
++        let parsed = parse_init_segment(combined).expect("combined init parses");
++        assert_eq!(parsed.tracks.len(), 2);
++        assert_eq!(parsed.tracks[0].track_id, 1);
++        assert_eq!(parsed.tracks[0].timescale, 15360);
++        assert_eq!(parsed.tracks[0].handler, *b"vide");
++        assert_eq!(parsed.tracks[1].track_id, 2);
++        assert_eq!(parsed.tracks[1].timescale, 44100);
++        assert_eq!(parsed.tracks[1].handler, *b"soun");
++        assert_eq!(trex_ids(combined), vec![1, 2]);
++    }
++
++    #[test]
++    fn moofs_are_retargeted_and_sequenced() {
++        let mut muxer = MseMuxer::default();
++        muxer.feed(0, init_segment(1, 15360, 288000, b"vide"), 2);
++        muxer.feed(1, init_segment(1, 44100, 840000, b"soun"), 2);
++        // Video moof (original track 1) stays 1; audio moof (original
++        // track 1) becomes 2; sequences run 1, 2 in emission order.
++        let out = muxer.feed(0, moof(1, 0, 512, 60), 2).chunks;
++        assert_eq!(out.len(), 1);
++        assert_eq!(moof_ids(&out[0]), (1, 1));
++        let out = muxer.feed(1, moof(1, 0, 1024, 84), 2).chunks;
++        assert_eq!(out.len(), 1);
++        assert_eq!(moof_ids(&out[0]), (2, 2));
++    }
++
++    #[test]
++    fn held_media_flushes_in_timestamp_order() {
++        let mut muxer = MseMuxer::default();
++        muxer.feed(0, init_segment(1, 15360, 288000, b"vide"), 2);
++        // Two video segments held out of order (4 s then 0 s).
++        let late = moof(1, 61440, 512, 60); // tfdt 61440 = 4.0 s
++        let early = moof(1, 0, 512, 60); // tfdt 0 = 0.0 s
++        assert!(muxer.feed(0, late, 2).chunks.is_empty());
++        assert!(muxer.feed(0, early, 2).chunks.is_empty());
++        // The audio init completes the set: combined init, then the
++        // held segments earliest-first.
++        let out = muxer.feed(1, init_segment(1, 44100, 840000, b"soun"), 2).chunks;
++        assert_eq!(out.len(), 3);
++        // out[0] is the combined init; out[1] the 0 s moof (seq 1),
++        // out[2] the 4 s moof (seq 2).
++        assert_eq!(moof_ids(&out[1]), (1, 1));
++        assert_eq!(moof_ids(&out[2]), (1, 2));
++    }
++
++    #[test]
++    fn media_before_init_is_held_then_emitted() {
++        let mut muxer = MseMuxer::default();
++        // Media with no init yet: held, not dropped.
++        assert!(muxer.feed(0, moof(1, 0, 512, 60), 2).chunks.is_empty());
++        muxer.feed(0, init_segment(1, 15360, 288000, b"vide"), 2);
++        // Still held: the audio init is missing.
++        // Audio init completes the set: combined init + held media.
++        let out = muxer.feed(1, init_segment(1, 44100, 840000, b"soun"), 2).chunks;
++        assert_eq!(out.len(), 2);
++        assert_eq!(moof_ids(&out[1]), (1, 1));
++    }
++
++    #[test]
++    fn late_init_and_its_media_are_dropped() {
++        let mut muxer = MseMuxer::default();
++        muxer.feed(0, init_segment(1, 15360, 288000, b"vide"), 2);
++        muxer.feed(1, init_segment(1, 44100, 840000, b"soun"), 2);
++        // A third track's init arrives after the stream committed.
++        assert!(!muxer
++            .feed(2, init_segment(1, 90000, 90000, b"vide"), 3)
++            .accepted);
++        // Its media is dropped too.
++        assert!(!muxer.feed(2, moof(1, 0, 512, 60), 3).accepted);
++    }
++
++    #[test]
++    fn single_buffer_late_second_buffer_is_dropped() {
++        let mut muxer = MseMuxer::default();
++        let init = init_segment(1, 15360, 288000, b"vide");
++        let result = muxer.feed(0, init.clone(), 1);
++        assert!(result.accepted);
++        assert_eq!(result.chunks, vec![init]);
++        // A second buffer appears after pass-through was decided.
++        assert!(!muxer
++            .feed(1, init_segment(1, 44100, 840000, b"soun"), 2)
++            .accepted);
++    }
++}
+diff --git a/components/script/dom/media/sourcebuffer.rs b/components/script/dom/media/sourcebuffer.rs
+index 71e080bf8..e32d825f0 100644
+--- a/components/script/dom/media/sourcebuffer.rs
++++ b/components/script/dom/media/sourcebuffer.rs
+@@ -88,10 +88,20 @@ pub(crate) struct SourceBuffer {
+     /// Track timescales from the init segment, once one has been
+     /// appended; `None` until then.
+     init_info: DomRefCell<Option<Mp4InitInfo>>,
++    /// Creation-order key of this buffer, handed out by the
++    /// `MediaSource` (Round 20): the remuxer uses it to tell this
++    /// buffer's tracks apart from the other buffers'.
++    track_key: u32,
++    /// Emitted chunks the player refused (`EnoughData` or another
++    /// push failure), waiting to go straight to the player on the
++    /// next drain, ahead of anything new. These bypass the remuxer:
++    /// they are already out of it, so re-feeding would duplicate
++    /// them (Round 20).
++    push_pending: DomRefCell<Vec<Vec<u8>>>,
+ }
+ 
+ impl SourceBuffer {
+-    fn new_inherited(media_source: &MediaSource, mime_type: DOMString) -> SourceBuffer {
++    fn new_inherited(media_source: &MediaSource, mime_type: DOMString, track_key: u32) -> SourceBuffer {
+         SourceBuffer {
+             eventtarget: EventTarget::new_inherited(),
+             mode: Cell::new(AppendMode::Segments),
+@@ -106,6 +116,8 @@ impl SourceBuffer {
+             pending_bytes: DomRefCell::new(Vec::new()),
+             buffered_ranges: DomRefCell::new(TimeRangesContainer::default()),
+             init_info: DomRefCell::new(None),
++            track_key,
++            push_pending: DomRefCell::new(Vec::new()),
+         }
+     }
+ 
+@@ -115,10 +127,11 @@ impl SourceBuffer {
+         proto: Option<HandleObject>,
+         media_source: &MediaSource,
+         mime_type: DOMString,
++        track_key: u32,
+     ) -> DomRoot<SourceBuffer> {
+         reflect_dom_object_with_proto(
+             cx,
+-            Box::new(SourceBuffer::new_inherited(media_source, mime_type)),
++            Box::new(SourceBuffer::new_inherited(media_source, mime_type, track_key)),
+             global,
+             proto,
+         )
+@@ -176,64 +189,102 @@ impl SourceBuffer {
+     /// chunks the player accepts. Runs on the script thread (from the
+     /// `updateend` task, from `NeedData`, or from attach).
+     ///
+-    /// Bytes the player refuses stay queued: `EnoughData` means its
+-    /// queue is full, and the player's next `NeedData` event drains
+-    /// the rest. Any other push failure also re-queues the chunk —
+-    /// the player surfaces decode problems through its own error
+-    /// events, and dropping bytes here would corrupt the stream.
+-    /// If there is no attached element or no player yet, everything
+-    /// stays queued for the attach drain.
++    /// Round 20: appended bytes go through the `MediaSource`'s
++    /// remuxer first (`mux_feed`), which may hold them (combined
++    /// init not ready yet), drop them (late track), or split them
++    /// into several chunks to push (combined init plus flushed
++    /// media). Ranges are recorded from the ORIGINAL chunk when the
++    /// muxer accepts it — the muxer has the bytes and will push
++    /// them — using this buffer's own init info, so the merged
++    /// stream's reassigned track IDs never leak into accounting.
++    /// A chunk the player refuses is NOT re-fed through the muxer
++    /// (that would duplicate it): the refused emitted bytes wait in
++    /// `push_pending` and go straight to the player on the next
++    /// drain, ahead of anything new. If there is no attached element
++    /// or no player yet, everything stays queued for the attach drain.
+     pub(crate) fn drain_pending(&self) {
++        let Some(element) = self.media_source.attached_element() else {
++            return;
++        };
++        // (a) Emitted chunks the player refused earlier go first,
++        // unmodified, so stream order is preserved.
++        let mut push_pending = std::mem::take(&mut *self.push_pending.borrow_mut());
++        while !push_pending.is_empty() {
++            let bytes = push_pending.remove(0);
++            match element.push_media_source_data(bytes.clone()) {
++                Ok(()) => {},
++                Err(error) => {
++                    if !matches!(error, PlayerError::EnoughData) {
++                        warn!("MSE: could not push segment to player: {error:?}");
++                    }
++                    push_pending.insert(0, bytes);
++                    break;
++                },
++            }
++        }
++        if !push_pending.is_empty() {
++            *self.push_pending.borrow_mut() = push_pending;
++            return;
++        }
++        // (b) Drain appended chunks through the remuxer, in order.
+         let mut pending = std::mem::take(&mut *self.pending_bytes.borrow_mut());
+         if pending.is_empty() {
+             return;
+         }
+-        let Some(element) = self.media_source.attached_element() else {
+-            *self.pending_bytes.borrow_mut() = pending;
+-            return;
+-        };
+-        // Chunks are drained from the front in append order; a chunk
+-        // the player refuses goes back at the front with the rest.
++        let mut refused: Vec<Vec<u8>> = Vec::new();
+         while !pending.is_empty() {
+             let chunk = pending.remove(0);
+-            match element.push_media_source_data(chunk.bytes.clone()) {
+-                Ok(()) => {
+-                    // The player took the bytes: account for them.
+-                    let (found_init, mut ranges) =
+-                        parse_appended(&chunk.bytes, &self.init_info.borrow());
+-                    if let Some(init) = found_init {
+-                        *self.init_info.borrow_mut() = Some(init);
++            let result = self.media_source.mux_feed(self.track_key, chunk.bytes.clone());
++            if result.accepted {
++                // The muxer has the bytes: account for them from the
++                // original chunk (see the doc comment above).
++                let (found_init, mut ranges) =
++                    parse_appended(&chunk.bytes, &self.init_info.borrow());
++                if let Some(init) = found_init {
++                    *self.init_info.borrow_mut() = Some(init);
++                }
++                let timestamp_offset = self.timestamp_offset.get();
++                let window_start = self.append_window_start.get();
++                let window_end = self.append_window_end.get();
++                let mut container = self.buffered_ranges.borrow_mut();
++                for range in ranges.drain(..) {
++                    if let Some(range) = apply_append_window(
++                        range,
++                        timestamp_offset,
++                        window_start,
++                        window_end,
++                    ) {
++                        let _ = container.add(range.0, range.1);
+                     }
+-                    let timestamp_offset = self.timestamp_offset.get();
+-                    let window_start = self.append_window_start.get();
+-                    let window_end = self.append_window_end.get();
+-                    let mut container = self.buffered_ranges.borrow_mut();
+-                    for range in ranges.drain(..) {
+-                        if let Some(range) = apply_append_window(
+-                            range,
+-                            timestamp_offset,
+-                            window_start,
+-                            window_end,
+-                        ) {
+-                            let _ = container.add(range.0, range.1);
++                }
++            }
++            // Push the emitted chunks in order. A refusal stops the
++            // drain: the refused chunk and the rest of this chunk's
++            // emitted bytes wait in `push_pending` (they are already
++            // out of the muxer, so re-feeding would duplicate them).
++            let chunks = result.chunks;
++            let mut i = 0;
++            while i < chunks.len() {
++                match element.push_media_source_data(chunks[i].clone()) {
++                    Ok(()) => {
++                        i += 1;
++                    },
++                    Err(error) => {
++                        if !matches!(error, PlayerError::EnoughData) {
++                            warn!("MSE: could not push segment to player: {error:?}");
+                         }
+-                    }
+-                    // `remove` consumed the chunk: the next chunk is
+-                    // now at the same index.
+-                },
+-                Err(PlayerError::EnoughData) => {
+-                    // Player queue full: keep this chunk and the rest
+-                    // for the next `NeedData` drain.
+-                    pending.insert(0, chunk);
+-                    break;
+-                },
+-                Err(error) => {
+-                    warn!("MSE: could not push segment to player: {error:?}");
+-                    pending.insert(0, chunk);
+-                    break;
+-                },
++                        refused.extend(chunks.into_iter().skip(i));
++                        break;
++                    },
++                }
++            }
++            if !refused.is_empty() {
++                break;
+             }
+         }
++        if !refused.is_empty() {
++            *self.push_pending.borrow_mut() = refused;
++        }
+         if !pending.is_empty() {
+             let mut queue = self.pending_bytes.borrow_mut();
+             // Drained chunks were removed from the front, so the
+-- 
+2.43.0
+
