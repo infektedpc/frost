@@ -376,12 +376,34 @@ No new features — this round finishes what Round 3 left open:
   probe ALL PASS, probe3 ALL PASS, R18 probe 29/29,
   R19 probe ALL PASS; all regressions pass. No
   .deb, no push.
-- Round 21 (next, MSE project): YouTube playback
-  end-to-end — drive the SABR/MSE path on the real
-  watch page (possibly by keeping itag 18 out of
-  the player's way) + add MSE append logging so the
-  appends are observable. If the 403 is
-  sandbox-IP-only, Joel's box is the real test.
+- Round 21 (done 2026-11-17, MSE project): YouTube playback
+  end-to-end attempt — drive the SABR/MSE path on the real
+  watch page. F-014 adds MSE append + player-event logging at
+  info level (fork patch, fourteen patches total), and the
+  embedder gains a `FROST_BLOCK_URL_SUBSTRING` diagnostic
+  block (proven live by a local probe: itag=18 fetch fails
+  fast, itag=134 control returns 200). What the gates proved:
+  the player DOES initialize and append on the real watch page
+  (59 `MSE:` lines, 23 appendBuffers, SABR 5× 200) — but it
+  chooses WebM audio (Opus) + AV1/VP9 video, and the remuxer
+  is fMP4-only, so every WebM chunk is silently dropped, the
+  combined init never emits, `pushed=0` in all 15 drains, and
+  the player starves and stalls at 0:00. The itag-18
+  hypothesis is NOT supported by the run that reached the
+  player (zero itag-18 requests); the bot check is flaky
+  between runs (one run showed "Sign in to confirm you're not
+  a bot" with no player at all). Label correction: `accepted:
+  false` means DROPPED, never held. Honest limits: the watch
+  page still does NOT play; seeking not supported. Full suite
+  88/88; R18 probe 29/29, R19 probe ALL PASS, R20 probe ALL
+  PASS; all regressions pass. No .deb, no push.
+- Round 22 (next, MSE project): make the muxer handle WebM —
+  either parse WebM/EBML and repackage WebM tracks into fMP4,
+  or steer the player toward fMP4 by having
+  `MediaSource.isTypeSupported` return false for `audio/webm`,
+  `video/webm`, and AV1 so the player falls back to itag 134
+  (avc1/fMP4) + itag 140 (mp4a/fMP4), which are PROVEN to play
+  through the remuxer (R20). That choice needs Joel's word.
   Then: Frostbite tab hibernation (needs a tab system
   first), Snowdrift workspaces (needs tabs + sessions +
   persistence — biggest). Inspector v2 (docked panel,

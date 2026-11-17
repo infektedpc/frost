@@ -3,7 +3,7 @@
 #
 # What it does:
 #   1. Shallow-clones servo/servo at tag v0.8.0 into ./servo/
-#   2. Applies the thirteen proven 0.8.0 engine patches from ./patches/,
+#   2. Applies the fourteen proven 0.8.0 engine patches from ./patches/,
 #      one commit per patch (the three servo-de patches + Frost's own
 #      F-001 stop patch, which the engine's stop() depends on, the
 #      F-005 viewport-refresh patch, which the engine's refresh_viewport()
@@ -13,7 +13,7 @@
 #      patch: F-010 HTTP/2 max header list size, and the Round 18
 #      patch: F-011 MSE foundation, and the Round 19 patch: F-012
 #      MSE appendBuffer → media thread, and the Round 20 patch: F-013
-#      MSE remuxer).
+#      MSE remuxer, and the Round 21 patch: F-014 MSE append logging).
 #
 # Usage (from the frost repo root):
 #   ./clone-fork.sh
@@ -103,6 +103,9 @@ for patch in servo-keypress-charcode-0.8 servo-damage-rects-0.8 servo-dmabuf-0.8
             ;;
         servo-mediasource-remux-0.8)
             git commit -qm "F-013: MSE slice 3 — remux per-track DASH streams into one player stream (Round 20)"
+            ;;
+        servo-mediasource-logging-0.8)
+            git commit -qm "F-014: MSE append + player-event logging (Round 21)"
             ;;
     esac
 done

@@ -1288,7 +1288,7 @@ as tasks, with `updating` staying true until the
 | 3. MSE foundation (F-011) | DONE (R18) — `MediaSource` exists, attaches, `isTypeSupported` answers. Bytes queue, nothing decodes. |
 | 4. `SourceBuffer.appendBuffer` → media thread | DONE (R19) — `pending_bytes` drain into the player; `buffered` [0.00–10.00] script-side; `loadedmetadata`, duration 10 s, `networkState` Idle, `activeSourceBuffers` length 1. Stretch: the segments decode and PLAY through the existing ServoSrc pipeline. |
 | 5. YouTube's DASH segments through the MSE pipeline | DONE (R20) — the remuxer (F-013): one buffer passes through byte-identical; two buffers merge into one combined init + re-ordered `moof`s. Real YouTube DASH segments ("Me at the zoo", itag 134 + 140) play end to end through the MSE pipeline: video `buffered` [0.00–18.93], audio [0.00–19.06], `playing` fires, `currentTime` advances, decoded frame renders. |
-| 6. YouTube playback | R21 — a watch page plays end to end, not just loads. Gate: video plays, not just the homepage. What R20 learned: the real watch page gets metadata and a poster (duration 0:19 known) but the progressive itag 18 path returns HTTP 403 in the sandbox (bot-checked IP) and the player errors out; SABR/DASH POSTs return 200 but playback never starts. R21's job is the SABR/MSE handoff: drive the DASH path (possibly by keeping itag 18 out of the player's way) + add MSE append logging so the appends are observable. If the 403 is sandbox-IP-only, Joel's box is the real test. |
+| 6. YouTube playback | R21 DONE (diagnostic + root cause, watch page still does NOT play) — the SABR/MSE path was driven on the real watch page with MSE append logging (F-014) and an embedder-side diagnostic URL block (`FROST_BLOCK_URL_SUBSTRING`). What the gates proved: (a) the baseline run never got a player — YouTube showed its "Sign in to confirm you're not a bot" screen, zero `youtubei/v1/player` POSTs, zero appends; the bot check is flaky between runs. (b) the dash run DID get a player (poster, full controls, 0:00/0:19) and the player appended 23 times — but it chose **WebM audio (Opus) + AV1/VP9 video**, and the remuxer is fMP4-only: WebM chunks are silently dropped (`split_chunk` finds no fMP4 boxes), the audio init never registers, the combined init never emits, the player starves (`NeedData` → GStreamer "Could not determine type of stream") and stalls at 0:00 after 3 attempts. (c) the itag-18 hypothesis is NOT supported by the dash run: the player went straight to DASH, made zero itag-18 requests, and the diagnostic block fired 0 times (the block mechanism itself is proven live by a local probe: itag=18 fetch fails fast, itag=134 control succeeds 200). R22's job: make the muxer handle WebM, or steer the player to fMP4 via `isTypeSupported`. If the bot check is sandbox-IP-only, Joel's box is the real test. |
 | 7. Hardware decode | After R21 — VA-API H.264 on Joel's box (`gstreamer1.0-vaapi`); VP9/AV1 stay software on Haswell. |
 
 No unit tests were added in this round: the changes
@@ -1347,10 +1347,20 @@ is one method:
 
 ```rust
 feed(key, bytes, buffer_count) -> FeedResult {
-    accepted: bool,            // false = held for a later drain
+    accepted: bool,            // false = DROPPED (see correction below)
     chunks: Vec<Vec<u8>>,      // bytes to push to the player
 }
 ```
+
+> **Correction (Round 21):** the R20 comment above was wrong.
+> `accepted: false` means the chunk was **dropped**, never held:
+> it happens only for a late track's media, an unparseable
+> init, or a chunk that is not fMP4 at all (e.g. a WebM/EBML
+> chunk — `split_chunk` finds no top-level fMP4 boxes, so
+> `init=None, media=[]`). Held media returns `accepted: true`
+> with the chunks still inside the muxer. The R21 drain log
+> label was fixed to match (`held=` → `dropped=`); see the
+> Round 21 section.
 
 - One buffer only (`buffer_count == 1` at first
   feed): pass-through. Chunks go to the player
@@ -1470,3 +1480,208 @@ append logging so the appends are observable.
   the event can fire during the first append,
   and a listener registered after the appends
   misses it.
+
+## Round 21 — MSE slice 4: drive the SABR/MSE path on the real watch page (F-014 + diagnostic block)
+
+### What this round did
+
+Two things, both permanent diagnostics:
+
+1. **F-014 — MSE append + player-event logging (info level).**
+   `patches/servo-mediasource-logging-0.8.patch`, fork commit
+   `09b36f9a4` (fourteen patches total). `SourceBuffer::AppendBuffer`
+   logs mime + byte count; `drain_pending` logs one summary line
+   per drain that moved or dropped bytes (chunks/bytes pushed,
+   chunks dropped, buffered ranges after); `MediaSource::attach`
+   and `AddSourceBuffer` log; `HTMLMediaElement::handle_player_event`
+   logs `MetadataUpdated` (duration, track counts, WxH, format),
+   `DurationChanged`, `NeedData`, `EnoughData`, `EndOfStream`, and
+   `StateChanged` (transition only), prefixed `MSE:` when an
+   attached MediaSource exists else `media:`.
+   `PositionChanged`/`VideoFrameUpdated` stay silent (per-frame).
+   Player errors already logged via `playback_error`.
+
+   Label correction, found while reading the dash-run log:
+   `accepted: false` from the remuxer means **dropped**, never
+   held — held media returns `accepted: true`. The drain log's
+   `held=` counter was mislabeled and is now `dropped=` (the
+   R20 `FeedResult` comment in this file was wrong the same way
+   and is corrected above). No behavior changed, only the label.
+
+2. **`FROST_BLOCK_URL_SUBSTRING` — embedder-side diagnostic
+   URL block** (`crates/frost-engine/src/snowplow.rs`, no fork
+   change). When set, any non-main-frame HTTP(S) load whose URL
+   contains the substring is cancelled (fast network error) and
+   logged as `diagnostic URL block`, independent of Snowplow's
+   toggle; it sends NO `ResourceBlocked` event, so it never
+   pollutes the Snowplow count. Plain-substring semantics
+   (`itag=18` also matches `itag=180`). Pure helper
+   `url_matches_block_substring` + one unit test
+   (`diagnostic_substring_match`: itag 18 progressive matches,
+   itag 134 DASH does not, `data:` never matches). Full suite
+   is now **88** (87 + 1).
+
+### What the watch-page gates proved
+
+**Baseline run (no block, fresh Frost, nav 2026-11-17
+11:14:36Z): the player never initialized.** Watch page HTML
+200, player JS `base.js` 200, but zero `youtubei/v1/player`
+POSTs, zero `videoplayback` requests, zero `MSE:` lines, zero
+403s (150× 200, 3× 204, 1× 401 on accounts.google.com
+ServiceLogin — an irrelevant sign-in check). Only youtubei
+traffic was 4× `log_event` POSTs. No JS errors in the log.
+After ~2.5 min the page rendered YouTube's bot check: "Sign
+in to confirm you're not a bot". Nothing to drive.
+
+**Dash run (`FROST_BLOCK_URL_SUBSTRING=itag=18`, fresh Frost,
+nav ~11:18:59Z): the player FULLY initialized** — poster frame
+(Jawed + elephants), full controls, title "Me at the zoo -
+YouTube", 0:00 / 0:19. 59 `MSE:` lines, 23 appendBuffers, 3
+MediaSource attaches, 3 Player errors; SABR `videoplayback`
+URLs with `sabr=1`, `rn=1..5`, 5× 200; QoE stats URL with
+`fmt=134&afmt=251`. The dash run reaching the player (vs the
+baseline's bot check) is luck of the draw, not the block —
+the block did nothing in this run.
+
+### Root cause: the remuxer is fMP4-only and YouTube serves WebM audio
+
+The player chose **audio/webm Opus + video/mp4 AV1** (attempts
+1–2), then **audio/webm Opus + video/webm VP9** (attempt 3).
+`mux.rs::split_chunk` walks top-level fMP4 boxes; a WebM
+(EBML) chunk has none, so `init=None, media=[]` and `feed()`
+returns `accepted: false` with NO warning — the chunk is
+silently dropped. The audio WebM init (259 B) never registers,
+so `all_buffers_have_inits(2)` never becomes true
+(`tracks.len()=1 < 2`), the combined init never emits, the
+video fMP4 AV1 init registers (accepted=true, no chunks out —
+waiting for the audio init) and its held media never flushes.
+**`pushed=0` in ALL 15 drains.** The player receives zero
+bytes → `NeedData` → GStreamer typefind error "Could not
+determine type of stream. Stream doesn't contain enough
+data." → the player retries with a fresh MediaSource → same
+deadlock → falls back to VP9/WebM (both tracks WebM) → same
+→ 3 attempts, then stalls at 0:00 with poster + controls
+(status "Snowplow blocked 2").
+
+The AV1 video buffer logged NO drain line in attempts 1–2
+because its feed returned accepted=true with empty chunks
+(init stored, waiting) — under the old log condition
+(pushed>0 || held>0 || refused) that produced no line.
+Consistent, not a second bug.
+
+### The itag-18 hypothesis is NOT supported by the dash run
+
+R20's lead hypothesis was that the player falls back to the
+itag 18 progressive URL, gets a 403, and errors out before
+using DASH. In the dash run the player went straight to DASH
+and made **zero** itag-18 requests, so the diagnostic block
+fired **0 times**. The block mechanism itself is proven live
+by a local probe (`r13-test/r21-media/block-probe.html`,
+2/2 PASS: the itag=18 fetch fails fast with TypeError and a
+`diagnostic URL block` line in the log; the itag=134 control
+fetch returns 200). The R20 evidence (6× 403 on itag 18
+progressive URLs) stands as a real observation from a run
+where the player DID request itag 18 — the player's format
+choice varies between runs — but in the run that reached the
+player, itag 18 played no part. The bot check is likewise
+flaky: the baseline run hit it, the dash run did not.
+
+### Honest limits
+
+- **The YouTube watch page still does NOT play in the
+  sandbox.** The player initializes and appends, but the
+  fMP4-only remuxer drops every WebM chunk and the player
+  starves. His box is the real test — and the same WebM
+  deadlock would hit there too, so this is not a
+  sandbox-IP-only gap anymore.
+- Seeking is still unsupported (R19 limit). Hardware decode
+  is still a later stage (after MSE works).
+- The audio in the R20 test segments is re-containerized
+  (ffmpeg stream-copy of itag 140 — AAC sample data
+  byte-identical, box structure regenerated); the video is
+  untouched real DASH.
+
+### Regression gates (all pass)
+
+R18 probe 29/29 (ALL PASS), R19 probe ALL PASS, R20 probe
+ALL PASS (playing fires, currentTime 0.00 → 2.51, decoded
+frame renders), block probe 2/2 PASS, homepage paints,
+youtube.com loads with 0 SendRequest/PROTOCOL_ERROR (F-010),
+split view both panes, Snowplow blocks in both panes
+(status "blocked 4"), Freeze writes a correct archive
+(`<base href>` + index.json, status "Frozen: …"), Settings
+save + persist across relaunch (homepage example.com +
+search Google, fresh launch opens on example.com),
+Inspector F12 (35 nodes), bands.html strip-scroll paints
+(BAND 2/3 after scroll), frost://settings fails plainly
+(status explains the menu windows), no Frost listener,
+GNOME-mode fallback titlebar (own bar, min/max/close),
+local H.264 video still plays ("playing t=5.00", SMPTE
+bars).
+
+Two gate notes: (1) the R20 probe's FIRST re-run under the
+rebuilt binary hit the known intermittent media-thread
+metadata flake — 4 FAILURES (loadedmetadata never fired,
+readyState 0, networkState 2, no error) while every append
++ buffered check passed; a fresh-Frost re-run passed ALL
+PASS. Same shape as the R20 finding; the label fix cannot
+cause it (log string only). (2) the R18 probe failed twice
+in a row (isTypeSupported false for avc1/vp9/av01) while
+launches carried `LD_LIBRARY_PATH` pointing at the
+**gst-dev build sysroot** — see the harness note below;
+clean launches pass 29/29.
+
+### Harness notes for the next round
+
+- **The gst-dev sysroot is BUILD-TIME ONLY. Never put it in
+  `LD_LIBRARY_PATH` for a launch.** The sandbox's system
+  GStreamer 1.24.2 runtime is complete (`libgstplay-1.0.so.0`
+  and friends are all in `/lib/x86_64-linux-gnu/`, clean
+  `ldd` finds 0 missing). Pointing the launch at the sysroot
+  shadows the system libgstreamer with the sysroot copy,
+  which sees NO plugins (`gst-inspect-1.0 avdec_h264` fails
+  under that path, finds 484 decoders without it) — so the
+  registry scanner finds nothing and `isTypeSupported`
+  returns false for everything, while real decoding still
+  works. The first post-restart launch failure
+  (`libgstplay-1.0.so.0: cannot open shared object file`)
+  was a transient post-restart loader-cache state, not a
+  missing library — clean `ldd` afterwards finds everything.
+  The launch scripts never included gst-dev; keep it that
+  way.
+- **Runtime restarts kill Xvfb :97 + all three test servers**
+  (18080/18099/18101) and the exec-shell environment with
+  them. Restart all three with `setsid nohup` before gating.
+  Watch the `&`/`&&` precedence trap: `cd X && A & B & C`
+  runs B and C in the ORIGINAL cwd, not X — the 18101 server
+  restarted that way served `/home/hatch` (404s) and the hang
+  server died (file not found). Give each backgrounded
+  command its own `cd` or absolute paths.
+- **MSE probes must be the FIRST media page in a fresh
+  Frost** (R20 finding, re-confirmed this round by the
+  metadata flake). Restart Frost between MSE probes. Use a
+  `?cache-buster` query when re-running an edited probe
+  (Servo caches aggressively). Register `loadedmetadata`
+  listeners BEFORE the appends.
+- The plain 2 GB debug link still OOM-kills in the sandbox;
+  the gate binary is linked with
+  `-C link-arg=-Wl,--strip-debug` via `cargo rustc -p frost
+  --bins` (same code, no debuginfo; this round's binary
+  522,336,328 B). A fork change forces a servo-script
+  rebuild (~7 min for the strip link).
+
+### R22 staging (proposal, not decided)
+
+The muxer must handle WebM. Two options: (a) parse WebM/EBML
+and repackage WebM tracks into fMP4 (Opus-in-MP4 and
+VP9-in-MP4 exist as formats, but a repackager is a big
+slice); or (b) steer the player toward fMP4 by having
+`MediaSource.isTypeSupported` return false for `audio/webm`,
+`video/webm`, and AV1 (`video/mp4; codecs="av01…"`) so the
+player falls back to itag 134 (avc1/fMP4) + itag 140
+(mp4a/fMP4), which are PROVEN to play through the remuxer
+(R20). Option (b) is format negotiation via the API's
+intended purpose, but it is a capability declaration that
+needs Joel's/parent's decision — do NOT implement it inside
+Round 21. Hardware decode remains a later stage after MSE
+works.

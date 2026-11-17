@@ -43,6 +43,14 @@ use url::Url;
 
 use crate::EngineEvent;
 
+/// Whether a URL matches the Round 21 diagnostic block substring:
+/// HTTP(S) only, matched as a plain substring of the full URL.
+/// Pure so tests can drive it; the main-frame and Snowplow-toggle
+/// gates live in [`handle_load`], not here.
+fn url_matches_block_substring(url: &Url, substring: &str) -> bool {
+    (url.scheme() == "http" || url.scheme() == "https") && url.as_str().contains(substring)
+}
+
 /// Well-known ad-serving and tracking domains. Matching is by host
 /// suffix (see [`host_is_blocked`]), so e.g. `doubleclick.net` also
 /// covers `ad.doubleclick.net` and `stats.g.doubleclick.net`. Entries
@@ -242,12 +250,40 @@ impl Default for Snowplow {
 /// navigations and non-HTTP(S) requests are never blocked. A blocked
 /// load is cancelled (a fast network error, never a hang) and an
 /// [`EngineEvent::ResourceBlocked`] is sent so the UI can count it.
+///
+/// Round 21 diagnostic, independent of Snowplow's toggle: if the
+/// `FROST_BLOCK_URL_SUBSTRING` environment variable is set to a
+/// non-empty substring, any non-main-frame HTTP(S) load whose URL
+/// contains it is cancelled (fast network error) and logged at info.
+/// It sends no `ResourceBlocked` event — it is not Snowplow and must
+/// not pollute the blocked count. Built to test the YouTube hypothesis
+/// that the player falls back to the itag 18 progressive URL and
+/// errors out before using DASH: `FROST_BLOCK_URL_SUBSTRING=itag=18`
+/// keeps the progressive URL out of the player's way. Matching is a
+/// plain substring on the full URL, so `itag=18` also matches
+/// `itag=180` — a diagnostic, not a filter language. Default off.
 pub fn handle_load(
     load: WebResourceLoad,
     snowplow: &Snowplow,
     tx: &mpsc::Sender<EngineEvent>,
     webview: WebViewId,
 ) -> bool {
+    if let Ok(substring) = std::env::var("FROST_BLOCK_URL_SUBSTRING") {
+        if !substring.is_empty() {
+            let request = load.request();
+            if !request.is_for_main_frame {
+                let url: Url = request.url.clone().into_url();
+                if url_matches_block_substring(&url, &substring) {
+                    let blocked = url.to_string();
+                    load.intercept(WebResourceResponse::new(url)).cancel();
+                    log::info!(
+                        "frost-engine: diagnostic URL block (FROST_BLOCK_URL_SUBSTRING={substring:?}): {blocked}"
+                    );
+                    return true;
+                }
+            }
+        }
+    }
     if !snowplow.enabled {
         return false;
     }
@@ -268,6 +304,26 @@ pub fn handle_load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_substring_match() {
+        // Round 21: the itag 18 progressive URL matches, a DASH
+        // segment URL does not, and non-HTTP(S) schemes never match.
+        let progressive = Url::parse(
+            "https://rr1---sn.googlevideo.com/videoplayback?itag=18&mime=video%2Fmp4",
+        )
+        .unwrap();
+        assert!(url_matches_block_substring(&progressive, "itag=18"));
+        assert!(!url_matches_block_substring(&progressive, "itag=134"));
+        let dash = Url::parse(
+            "https://rr1---sn.googlevideo.com/videoplayback?itag=134&range=0-1000",
+        )
+        .unwrap();
+        assert!(!url_matches_block_substring(&dash, "itag=18"));
+        assert!(url_matches_block_substring(&dash, "itag=134"));
+        let data = Url::parse("data:text/html,itag=18").unwrap();
+        assert!(!url_matches_block_substring(&data, "itag=18"));
+    }
 
     #[test]
     fn exact_and_subdomain_match() {

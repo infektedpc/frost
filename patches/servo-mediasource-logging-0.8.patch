@@ -1,0 +1,80 @@
+diff --git a/components/script/dom/media/sourcebuffer.rs b/components/script/dom/media/sourcebuffer.rs
+index 96561387f..d46f6edb2 100644
+--- a/components/script/dom/media/sourcebuffer.rs
++++ b/components/script/dom/media/sourcebuffer.rs
+@@ -22,12 +22,20 @@
+ 
+ //! Round 21: MSE append logging (permanent diagnostic). `appendBuffer`
+ //! logs mime + byte count at info level, and `drain_pending` logs one
+-//! summary line per drain that moved or held bytes (chunks pushed,
+-//! bytes pushed, chunks held by the remuxer, buffered ranges after).
++//! summary line per drain that moved or dropped bytes (chunks pushed,
++//! bytes pushed, chunks the remuxer dropped, buffered ranges after).
+ //! A gate can therefore prove from the log alone whether a page's
+ //! player appends segments at all — the Round 20 watch-page question,
+ //! where the player showed no append activity at info level because
+ //! none was logged.
++//!
++//! "Dropped" is exact: `MseMuxer::feed` returns `accepted: false`
++//! only for bytes it discards (a chunk from a late track, an
++//! unparseable init, or — the case the Round 21 watch-page gate
++//! found — a non-fMP4 chunk such as a WebM init/segment, which
++//! `split_chunk` finds no boxes in). Bytes the remuxer keeps for
++//! later (held media before the combined init goes out) return
++//! `accepted: true`, so they never count here.
+ 
+ use std::cell::Cell;
+ 
+@@ -217,10 +225,11 @@ impl SourceBuffer {
+         };
+         // Round 21: drain accounting for the info-level summary line
+         // at the end (chunks/bytes actually pushed, chunks the remuxer
+-        // held for a later drain).
++        // dropped — see the header comment: `accepted: false` means
++        // dropped, never held).
+         let mut pushed_chunks = 0usize;
+         let mut pushed_bytes = 0usize;
+-        let mut held_chunks = 0usize;
++        let mut dropped_chunks = 0usize;
+         // (a) Emitted chunks the player refused earlier go first,
+         // unmodified, so stream order is preserved.
+         let mut push_pending = std::mem::take(&mut *self.push_pending.borrow_mut());
+@@ -254,11 +263,10 @@ impl SourceBuffer {
+             let chunk = pending.remove(0);
+             let result = self.media_source.mux_feed(self.track_key, chunk.bytes.clone());
+             if !result.accepted {
+-                // Round 21: the remuxer is holding this chunk for a
+-                // later drain (another track's init has not arrived
+-                // yet) — it is not lost, but nothing reaches the
+-                // player from it this drain.
+-                held_chunks += 1;
++                // Round 21: the remuxer dropped this chunk (not fMP4,
++                // a late track, or an unparseable init — see the header
++                // comment). It is gone, not waiting for a later drain.
++                dropped_chunks += 1;
+             }
+             if result.accepted {
+                 // The muxer has the bytes: account for them from the
+@@ -310,16 +318,16 @@ impl SourceBuffer {
+                 break;
+             }
+         }
+-        // Round 21: one info line per drain that moved, held, or was
+-        // refused bytes — the observable proof of whether a page's
+-        // player appends at all, with the buffered ranges after.
+-        if pushed_chunks > 0 || held_chunks > 0 || !refused.is_empty() {
++        // Round 21: one info line per drain that moved or dropped
++        // bytes — the observable proof of whether a page's player
++        // appends at all, with the buffered ranges after.
++        if pushed_chunks > 0 || dropped_chunks > 0 || !refused.is_empty() {
+             info!(
+-                "MSE: drain mime={} pushed={} chunks ({} bytes) held={} buffered={:?}",
++                "MSE: drain mime={} pushed={} chunks ({} bytes) dropped={} buffered={:?}",
+                 &*self.mime_type.borrow().str(),
+                 pushed_chunks,
+                 pushed_bytes,
+-                held_chunks,
++                dropped_chunks,
+                 self.buffered_ranges()
+             );
+         }
