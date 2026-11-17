@@ -208,6 +208,41 @@ binary itself was linked with `--strip-debug` (517 MB) because the
 plain 2 GB debug link OOM-killed twice in the sandbox — same code, no
 debuginfo; the source still builds the normal dev binary.
 
+### .deb 0.16.0 (Round 16, Debian 13, amd64)
+
+`packaging/build-deb-0.16.0.sh` builds `frost-0.16.0_amd64.deb` (SHA-256
+`a0f5fc4e3bdc24b5a25f4174e559a7c4cd47e84374cb6a97c019b13c102e501e`,
+64,710,502 B; stripped binary 318,929,544 B) from the Round 16 tree
+(HEAD `a6f00f2`, same proven gated binary — no rebuild). Same contents:
+`/usr/bin/frost`, desktop file, snowflake icon. Same honest
+stripped-DEBUG note in the Description. Depends were re-derived from
+`ldd` + `/proc` maps of the running Round 16 binary and are
+IDENTICAL to the 0.14.0 list (25 packages) — `libvulkan1` stays
+because `WGPU_BACKEND=vulkan` remains a supported override even
+though the default path is now GL (the running binary maps no
+libvulkan.so.1); `libGLESv2` was NOT added — verified before
+packaging that it is in neither `ldd` nor the running binary's maps,
+and wgpu-hal 28 binds desktop GL first on Mesa (the gate log shows
+adapter driver_info "4.5 (Core Profile)", `backend: Gl`), so on any
+Mesa system it is never loaded. The packaged binary's BuildID
+(`4aa99814…63dc`) is identical to the tree binary's — the .deb really
+contains the gated Round 16 build. The packaged binary was gated
+from a clean extraction: launch + example.org full paint + banner
+(log shows `backend: Gl`), Ctrl+K palette with all entries, split
+view with both panes fully painted, menu with all 9 items (dynamic
+"Close split view" label), Freeze writes a correct archive +
+index.json with "Frozen: Example Domain" in the status line,
+settings save (homepage → example.com, theme → Light) + persist
+across relaunch, GNOME-mode fallback titlebar ("Frost — Example
+Domain" with min/max/close). Install the same way:
+`sudo dpkg -i frost-0.16.0_amd64.deb` (+ `sudo apt-get install -f`
+only if a dep is missing). Never installed with `dpkg -i` in the
+sandbox — the real install is Joel's-box verdict, and the CPU win is
+only measurable there (the sandbox has no GPU). Note: the tree
+binary itself was linked with `--strip-debug` (517 MB) because the
+plain 2 GB debug link OOM-killed twice in the sandbox — same code, no
+debuginfo; the source still builds the normal dev binary.
+
 ### .deb 0.11.0 (Round 11, Debian 13, amd64)
 
 `packaging/build-deb-0.11.0.sh` builds `frost-0.11.0_amd64.deb` (SHA-256
