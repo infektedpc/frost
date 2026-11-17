@@ -1,5 +1,5 @@
 [toolchain]
-# Matches the fork's pin (servo/rust-toolchain.toml). The fork is Servo
-# 0.8.0, which requires 1.99.1. If rustup has not installed it yet it
+# Matches Freezer's pin (freezer/rust-toolchain.toml). Freezer is
+# Servo 0.8.0-based, which requires 1.99.1. If rustup has not installed it yet it
 # downloads it on first use (network required, one-time).
 channel = "1.99.1"

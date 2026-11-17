@@ -12,7 +12,7 @@ use cosmic::iced::keyboard::{
     Key as IcedKey, Location as IcedLocation, Modifiers as IcedModifiers,
 };
 use cosmic::iced::mouse::Button as IcedButton;
-use frost_engine::{
+use frozen::{
     FrostCode, FrostKey, FrostLocation, FrostModifiers, FrostMouseButton,
     FrostNamedKey,
 };

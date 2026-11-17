@@ -9,13 +9,13 @@
 //! All-full frames point the finger at the app/iced upload path.
 //!
 //! Usage:
-//!   cargo run -p frost-engine --example frameprobe -- [URL] [STEPS]
+//!   cargo run -p frozen --example frameprobe -- [URL] [STEPS]
 //!
 //! Defaults: file://.../r6-scroll.html in the harness dir, 12 scroll steps.
 
 use std::time::{Duration, Instant};
 
-use frost_engine::{Engine, EngineEvent, Frame, FrostInputEvent};
+use frozen::{Engine, EngineEvent, Frame, FrostInputEvent};
 
 fn stats(tag: &str, frame: &Frame) {
     let n = (frame.width as usize) * (frame.height as usize);

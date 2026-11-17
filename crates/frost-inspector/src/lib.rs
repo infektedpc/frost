@@ -6,7 +6,7 @@
 //! [`StubInspector`] that returns an empty-document snapshot. The real
 //! implementation (Round 4+) will pull the DOM out of Servo — Servo's
 //! constellation owns the live DOM, so the inspector needs a fork-side
-//! hook that serializes a subtree on request (see `FORK.md`, patch F-002).
+//! hook that serializes a subtree on request (see `FREEZER.md`, patch F-002).
 //! The UI contract is fixed now so the inspector page (`frost://inspect`)
 //! can be built against the trait without waiting for the engine hook.
 //!

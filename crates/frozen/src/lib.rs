@@ -1,4 +1,4 @@
-//! frost-engine: Servo embedding wrapper for the Frost browser.
+//! frozen: Freezer embedding wrapper for the Frost browser.
 //!
 //! This crate owns everything Servo-shaped: creating the engine, owning one
 //! [`FrostWebView`] per tab, pumping the event loop, turning Servo
@@ -20,7 +20,7 @@
 //!   [`KeyboardEvent::new_without_event`], which needs the `+8` evdev
 //!   adjustment only for Wayland seat input — Frost keys come from
 //!   winit/libcosmic, so that fix does not apply here.
-//! * `stop()` landed in Round 2 as fork patch F-001 (see `FORK.md`):
+//! * `stop()` landed in Round 2 as fork patch F-001 (see `FREEZER.md`):
 //!   [`FrostWebView::stop`] sends the stop request to the script thread
 //!   of the active pipeline.
 //!
@@ -389,7 +389,7 @@ pub fn create_rendering_context(
         Ok(ctx) => Ok(Rc::new(ctx)),
         Err(e) => {
             log::warn!(
-                "frost-engine: hardware rendering context failed ({e:?}); falling back to software rendering"
+                "frozen: hardware rendering context failed ({e:?}); falling back to software rendering"
             );
             Ok(Rc::new(SoftwareRenderingContext::new(size).map_err(
                 |e| EngineError::Servo(format!("rendering context: {e:?}")),

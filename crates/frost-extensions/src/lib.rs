@@ -17,7 +17,7 @@
 //!   real implementation can be swapped in without touching callers.
 //! * [`ExtensionHost`] is a trait; [`StubHost`] is the Round 1 in-memory
 //!   implementation. The real host (Round 3+) will drive content-script
-//!   injection through `frost-engine`'s script evaluation hook.
+//!   injection through `frozen`'s script evaluation hook.
 
 use std::collections::HashMap;
 

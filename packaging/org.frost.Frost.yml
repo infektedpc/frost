@@ -14,11 +14,10 @@
 #   hold the Round 4 tree (it does — created 2026-11-14; the manifest
 #   clones branch `main`). If the code is ever pushed to a different
 #   remote, update the `url` below.
-# - Network access DURING the build: clone-fork.sh clones servo/servo at
-#   v0.8.0 from GitHub and cargo fetches crates + the libcosmic git dep.
-#   That is why flatpak-builder must be run with --share=network.
+# - Network access DURING the build: cargo fetches crates + the libcosmic
+#   git dep. That is why flatpak-builder must be run with --share=network.
 # - Rust toolchain: the repo pins Rust 1.99.1 (rust-toolchain.toml, to
-#   match the Servo fork). The freedesktop SDK's cargo may be older; if
+#   match Freezer). The freedesktop SDK's cargo may be older; if
 #   the build fails on toolchain/edition errors, install rustup 1.99.1
 #   in the build (rustup toolchain install 1.99.1) or build with
 #   --share=network and let rustup fetch it. The manifest below uses the
@@ -28,10 +27,10 @@
 #   build was not feasible in the sandbox; a Flatpak built on Joel's box
 #   has no such limit, but a full Servo release build still takes a long
 #   time (budget hours, not minutes).
-# - The Servo fork is recreated inside the build by ./clone-fork.sh
-#   (shallow clone of servo/servo v0.8.0 + the eight vendored patches in
-#   patches/), exactly as a normal source build does. The fork is NOT
-#   fetched as a separate module.
+# - Freezer is NOT fetched by this manifest: the old ./clone-fork.sh
+#   recreation path was retired in Round 23. A Freezer checkout must be
+#   copied into the build tree before `cargo build` runs — the manifest
+#   does not do this yet, so the Flatpak build is broken until then.
 app-id: org.frost.Frost
 runtime: org.freedesktop.Platform
 runtime-version: '24.08'
@@ -49,7 +48,6 @@ modules:
   - name: frost
     buildsystem: simple
     build-commands:
-      - ./clone-fork.sh
       - cargo build --release -p frost
       - install -Dm755 target/release/frost /app/bin/frost
       - install -Dm644 packaging/frost.desktop /app/share/applications/org.frost.Frost.desktop

@@ -12,7 +12,7 @@ use cosmic::iced::{
 };
 use cosmic::widget::{self, button, container, text, text_input};
 use cosmic::{executor, iced, ApplicationExt, Element};
-use frost_engine::{
+use frozen::{
     Engine, EngineEvent, FrostCode, FrostInputEvent, FrostKeyState,
     FrostMouseButtonAction, FrostWebView, WebViewId, MAX_SYNC_UPLOAD_BYTES,
 };

@@ -1,12 +1,12 @@
 [package]
-name = "frost-engine"
+name = "frozen"
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-# Servo fork, one directory up: ../.. is the frost repo root, servo/ is the
-# nested fork (see FORK.md). Feature set mirrors the proven servo-de
+# Freezer engine, one directory up: ../.. is the frost repo root, freezer/ is the
+# nested engine repo (see FREEZER.md). Feature set mirrors the proven servo-de
 # embedder: the same features servoshell enables MINUS webgl / webxr,
 # which the sandbox cannot build (no libclang for mozangle's bindgen).
 # Round 17 enables `media-gstreamer` (video/audio playback): it builds
@@ -16,7 +16,7 @@ publish = false
 # Round 17). Without that sysroot (or system -dev packages on another
 # machine), the build fails at the gstreamer-sys build scripts.
 # `subtlecrypto` is the 0.8.0 name for the old `webcrypto`.
-servo = { path = "../../servo/components/servo", default-features = false, features = [
+servo = { path = "../../freezer/components/servo", default-features = false, features = [
     "background_hang_monitor",
     "bluetooth",
     "testbinding",

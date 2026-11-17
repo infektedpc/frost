@@ -13,8 +13,10 @@
 #           https://flathub.org/repo/flathub.flatpakrepo
 #   - the GitHub repo https://github.com/infektedpc/frost.git exists
 #     (the manifest clones branch `main` from it)
-#   - network access during the build (clone-fork.sh clones servo/servo;
-#     cargo fetches crates + the libcosmic git dep) — hence --share=network
+#   - network access during the build (cargo fetches crates + the
+#     libcosmic git dep) — hence --share=network
+#   - a Freezer checkout at ./freezer/ (the old clone-fork.sh recreation
+#     path was retired in Round 23; the manifest does not fetch it)
 #   - patience: a full Servo release build takes hours, not minutes
 #
 # Usage (from the frost repo root):

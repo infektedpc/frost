@@ -420,10 +420,16 @@ No new features — this round finishes what Round 3 left open:
   still does not play through; seeking not supported. Full
   suite 88/88; R18 probe 29/29, R19 probe ALL PASS, R20
   probe ALL PASS; all regressions pass. No .deb, no push.
-- Round 23 (next, MSE project): diagnose the post-steer
-  stall — why a fully-buffered MSE element stops advancing
-  a few seconds in on the real watch page with no error.
-  Then: Frostbite tab hibernation (needs a tab system
+- Round 23 (done 2026-11-17): cut the Servo fork loose as Freezer
+  and rename the engine crate to `frozen` — Joel chose this himself.
+  Freezer is now its own codebase (no upstream remote, single squashed
+  commit); `clone-fork.sh` retired; `frost-engine` is now `frozen`.
+  Full suite 88/88; R18 probe 29/29, R19 probe ALL PASS, R20 probe ALL
+  PASS; all regressions pass. No .deb, no push.
+- Stall diagnosis (pending, UNNUMBERED — Joel's call): why a
+  fully-buffered MSE element stops advancing a few seconds in on the
+  real watch page with no error (post-steer stall, not the R21
+  starvation). Then: Frostbite tab hibernation (needs a tab system
   first), Snowdrift workspaces (needs tabs + sessions +
   persistence — biggest). Inspector v2 (docked panel,
   click-to-inspect, live updates, console) stays
@@ -523,9 +529,9 @@ changes. Frostbite freezes the workspace you leave.
 |---|---|
 | No WebExtensions API | We build our own host (`frost-extensions`); manifest is close to WebExtensions so authors can port with small edits. |
 | No HTML inspector | We built our own (`frost-inspector` walker script + `frost://inspector` snapshot page, Round 5 — no fork patch; F-002 closed as not needed). Click-to-inspect is v2. |
-| Limited print support | Fork patch F-003 or paginated-image export from the render path. |
+| Limited print support | Freezer patch F-003 or paginated-image export from the render path. |
 | No PDF viewer | Later round: render PDFs via the engine (pdf.js-style, Servo-rendered) or a native viewer page. |
-| No spellcheck | Fork patch F-004 or a pure-Rust spellcheck in the UI layer. |
+| No spellcheck | Freezer patch F-004 or a pure-Rust spellcheck in the UI layer. |
 | No `WebView::stop` | Fork patch F-001 — LANDED in Round 2 (real `stop()`; the Stop button is enabled while loading). F-008 LANDED in Round 4: Stop now also aborts a navigation stuck at the constellation (pending-change abort folded into `handle_stop_msg`). |
 | No WebGL in the sandbox feature set | Deliberate Round 1 cut (no libclang for mozangle bindgen, no gstreamer). Revisit when the build machine has them; Joel's box may already. |
 | No media (audio/video) in the sandbox feature set | Same cut (no gstreamer). Same revisit. |

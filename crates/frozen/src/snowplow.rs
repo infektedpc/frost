@@ -277,7 +277,7 @@ pub fn handle_load(
                     let blocked = url.to_string();
                     load.intercept(WebResourceResponse::new(url)).cancel();
                     log::info!(
-                        "frost-engine: diagnostic URL block (FROST_BLOCK_URL_SUBSTRING={substring:?}): {blocked}"
+                        "frozen: diagnostic URL block (FROST_BLOCK_URL_SUBSTRING={substring:?}): {blocked}"
                     );
                     return true;
                 }

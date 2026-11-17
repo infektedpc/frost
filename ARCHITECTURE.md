@@ -4,14 +4,14 @@
 
 | Crate | Role | Depends on |
 |---|---|---|
-| `frost` | libcosmic app: window, toolbar, address bar, hamburger menu, titlebar (Round 2); tab strip later | `frost-engine`, `libcosmic` (optional, git) |
-| `frost-engine` | Servo embedding: engine, webview per tab, event pump, frame readback | fork `servo/components/servo` (path dep) |
+| `frost` | libcosmic app: window, toolbar, address bar, hamburger menu, titlebar (Round 2); tab strip later | `frozen`, `libcosmic` (optional, git) |
+| `frozen` | Freezer embedding: engine, webview per tab, event pump, frame readback | Freezer `freezer/components/servo` (path dep) |
 | `frost-extensions` | Extension host: manifests, content scripts, `frost.*` bridge trait, stub host | `serde`, `serde_json`, `url` |
 | `frost-inspector` | Inspector: DOM snapshot types, walker script (`walk.js`), `snapshot_from_json`, `DOM_WALK_SCRIPT` | `serde`, `serde_json` |
 
 Rules:
 
-- `frost-engine` never imports the UI. It is headless by design — that is
+- `frozen` never imports the UI. It is headless by design — that is
   what makes the smoke test possible and keeps the engine testable without
   a window.
 - `frost-extensions` and `frost-inspector` never import Servo. They define
@@ -32,7 +32,7 @@ Rules:
                 │  render() -> Frame { rgba }
                 │  EngineEvent channel (title/url/load/frame/crash)
 ┌───────────────┴────────────────────────────────────────────┐
-│ frost-engine                                               │
+│ frozen                                                     │
 │  ServoBuilder → Servo → WebView + SoftwareRenderingContext │
 │  spin_event_loop() driven by the UI loop (Round 2)         │
 └────────────────────────────────────────────────────────────┘
@@ -249,7 +249,7 @@ request, not the first response. `LoadStarted`/`LoadFinished`/
 afterward. The fork side of F-008 (`handle_stop_msg` also draining
 pending session-history changes) is what makes the resulting Stop
 actually abort a stuck navigation; the app-side flag is what makes
-Stop reachable for one. See FORK.md.
+Stop reachable for one. See FREEZER.md.
 
 ## Menu pages: native windows (Round 7)
 
@@ -514,7 +514,7 @@ without restructuring:
 
 `frost-inspector` defines the snapshot contract, and Round 5 fills it
 in — with a walker script, NOT a fork patch (F-002 is not needed; see
-FORK.md):
+FREEZER.md):
 
 - `DomSnapshot`: an owned tree (`DomNode` with tag, attributes, computed
   style, box model) — no live handles into Servo, so it serializes cleanly
@@ -974,7 +974,7 @@ the confirmation signal on Joel's box. The patch file
 is `patches/servo-hardware-rendering-context-0.8.patch`
 (171 lines, fork commit `1136ffe68`), applied last by
 `clone-fork.sh` (nine patches now) and documented in
-`FORK.md`. `SurfmanRenderingContext` itself is private,
+`FREEZER.md`. `SurfmanRenderingContext` itself is private,
 so the fork patch was unavoidable — the embedder cannot
 build a hardware context from exported pieces alone.
 

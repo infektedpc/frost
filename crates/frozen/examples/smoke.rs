@@ -4,7 +4,7 @@
 //! timeout), waits for a painted frame, and writes it as a PNG.
 //!
 //! Usage:
-//!   cargo run -p frost-engine --example smoke -- [URL] [OUT.png] [W] [H]
+//!   cargo run -p frozen --example smoke -- [URL] [OUT.png] [W] [H]
 //!
 //! Defaults: `https://example.org`, `smoke.png` in the current directory,
 //! 1280x800. Exit code 0 means a non-blank PNG was written; anything else is a
@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use frost_engine::{Engine, EngineEvent, Frame};
+use frozen::{Engine, EngineEvent, Frame};
 
 fn write_png(path: &str, frame: &Frame) -> Result<(), Box<dyn std::error::Error>> {
     let file = std::fs::File::create(path)?;

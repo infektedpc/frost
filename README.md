@@ -30,48 +30,49 @@ Fork at F-015. See [ROADMAP.md](ROADMAP.md) for the plan.**
 ```
 frost/
 ├── Cargo.toml            # cargo workspace
-├── rust-toolchain.toml   # Rust 1.99.1 (matches the Servo fork's pin)
-├── FORK.md               # the Servo fork: point, patches, planned patches
-├── clone-fork.sh         # recreate servo/ from scratch (shallow v0.8.0 + patches)
-├── patches/              # the twelve proven 0.8.0 engine patches (vendored)
-├── servo/                # the Servo fork (NESTED repo, gitignored, not in the zip)
+├── rust-toolchain.toml   # Rust 1.99.1 (matches Freezer's pin)
+├── FREEZER.md            # Freezer: history, patches, planned work
+├── patches/              # the fifteen Freezer patches, kept as the historical record (vendored)
+├── freezer/              # Freezer (NESTED repo, gitignored, not in the zip)
 ├── crates/
 │   ├── frost/            # libcosmic app: toolbar, address bar, hamburger menu
-│   ├── frost-engine/     # Servo embedding wrapper + headless smoke test
+│   ├── frozen/           # Freezer embedding wrapper + headless smoke test
 │   ├── frost-extensions/ # extension host scaffolding (manifests, content scripts, frost.* API)
 │   └── frost-inspector/  # HTML inspector scaffolding (DOM snapshots, element picker)
 ├── README.md / ARCHITECTURE.md / ROADMAP.md
 └── smoke.png             # smoke-test screenshot (generated, gitignored)
 ```
 
-## The fork
+## Freezer
 
-Frost builds against its own Servo fork at `servo/`, not upstream. The
-fork point is **v0.8.0** (`4e136d8e…`) plus ten engine patches as fork
-commits (keypress charCode, damage rects, dmabuf export, F-001 stop,
+Frost builds against Freezer, its own engine codebase at `freezer/`,
+cut loose from upstream Servo in Round 23. Freezer started as a Servo
+fork at **v0.8.0** (`4e136d8e…`) plus fifteen engine patches folded in
+as commits (keypress charCode, damage rects, dmabuf export, F-001 stop,
 F-005 refresh-viewport, F-006 reload-notify, F-007 full-present,
 F-008 stop-aborts-pending, F-009 hardware rendering context,
-F-010 HTTP/2 max header list size). Full detail in [FORK.md](FORK.md). To recreate it on another machine:
+F-010 HTTP/2 max header list size, F-011 MediaSource foundation,
+F-012 appendBuffer → media thread, F-013 MSE remuxer, F-014 MSE +
+player-event logging, F-015 steer to fMP4). Full detail in
+[FREEZER.md](FREEZER.md).
 
-```bash
-./clone-fork.sh
-```
-
-The fork is a nested repo with its own `.git`; the frost repo never tracks
-it. It is also excluded from the delivery zip — it is reproducible from
-`clone-fork.sh` and far too big to ship.
+Freezer is a nested repo with its own `.git` and no upstream remote;
+the frost repo never tracks it. It is also excluded from the delivery
+zip — it is far too big to ship, and the zip is a snapshot of the
+frost repo only. A machine that has only the zip needs a Freezer
+checkout placed at `./freezer/` before it can build (see FREEZER.md).
 
 ## Building
 
 ```bash
-# 1. Recreate the fork (first time only)
-./clone-fork.sh
+# 1. Freezer must already be checked out at ./freezer/
+#    (nested repo, not in the zip — see FREEZER.md)
 
 # 2. Check everything (engine + scaffolding + app stub)
 cargo check --workspace --all-targets
 
 # 3. Headless proof: load example.org and screenshot it
-cargo run -p frost-engine --example smoke
+cargo run -p frozen --example smoke
 # writes smoke.png (1280x800) — must be a real page, not a solid color
 
 # 4. The window (needs libcosmic's system libraries; see below).
@@ -85,8 +86,8 @@ compiles even where libcosmic cannot.
 
 ### Toolchain
 
-Rust **1.99.1**, pinned in `rust-toolchain.toml` to match the fork
-(`servo/rust-toolchain.toml`). Rustup downloads it on first use if it is
+Rust **1.99.1**, pinned in `rust-toolchain.toml` to match Freezer
+(`freezer/rust-toolchain.toml`). Rustup downloads it on first use if it is
 not installed yet.
 
 ### libcosmic
@@ -296,9 +297,11 @@ Inspector capture — the known Round 7 wart, carried over unchanged.
 `packaging/org.frost.Frost.yml` + `packaging/build-flatpak.sh` build a
 Flatpak **on Joel's machine** (the sandbox has no flatpak tooling at
 all, so the manifest was never built or tested there). It clones the
-GitHub repo (`infektedpc/frost`, branch `main`) and recreates the Servo
-fork with `./clone-fork.sh`, then does a **release** build. It needs
-network during the build (`--share=network`) and hours, not minutes.
+GitHub repo (`infektedpc/frost`, branch `main`), then does a **release**
+build. Freezer is NOT in the snapshot, so the Flatpak build needs a
+Freezer checkout copied in first — the old `./clone-fork.sh` recreation
+path was retired in Round 23 and the manifest does not do this yet.
+It needs network during the build (`--share=network`) and hours, not minutes.
 
 ## Pushing to GitHub
 
@@ -311,13 +314,9 @@ git remote add origin git@github.com:<your-user>/frost.git
 git push -u origin main
 ```
 
-The `servo/` fork is a separate nested repo; push it separately if you
-want it on GitHub too:
-
-```bash
-git -C servo remote add origin git@github.com:<your-user>/servo.git
-git -C servo push -u origin HEAD:main
-```
+Freezer is a separate nested repo with NO remote — do not push it.
+It has no upstream and no GitHub home; it travels with the build
+machine, not with the snapshot.
 
 ## Round 1 — what is proven, what is not
 

@@ -6,7 +6,7 @@ publish = false
 
 [features]
 # The libcosmic window is the default now (Round 2): `cargo run -p frost`
-# launches the browser. The engine proof (frost-engine smoke test) never
+# launches the browser. The engine proof (frozen smoke test) never
 # depends on it.
 default = ["ui-libcosmic"]
 # `libcosmic/wgpu` switches iced to its fallback renderer (wgpu first,
@@ -20,7 +20,7 @@ default = ["ui-libcosmic"]
 ui-libcosmic = ["dep:libcosmic", "libcosmic/wgpu"]
 
 [dependencies]
-frost-engine = { path = "../frost-engine" }
+frozen = { path = "../frozen" }
 frost-extensions = { path = "../frost-extensions" }
 # Round 5: the inspector (DOM walker script + snapshot parsing).
 frost-inspector = { path = "../frost-inspector" }

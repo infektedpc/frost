@@ -14,7 +14,7 @@
 //!   `https://`, anything else is a search with the default engine).
 //! * Input forwards into the page: the app listens to all iced events and
 //!   translates the ones landing in the content area into
-//!   [`frost_engine::FrostInputEvent`]s. Keyboard goes to the page only
+//!   [`frozen::FrostInputEvent`]s. Keyboard goes to the page only
 //!   while the content area has focus (a click in the content, or Enter in
 //!   the address bar); typing in the address bar stays in the bar.
 //! * The hamburger menu opens as a dropdown; Settings / Print /
@@ -177,7 +177,7 @@ fn main() {
     eprintln!("frost: libcosmic UI is not enabled in this build.");
     eprintln!("frost: run with `cargo run -p frost --features ui-libcosmic` for the window.");
     eprintln!("frost: the engine is headless — prove it with:");
-    eprintln!("frost:   cargo run -p frost-engine --example smoke");
+    eprintln!("frost:   cargo run -p frozen --example smoke");
 }
 
 #[cfg(all(test, feature = "ui-libcosmic"))]

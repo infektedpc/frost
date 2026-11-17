@@ -1,19 +1,34 @@
-# Frost's Servo fork
+# Freezer — Frost's engine
 
-Frost does not build against upstream Servo. It builds against a fork that
-lives at `servo/` inside this repo (a **nested git repo** — it has its own
-`.git`, is gitignored by the frost repo, and is never committed into it).
-The fork exists so Frost can move on its own schedule: engine fixes land as
-fork commits instead of a permanent pile of `git apply` diffs.
+Frost does not build against upstream Servo. It builds against Freezer,
+its own engine codebase, which lives at `freezer/` inside this repo (a
+**nested git repo** — it has its own `.git`, is gitignored by the frost
+repo, and is never committed into it). Freezer started life as a Servo
+fork so Frost could move on its own schedule; in Round 23 (2026-11-17)
+it was cut loose from Servo's git entirely — the upstream remote is
+gone, the history was squashed into a single commit, and Freezer is
+developed on its own from here. Engine fixes land as Freezer commits.
 
-> **Cargo gotcha (2026-11-12):** `servo/` is also a nested *workspace*.
+> **Cargo gotcha (2026-11-12):** `freezer/` is also a nested *workspace*.
 > Cargo resolves a path dependency nested inside a workspace directory
 > against the OUTER workspace root unless the inner one is excluded — so
-> without `exclude = ["servo"]` in the frost root `Cargo.toml`,
+> without `exclude = ["freezer"]` in the frost root `Cargo.toml`,
 > `components/servo` inherits `rust-version`/`edition`/`license` from the
 > frost root (wrong: edition 2021 instead of 2024, no `rust-version`) and
 > manifest loading fails with "`workspace.package.rust-version` was not
 > defined". The `exclude` line is load-bearing; do not remove it.
+
+## Getting Freezer
+
+Freezer travels with the frost repo on the build machine — it is NOT in
+the delivery zip and NOT in the GitHub snapshot (both exclude the nested
+repo). A machine that has only the zip or a snapshot checkout cannot
+build until a Freezer tree is placed at `./freezer/`. There is no
+recreation script any more: `clone-fork.sh` (shallow-clone upstream
+Servo v0.8.0 + apply the patches) was retired in Round 23 when the
+fork was cut loose. The 15 changes themselves are still recorded in
+`patches/` (see below) — re-applying them to a fresh Servo 0.8.0
+checkout by hand would be the recovery path if the tree were ever lost.
 
 ## Fork point
 
@@ -22,13 +37,11 @@ fork commits instead of a permanent pile of `git apply` diffs.
 | Upstream | `servo/servo`, tag **v0.8.0** |
 | Commit | `4e136d8ef31b7c4748fbfac606ca463f3efd7537` ("backport: release: Disable publishing of servo-svg (#49628)") |
 | Clone | `git clone --depth 1 --branch v0.8.0 https://github.com/servo/servo servo` |
-| Toolchain pinned by the fork | Rust **1.99.1** (`servo/rust-toolchain.toml`) |
+| Toolchain pinned by Freezer | Rust **1.99.1** (`freezer/rust-toolchain.toml`) |
+| Cut loose | Round 23 (2026-11-17): upstream remote removed, 15 patch commits squashed into Freezer commit `597be6e`. No upstream any more. |
 
-The clone is shallow. Full history later with:
-
-```bash
-git -C servo fetch --unshallow
-```
+The old fork was a shallow clone. That history is gone with the
+squash — the single Freezer commit is the whole record now.
 
 ## Patches applied as fork commits
 
@@ -39,10 +52,12 @@ and the ninth is F-009 (Round 16), the tenth is F-010 (Round 17),
 and the eleventh is F-011 (Round 18), the twelfth is F-012 (Round 19),
 and the thirteenth is F-013 (Round 20), and the fourteenth is F-014
 (Round 21), and the fifteenth is F-015 (Round 22).
-Each was verified with `git apply --check` against this
-fork point before applying, one commit per patch. The patch files are
-vendored in `patches/` so the fork is reproducible from this repo alone
-(`./clone-fork.sh`).
+Each was verified with `git apply --check` against the fork point
+before applying, one commit per patch in the old fork. In Round 23 the
+fork was cut loose and those 15 commits were squashed into the single
+Freezer commit `597be6e`; the table below is the record of what each
+patch did. The patch files are vendored in `patches/` as the historical
+record of each change.
 
 | Commit | Patch | What it does |
 |---|---|---|
@@ -81,21 +96,9 @@ deaae1393 fork: apply keypress charcode patch (0.8)
 4e136d8ef backport: release: Disable publishing of servo-svg (#49628)
 ```
 
-## Clone quirk (sandbox, 2026-11-12)
+## Planned Freezer work (engine gaps Frost will close itself)
 
-The first shallow clone reported `fatal: unable to checkout working tree`
-and left an **empty index** (`git ls-files` returned 0, every file staged
-as deleted). Recovered with:
-
-```bash
-git read-tree HEAD && git checkout -- .
-```
-
-`clone-fork.sh` detects this state and recovers automatically.
-
-## Planned fork patches (Servo gaps Frost will close itself)
-
-These are NOT in the fork yet — they are the plan, so the work is scoped
+These are NOT in Freezer yet — they are the plan, so the work is scoped
 before it is needed. Each gets its own commit when built.
 
 | ID | Gap | Plan |
@@ -109,12 +112,10 @@ before it is needed. Each gets its own commit when built.
 | **F-007** | No way to force a layout reflow at an unchanged viewport (the real full-repaint trigger; F-005 only re-sends the viewport). Standing repro (finish pass 2026-11-13): the keytest page (`file://…/keytest.html`) never paints its body on load or reload — see ARCHITECTURE.md. **ROOT CAUSE FOUND 2026-11-14 (Round 4): not a reflow problem at all.** Instrumented paint-thread logging proved the display lists arrive complete (2046 bytes, viewport 1280×684) and WebRender renders the full frame once — then only dirty regions. The damage-rects patch had set `max_partial_present_rects: 1` (partial present), whose contract requires the embedder to keep its own full-frame backing buffers; Frost reads the GL back buffer wholesale and `Painter::render` clears it first, so every frame after the first is white except the dirty regions. **LANDED 2026-11-14 (Round 4, commit `f4886bf57`): `max_partial_present_rects: 0` — full present, the upstream default. No new reflow hook was needed; the Round 2 resize jiggle is RETIRED (Round 4 gate: keytest paints fully on load AND reload with no jiggle).** | Add a fork hook that forces the constellation to reflow the pipeline at the current viewport, so the jiggle can finally retire. |
 | **F-008** | A navigation stuck at the constellation cannot be aborted: F-001's `stop()` only reaches the CURRENT pipeline (`handle_stop_msg` → `ScriptThreadMessage::Stop`), and the embedder cannot name the pending pipeline to abort it (`handle_abort_load_url_msg` exists script-side only). **LANDED 2026-11-14 (Round 4, commit `f9462dbb7`): `handle_stop_msg` now also drains the webview's pending session-history changes for the top-level browsing context and closes their pipelines — Stop aborts both the current load AND any pending navigation. No new message type; the app calls the same `stop()`.** **App-side companion (Round 4, `crates/frost/src/main.rs`): the app now sets `loading = true` at the moment a navigation is requested (address-bar submit, Back, Forward, Reload, `load_loopback`) instead of waiting for `LoadStarted`. Servo only reports `LoadStatus::Started` when a new Document is initialized — which needs the first response bytes — so a server that never responds at all never fires `LoadStarted`, and without this the Stop button (live only while `loading`) was dead for exactly the hang Stop is meant to escape. Gated 2026-11-14 (see README).** | Fold the pending-change abort into `stop()` (done) rather than a new `EmbedderToConstellationMessage`. |
 
-## Updating the fork
+## No upstream
 
-When a new upstream Servo release is worth tracking:
-
-1. `git -C servo fetch --unshallow` (once) then `git -C servo fetch origin`.
-2. Create a branch at the new tag, cherry-pick the fork commits on top.
-3. Re-run `git apply --check` for each patch in `patches/`; fix conflicts
-   in the fork, not in the patch files, and record what changed here.
-4. Re-run the smoke test (`cargo run -p frost-engine --example smoke`).
+Freezer has no upstream remote and no tracking branch. There is nothing
+to fetch or rebase against — new engine work is committed straight into
+`freezer/`. If a future Servo release is ever worth looking at, that is
+a manual porting job, not a merge. Re-run the smoke test after engine
+changes (`cargo run -p frozen --example smoke`).
