@@ -3181,6 +3181,12 @@ the eye misses a frozen frame; 0.02% differ means frozen,
 sandbox; a watch-page run's first player is always thrown
 away. The plain 2 GB debug link still OOM-kills; the gate
 binary is linked with `-C link-arg=-Wl,--strip-debug`
-(522,337,704 B). Next: diagnose the post-steer stall —
-why a fully-buffered MSE element stops advancing a few
-seconds in with no error — then Frostbite hibernation.
+(522,207,832 B). Round 24 diagnosed the post-steer stall:
+the pipeline keeps playing but the position events stop
+reaching the script thread ~1.5 s in and flush in a burst
+~34 s later (F-016 logging) — the reload is refuted as the
+cause, and a separate intermittent metadata flake (full
+buffer, no `MetadataUpdated`, readyState 0) was found
+alongside it. No fix shipped; the fix needs a media-thread
+backtrace during the stall (no gdb in the sandbox). Next:
+Frostbite hibernation.

@@ -426,10 +426,57 @@ No new features — this round finishes what Round 3 left open:
   commit); `clone-fork.sh` retired; `frost-engine` is now `frozen`.
   Full suite 88/88; R18 probe 29/29, R19 probe ALL PASS, R20 probe ALL
   PASS; all regressions pass. No .deb, no push.
-- Stall diagnosis (pending, UNNUMBERED — Joel's call): why a
-  fully-buffered MSE element stops advancing a few seconds in on the
-  real watch page with no error (post-steer stall, not the R21
-  starvation). Then: Frostbite tab hibernation (needs a tab system
+- Round 24 (done 2026-11-17): stall diagnosis — Joel chose this
+  himself (tap ~10:24), after the Round 23 Freezer break-off took the
+  number. F-016 (freezer commit `b36a43729`) is logging only:
+  `StateChanged` now logs the state VALUE (the R21 comment claiming
+  `PlaybackState` does not derive `Debug` was wrong) and
+  `PositionChanged` (every 0.5 s) is now logged. Findings, all from
+  the F-016 instrumented run on the real watch page (no URL block):
+  the steer works (fMP4-only appends, itag 134 + 140, drains
+  `pushed=1`, `dropped=0`, buffered 18.93 / 19.06, `MetadataUpdated`
+  320x240, `DurationChanged` 19.064s); the player reaches `Playing`
+  and the pipeline DOES keep playing — but the position events stop
+  reaching the script thread ~1.5 s in (last `PositionChanged`
+  1.51 s) and then flush in a single burst ~34 s later (2.01 →
+  18.60, then the 290.82 post-EOS artifact, `EndOfStream`,
+  `Stopped`). The UI freezes at 0:01 because `currentTime` never
+  advances, not because the pipeline stalls. The `&themeRefresh=1`
+  self-reload is REFUTED as the cause: a local repro page that
+  attaches a starved player (played or not) and reloads after 5 s
+  plays through on the next load (currentTime 1.00 → 12.15, NO
+  STALL, two of three runs). The player then retries with a fresh
+  MediaSource (player 3, re-appends all segments) but that retry
+  hits the separate intermittent metadata flake (below) and the
+  video area goes black. The itag-18 progressive fallback the player
+  requests gets HTTP 403s from YouTube — that is YouTube refusing
+  the sandbox IP, not our bug. R20 probe ALL PASS on the Round 24
+  tree (playing, currentTime 0.00 → 2.51, decoded frame). Full suite
+  88/88 (frost 54 / frozen 18 / extensions 8 / inspector 8); R18
+  probe 29/29 ALL PASS, R19 probe ALL PASS; youtube.com loads with
+  0 SendRequest/PROTOCOL_ERROR; local H.264 plays to the end
+  (t=5.00, SMPTE bars); plain-video WebM plays (currentTime
+  0.00 → 3.01); homepage + banner, Ctrl+K, split view, menu,
+  Freeze, Settings persist, Inspector F12 all pass.
+  No fix shipped: the fix (why the script thread stops draining
+  media events for ~34 s while staying alive for CSS/net work) is
+  not a small proven change — it needs a media-thread backtrace
+  during the stall (no gdb in the sandbox) or an event-priority
+  investigation, so this round delivers the diagnosis + fix plan.
+  No .deb, no push.
+- Second bug found in this round (separate from the stall, needs
+  its own fix): the intermittent metadata flake — a player whose
+  drains all push (`pushed=1`, `dropped=0`, buffered full
+  18.93 / 19.06) sometimes never gets `MetadataUpdated` (readyState
+  stays 0, networkState 2, no error, state stuck at `Paused`).
+  Seen 4 times in Round 24 (reload-probe load 2 once, watch player
+  3, both heavy-JS probe runs). The drain sequences in a failing
+  run are byte-identical to a passing run, so it is a race inside
+  the pipeline/media thread, not a data problem. It also kills the
+  watch page's retry. The heavy-JS saturation test (does a
+  saturated script thread stall media events?) was inconclusive —
+  both attempts flaked before playback started.
+- Next: Frostbite tab hibernation (needs a tab system
   first), Snowdrift workspaces (needs tabs + sessions +
   persistence — biggest). Inspector v2 (docked panel,
   click-to-inspect, live updates, console) stays

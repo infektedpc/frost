@@ -1815,13 +1815,167 @@ before believing a freeze or a scroll.
 - **The YouTube watch page does not play through in the
   sandbox.** It starts, renders decoded frames, advances a
   few seconds, then freezes with a full buffer and no
-  error. The cause is undiagnosed; the next round's job is
-  to find it. His box is the real test for whether the
-  stall reproduces outside the sandbox — do NOT claim it
-  plays there.
+  error. Round 24 diagnosed it (see below) — the pipeline
+  keeps playing but the position events stop reaching the
+  script thread; no fix shipped. His box is the real test
+  for whether the stall reproduces outside the sandbox — do
+  NOT claim it plays there.
 - Seeking is still unsupported (R19 limit). Hardware decode
   is still a later stage (after MSE works).
 - The audio in the R20 test segments is re-containerized
   (ffmpeg stream-copy of itag 140 — AAC sample data
   byte-identical, box structure regenerated); the video is
   untouched real DASH.
+
+## Round 24 — stall diagnosis (F-016, no fix shipped)
+
+Joel chose this himself (tap 2026-11-17 ~10:24), after the Round 23
+Freezer break-off took the number. F-016 is logging only (freezer
+commit `b36a43729`): `StateChanged` now logs the `PlaybackState`
+value — it derives `Debug`, so the R21 comment in
+`htmlmediaelement.rs` claiming otherwise was wrong — and
+`PositionChanged` (every 0.5 s, `config.set_position_update_interval(500)`
+in the GStreamer player) is now logged. No behavior change.
+
+### What the stall actually is (F-016 instrumented run, real watch page)
+
+One fresh-Frost run, no URL block, "Me at the zoo":
+
+- Player 1 (pre-reload): attach, `NeedData`, `addSourceBuffer`
+  audio + video, no appends. The page reloads itself with
+  `&themeRefresh=1`; player 1 is discarded.
+- Player 2: attach, appends fMP4-only (itag 134 + 140), drains
+  `pushed=1 chunks, dropped=0`, buffered [(0.0, 18.93)] video /
+  [(0.0, 19.06)] audio, `MetadataUpdated … 320x240 format=ISO fMP4`,
+  `DurationChanged 19.064s`, `StateChanged` Buffering → Paused →
+  Buffering → Paused → Paused → **Playing**. Decoded frame renders,
+  0:01/0:19, pause icon showing.
+- Then the position events STOP: `PositionChanged` 0.50, 1.00, 1.51
+  at 17:54:29–30, then nothing for ~34 s. Two screenshots 20 s
+  apart are 0.05% different — the frame is frozen at 0:01.
+- At 17:55:04 the queued events flush in one burst:
+  `PositionChanged` 2.01 → 18.60 (33 updates, all logged in the
+  same second), then the 290.82 post-EOS artifact (see below),
+  `EndOfStream`, `StateChanged Stopped`. The pipeline played the
+  whole video; the script thread just did not see it until the end.
+- The script thread was NOT dead during the gap: CSS parse-error
+  lines (`script::dom::window::window` `Url:`) appear at 17:54:31,
+  17:54:49, 17:54:55, and the net thread kept working (SABR, a
+  `youtubei/v1/log_event` POST at 17:55:02 — the player's own stall
+  telemetry). But those CSS lines come from the style threads, so
+  they do not prove the script thread itself was draining its media
+  queue. The media events queue up (in the script thread's incoming
+  channel) and are drained all at once when the block clears.
+- The player then retries: a third `MediaSource` attaches at
+  17:57:14, re-appends all segments (buffered full again by
+  17:57:40) — but player 3 hits the metadata flake (below) and
+  never reaches `Playing`; the video area goes black.
+- The player also requests the itag-18 progressive fallback at
+  playback start and again at the burst; YouTube answers all of
+  them with HTTP 403 (the sandbox IP is refused). That is YouTube's
+  doing, not our bug — and it is why the fallback cannot save the
+  retry. (The same 403s appeared in Round 20.)
+
+Conclusion: the stall is an **event-delivery block**, not a pipeline
+stall. The pipeline plays; the position updates (and, by the frozen
+paint, the video frames) are not delivered to the script thread for
+~34 s. No player error, no GStreamer error, no `not-negotiated`,
+no seek warning — the element simply never learns the clock moved.
+
+### Leads ruled out
+
+- **The `&themeRefresh=1` reload (prime lead, REFUTED).** A local
+  repro page (`r13-test/r24-media/reload-probe.html`) attaches a
+  starved player, waits 5 s, then `location.replace`s to
+  `?themeRefresh=1`, where a second player runs the full R20 flow.
+  Three runs: load 2 played through twice (currentTime 1.00 →
+  12.15, NO STALL, decoded frame) — once with load 1 never calling
+  `play()`, once with load 1 calling `play()` (muted, starved).
+  A discarded first player, played or not, does not stall the next
+  one in this form. (The third run hit the metadata flake instead.)
+- **Audio-sink stall (already refuted in R22).** Same segments
+  played unmuted in a probe past 7.5 s in real time.
+- **R21 starvation (not this).** There `pushed=0` in every drain;
+  here `pushed=1, dropped=0` throughout.
+
+### Second bug found: the intermittent metadata flake
+
+A player whose drains all push (`pushed=1`, `dropped=0`, buffered
+full 18.93 / 19.06) sometimes never gets `MetadataUpdated`:
+readyState stays 0, networkState 2, no error, state stuck at
+`Paused`, no `Playing`, no positions. Seen 4 times in Round 24
+(reload-probe load 2 once, watch player 3, both heavy-JS probe
+runs). The drain sequences in a failing run are byte-identical to
+a passing run (same order, same byte counts, same buffered ranges),
+so it is a race inside the pipeline/media thread, not a data
+problem. It also kills the watch page's retry. It needs its own
+diagnosis; it is not the stall's cause (the stalling player 2 DID
+get metadata).
+
+### Inconclusive: heavy-JS saturation test
+
+A local probe (`r13-test/r24-media/js-stall-probe.html`) plays the
+R20 segments while a 0 ms timer does ~6 ms of busy work per tick
+plus a rAF DOM-churn loop, to test whether a saturated script
+thread stalls media-event delivery the way the watch page does.
+Both attempts flaked (metadata, before playback started), so the
+test neither confirms nor refutes script-thread saturation. The
+question — blocked (deadlock/wait) vs spinning (JS saturation) —
+is still open; answering it needs a media-thread backtrace during
+the stall, and there is no gdb in the sandbox.
+
+### The 290.82 position (post-EOS artifact, not a signal)
+
+After the last real position (~18.6 s) the pipeline reports
+`PositionChanged position=290.82`, immediately before `EndOfStream`
++ `Stopped`. The same value appears in the working R20 probe (after
+18.66, before `EndOfStream`). It is a reproducible GstPlay
+position-query quirk at end-of-stream, present in working runs too
+— do not read it as a seek or a stall signal.
+
+### Fix plan (not built — the fix is not small and proven)
+
+1. Get a backtrace of the script thread and the media thread
+   DURING the stall (attach gdb to the Frost process ~5 s after
+   `Playing`, while `PositionChanged` has stopped). That names the
+   wait: a lock, a channel, or a JS frame. No gdb exists in the
+   sandbox, so this is a job for a machine with gdb — or for
+   adding a watchdog that dumps thread backtraces on a media-event
+   stall (a real feature, not a one-off).
+2. Depending on what the backtrace shows:
+   - If the script thread is parked on a lock/channel the media
+     thread holds (or vice versa): break the cycle — do not hold
+     the observer mutex across a send, or move media-event
+     delivery off the script thread's main task queue.
+   - If the script thread is spinning in YouTube's JS: the media
+     events need priority over page timers (a separate media-event
+     queue drained ahead of timer tasks), or the page's JS needs
+     yielding — both are engine-level scheduling work, not a
+     one-line fix.
+3. Separately, diagnose the metadata flake: log the pipeline's
+   state-change completion and the appsrc need-data/enough-data
+   signals at the GStreamer level, and find which step fails to
+   fire when `MetadataUpdated` never arrives. The identical
+   drain sequences say the bytes arrive; the pipeline just
+   sometimes never parses them.
+4. Re-gate on the real watch page (two fresh-Frost runs, currentTime
+   past 0:02 with pixel-diff proof) once a fix lands. Note the
+   watch page now bot-checks the sandbox IP intermittently (two
+   consecutive runs on 2026-11-17 hit "Sign in to confirm you're
+   not a bot"); a watch gate may need a retry or a different
+   video.
+
+### Regression gates (Round 24 tree, F-016)
+
+Full suite 88/88 (frost 54 / frozen 18 / extensions 8 / inspector 8).
+R18 probe 29/29 ALL PASS. R19 probe ALL PASS. R20 probe ALL PASS
+(playing, currentTime 0.00 → 2.51, decoded frame). youtube.com loads
+with 0 SendRequest/PROTOCOL_ERROR (dark skeleton). Local H.264 plays
+to the end (t=5.00, 00:05/00:05, SMPTE bars). Local VP9+Opus `.webm`
+via plain `<video src>` plays (ALL PASS, currentTime 0.00 → 3.01,
+decoded frame). Homepage + banner (example.org + sample banner),
+Ctrl+K palette, split view both panes, menu (dynamic "Close split
+view"), Freeze archive (correct example.org archive + index.json —
+the filename uses the stale "YouTube" window title, cosmetic),
+Settings persist (fresh launch opens on example.com), Inspector F12
+(35 nodes) — all pass. No .deb, no push.
