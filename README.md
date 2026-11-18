@@ -3378,3 +3378,59 @@ nodes). Next: Round 28 — re-gate until the F-018 WARN fires
 with a player URL, and instrument the bootstrap chain
 (document-start errcap) to find what triggers `browse`
 (see DIAGNOSIS.md).
+
+## Round 28 — bootstrap instrumentation (document-start errcap) + IO latency fix (F-019)
+
+Joel chose this round 2026-11-18 ("then go ahead with round 28").
+Headline: **the feed is STILL stalled — `youtubei/v1/browse`
+fires 0x in every run — but two of the three leads closed with
+hard evidence, and the third got sharper.** Full detail in
+`DIAGNOSIS.md` (Round 28 section).
+
+Shipped (F-019, Freezer): `maybe_compute_intersection_output`
+now returns `Option` — layout-unavailable yields `None`
+instead of a false "not intersecting"; the caller retries at
+the next rendering opportunity while the document is still
+loading, and the Step 2 delay check is a per-target `continue`
+(not a whole-function `return`). Shipped (frost-side): the
+errcap is now v0.3.0 "R28 Error Capture", injected at
+document-start on a new `EngineEvent::HeadParsed` (was dropped),
+with ms timestamps on every line, `readystatechange` logging,
+`sendBeacon` wrapping, and fetch/XHR outcome logging
+(`FETCH-OK` / `FETCH-ERR` / `FETCH-THROW` incl.
+`signal.aborted`).
+
+Lead 3 (IO latency): **FIXED on the local probe** — IO1 fires
+#1 at 97.5 ms with `isIntersecting=true ratio=1` (was: false
+at 191 ms, true only at 2,078 ms), in the same rendering update
+as rAF (89.6/90.2 ms). But the errcap's own IO probe on the
+real YouTube page still logs `NOT FIRED after 5s` — the
+real-page stall is a different mechanism from the false-initial
+bug, and is the Round 29 lead.
+
+Lead 1 (F-018 WARN): **it fired — 6x — but on videoplayback,
+not the player POST.** All six name
+`rr5---sn-hgn7rnll.googlevideo.com/videoplayback?...&itag=18`:
+4x ConnectionReset, 2x TLS-EOF. The R26 hypothesis (player
+POSTs die with TLS EOF) is REFUTED as the feed mechanism — the
+player POST never reaches http_loader at all. The videoplayback
+deaths are a real, separate connection problem.
+
+Lead 2 (bootstrap): the document-start errcap works — the
+banner captures the app's calls with outcomes from +5 ms
+(`READY readyState=loading`, rIC fired at +18 ms, icon
+FETCH-OK 200s, log_event XHR-OK 200). The app's fetch/XHR
+layer works and rIC fires promptly, yet the app never attempts
+`browse` in 300 s. What it waits on is still unknown.
+
+Full test suite 89/89 (frost bin 54 / frozen 18 / extensions 9
+— +1 new DocumentStart test / inspector 8) plus servo-config
+3/3. All regression gates pass (R18 ALL PASS, R19 ALL PASS,
+R20 real DASH ALL PASS, youtube.com document 200 with 0
+SendRequest, local H.264 to end 5.00 + EndOfStream, plain WebM
+ALL PASS to 3.01, homepage + banner, palette, split view, menu,
+Freeze archive + index.json correct, Settings Snowplow: Off
+persists, Inspector F12 35 nodes). No panics in any gate log.
+No .deb, no push in this round. Next: Round 29 — why IO still
+doesn't fire on the real page, and what triggers `browse`
+(see DIAGNOSIS.md).

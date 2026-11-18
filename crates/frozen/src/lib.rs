@@ -166,6 +166,12 @@ pub enum EngineEvent {
     UrlChanged(WebViewId, Url),
     LoadStarted(WebViewId),
     LoadFinished(WebViewId),
+    /// The `<head>` has been parsed (0.8.0's `LoadStatus::HeadParsed`):
+    /// the document exists and `document.body` is available, but page
+    /// scripts after the head have not run yet. Round 28 surfaces it so
+    /// `DocumentStart` content scripts can run before the page's own
+    /// bootstrap caches references (e.g. to `window.fetch`).
+    HeadParsed(WebViewId),
     /// The load was stopped before completing (0.8.0's `LoadStatus::Stopped`).
     LoadStopped(WebViewId),
     FrameReady(WebViewId),
@@ -305,9 +311,9 @@ impl WebViewDelegate for FrostDelegate {
             // window.stop() inside the page). Surfaced as its own event
             // so the UI can tell "stopped" from "finished".
             LoadStatus::Stopped => EngineEvent::LoadStopped(id),
-            // HeadParsed is not surfaced: the UI only cares about
-            // started/finished/stopped.
-            LoadStatus::HeadParsed => return,
+            // Round 28: HeadParsed is surfaced so DocumentStart content
+            // scripts can run before the page's bootstrap scripts.
+            LoadStatus::HeadParsed => EngineEvent::HeadParsed(id),
         };
         let _ = self.tx.send(event);
     }

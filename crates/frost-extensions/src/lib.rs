@@ -528,6 +528,23 @@ mod tests {
     }
 
     #[test]
+    fn document_start_run_at_parses() {
+        // Round 28: the errcap runs at DocumentStart (HeadParsed) so it
+        // wraps fetch before the page's bootstrap caches its reference.
+        let dir = std::env::temp_dir().join("frost-ext-test-docstart");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_manifest_dir(
+            &dir,
+            r#"{"name":"Start Script","version":"0.3.0","content_scripts":[{"matches":["*://example.org/*"],"js_file":"content.js","run_at":"DocumentStart"}]}"#,
+            &[("content.js", "window.__start = true;")],
+        );
+        let m = ExtensionManifest::load_from_dir(&dir).unwrap();
+        assert_eq!(m.content_scripts[0].run_at, RunAt::DocumentStart);
+        assert_eq!(m.content_scripts[0].js, "window.__start = true;");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_from_dir_fails_cleanly_on_bad_manifest_and_missing_js() {
         // Not JSON at all.
         let dir = std::env::temp_dir().join("frost-ext-test-bad-json");

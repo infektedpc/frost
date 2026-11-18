@@ -16,7 +16,7 @@ use frozen::{
     Engine, EngineEvent, FrostCode, FrostInputEvent, FrostKeyState,
     FrostMouseButtonAction, FrostWebView, WebViewId, MAX_SYNC_UPLOAD_BYTES,
 };
-use frost_extensions::{ExtensionHost, ExtensionManifest, StubHost};
+use frost_extensions::{ExtensionHost, ExtensionManifest, RunAt, StubHost};
 use frost_inspector::{snapshot_from_json, DOM_WALK_SCRIPT};
 use url::Url;
 
@@ -520,6 +520,9 @@ struct Pane {
     /// URL content scripts were last injected for; a new navigation
     /// clears it so the new page gets its scripts.
     injected_for: Option<String>,
+    /// URL `DocumentStart` content scripts were last injected for
+    /// (Round 28: HeadParsed pass). A new navigation clears it.
+    injected_start_for: Option<String>,
 }
 
 impl Pane {
@@ -539,6 +542,7 @@ impl Pane {
             awaiting_load: true,
             loading_since: Some(std::time::Instant::now()),
             injected_for: None,
+            injected_start_for: None,
         }
     }
 
@@ -1022,6 +1026,7 @@ impl Frost {
             | EngineEvent::LoadStarted(id)
             | EngineEvent::LoadFinished(id)
             | EngineEvent::LoadStopped(id)
+            | EngineEvent::HeadParsed(id)
             | EngineEvent::FrameReady(id)
             | EngineEvent::ResourceBlocked(id, _)
             | EngineEvent::Crashed(id, _) => *id,
@@ -1032,7 +1037,9 @@ impl Frost {
         let is_active = index == self.active_pane;
         // A LoadFinished also (re-)injects this pane's content
         // scripts — after the match, once the pane borrow ends.
+        // A HeadParsed injects only the DocumentStart scripts.
         let mut inject_after = false;
+        let mut inject_start_after = false;
         let pane = &mut self.panes[index];
         match event {
             EngineEvent::TitleChanged(_, title) => {
@@ -1068,6 +1075,7 @@ impl Frost {
             },
             EngineEvent::LoadStarted(_) => {
                 pane.injected_for = None;
+                pane.injected_start_for = None;
                 // Round 13: a new page starts with a clean Snowplow count.
                 pane.snowplow_blocked = 0;
                 let url = pane
@@ -1098,6 +1106,11 @@ impl Frost {
             EngineEvent::LoadStopped(_) => {
                 pane.mark_settled("Stopped.".to_string());
             },
+            EngineEvent::HeadParsed(_) => {
+                // Round 28: the document exists now; run DocumentStart
+                // scripts before the page's own bootstrap scripts run.
+                inject_start_after = true;
+            },
             EngineEvent::ResourceBlocked(_, _url) => {
                 // Round 13: a real count from the delegate, one event
                 // per cancelled request. The status line shows it
@@ -1113,6 +1126,9 @@ impl Frost {
         }
         if inject_after {
             self.inject_content_scripts(index);
+        }
+        if inject_start_after {
+            self.inject_start_scripts(index);
         }
     }
 
@@ -1500,22 +1516,62 @@ impl Frost {
     }
     /// Runs once per URL, on LoadFinished (and on the 15 s safety
     /// net, for history traversals that never fire LoadFinished).
-    /// `DocumentStart` scripts cannot run at document start (no
-    /// navigation hook in the engine yet), so v1 runs every script
-    /// at load finish; the sample extension uses `DocumentIdle`
-    /// and is unaffected. Round 7: there are no internal pages
-    /// any more, so every URL the engine loads is a real page —
+    /// Runs every script EXCEPT `DocumentStart` ones that already ran
+    /// at HeadParsed — those are re-run here only if HeadParsed never
+    /// fired for this URL (fallback, so a missed HeadParsed does not
+    /// silently drop a start script). Round 7: there are no internal
+    /// pages any more, so every URL the engine loads is a real page —
     /// the old `frost://` / loopback guard is gone.
     fn inject_content_scripts(&mut self, index: usize) {
+        self.inject_content_scripts_filtered(index, false);
+    }
+
+    /// Runs once per URL, on HeadParsed: only `DocumentStart` scripts,
+    /// so they execute before the page's own bootstrap scripts run
+    /// (Round 28: wrapping `window.fetch` at load finish is too late —
+    /// the app has already cached its own reference).
+    fn inject_start_scripts(&mut self, index: usize) {
+        self.inject_content_scripts_filtered(index, true);
+    }
+
+    fn inject_content_scripts_filtered(&mut self, index: usize, start_only: bool) {
         let Some(url) = self.panes[index].webview.url().map(|u| u.to_string()) else {
             return;
         };
-        if self.panes[index].injected_for.as_deref() == Some(url.as_str()) {
-            return;
+        if start_only {
+            if self.panes[index]
+                .injected_start_for
+                .as_deref()
+                .is_some_and(|u| u == url.as_str())
+            {
+                return;
+            }
+            self.panes[index].injected_start_for = Some(url.clone());
+        } else {
+            if self.panes[index]
+                .injected_for
+                .as_deref()
+                .is_some_and(|u| u == url.as_str())
+            {
+                return;
+            }
+            self.panes[index].injected_for = Some(url.clone());
         }
-        self.panes[index].injected_for = Some(url.clone());
+        // In the finish pass, a DocumentStart script that already ran
+        // at HeadParsed must not run twice.
+        let start_ran = self.panes[index]
+            .injected_start_for
+            .as_deref()
+            .is_some_and(|u| u == url.as_str());
         let scripts = self.host.content_scripts_for(&url);
         for (_, script) in scripts {
+            let is_start = script.run_at == RunAt::DocumentStart;
+            if start_only && !is_start {
+                continue;
+            }
+            if !start_only && is_start && start_ran {
+                continue;
+            }
             self.panes[index].webview.evaluate_javascript(&script.js);
         }
     }

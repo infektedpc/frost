@@ -772,3 +772,248 @@ it will bite again if the round build keeps using
 4. **The R24 watch-page stall and metadata flake** are unchanged
    by this round (no fix was attempted for them here) and still
    await the backtrace on Joel's box.
+
+# Round 28 — bootstrap instrumentation (document-start errcap) + IO latency fix (F-019) + re-gate for the F-018 WARN
+
+## What shipped
+
+- **F-019 (freezer, `intersectionobserver.rs`) — the IO latency fix.**
+  `maybe_compute_intersection_output` now returns
+  `Option<IntersectionObservationOutput>`: `None` means layout
+  data is unavailable yet (the target has no box — the document
+  is still being parsed). The caller no longer queues the
+  `default_skipped()` value as a false "not intersecting" and no
+  longer touches `previous_*`; while `document.readyState ==
+  loading` it re-adds
+  `RenderingUpdateReason::IntersectionObserverStartedObservingTarget`
+  so the steps re-run at the next rendering opportunity (~20 ms
+  later). Once parsing is done a missing box is permanent (e.g.
+  `display:none`) and the skipped value stands — no infinite
+  retry. Also fixed the Step 2 delay check: the spec says skip
+  further processing *for target*; the old `return` aborted the
+  steps for every remaining target of the observer (now
+  `continue`).
+- **Document-start errcap (frost + frozen + extensions).**
+  New `EngineEvent::HeadParsed(WebViewId)`, mapped from
+  `LoadStatus::HeadParsed` (was dropped in `crates/frozen`).
+  `app.rs` injects DocumentStart scripts on HeadParsed via new
+  `inject_start_scripts` / `inject_content_scripts_filtered`
+  (the finish pass skips start scripts already run at HeadParsed,
+  re-runs them as fallback if HeadParsed never fired).
+  `extensions/r25-errcap/` v0.3.0, `run_at: "DocumentStart"`,
+  name "R28 Error Capture": content.js timestamps every line
+  with ms since install, logs `readystatechange` transitions,
+  wraps `navigator.sendBeacon`, and logs fetch/XHR outcomes
+  (`FETCH-OK` / `FETCH-ERR` / `FETCH-THROW` incl.
+  `signal.aborted`, `XHR-OK/ERROR/ABORT/TIMEOUT`). One new unit
+  test (`document_start_run_at_parses`) — suite is now **89/89**
+  (frost bin 54, frozen 18, extensions 9, inspector 8) +
+  servo-config 3/3.
+
+## Lead 3 — IO latency: FIXED, and the mechanism is proven
+
+Probes `r13-test/r25-feed/p11-raf-io.html`, `p11b-raf-io.html`
+(timed, counts firings). Pre-fix (R27 binary, 4 runs): rAF
+fires promptly (~90–173 ms) in the first
+`update_the_rendering`; the first IO callback fires late and
+reports a **false** `isIntersecting=false` for a visible target
+(R27: 2,069 ms; R28 run 3: 2,015 ms; R28 run 1: never by 12 s),
+and the TRUE value only arrives at ~2,078 ms (15 ms after the
+2,000 ms setTimeout fires) — count=2, i.e. the app gets a false
+initial entry and then a correction. A second observer created
+after settle fires in 15–79 ms. Root cause, traced in code: at
+the first update layout isn't ready,
+`border_box_without_reflow()` returns None,
+`maybe_compute_intersection_output` returned
+`default_skipped()` (NotMatching/false), which differs from the
+registration's initial (None/false), so step 18 queues a FALSE
+initial entry; the reason bit was already cleared, so nothing
+re-runs the IO steps until an unrelated event (timer/DOM
+change) triggers another rendering update.
+
+Post-fix gate (F-019 binary, `r28-p11b2.jpg` + Inspector
+`r28-p11b2-insp5.jpg`, log `r28-gate-p11b2.log`): **IO1 fires
+#1 at 97.5 ms with `isIntersecting=true ratio=1`** — the false
+initial entry is gone, first notification is true and lands in
+the same rendering update as rAF (RAF1 89.6 ms, RAF2 90.2 ms).
+The second IO1 firing at 2,068 ms is legitimate: the page's
+own 2,000 ms timer moves the sentinel below the fold
+(`marginTop 900px`), so true → false is a real transition;
+IO2 (created at 2,005 ms) fires at 2,071 ms. IO latency:
+**2,069 ms → ~97 ms**, and correct. One run-to-run variance
+remains unexplained: the pre-fix run 1 never fired IO1 by
+12 s while run 4 fired false at 191 ms — first-load observer
+delivery is racy in a way the counted run does not fully
+explain; F-019 removes the false value, but the never-fired
+case is not proven fixed.
+
+## Lead 1 — F-018 WARN re-gate (pre-build, R27 binary)
+
+YouTube 300 s, Snowplow OFF, log `r28-gate-yt-pre.log`,
+shots `r28-yt-30s/105s/300s.jpg`: **0 network errors in
+300 s.** The TLS-EOF / player-POST hypothesis remains
+UNTESTED (R26's 8 WARNs recurred in neither R27's 105 s nor
+this 300 s run). Engine log: browse 0, player 0, guide 2,
+log_event 10. But the banner showed a player POST attempt
+(`FETCH: POST https://www.youtube.com/youtubei/v1/player?key=...`)
+— the R26 finding reproduced: the fetch is attempted
+page-side but never reaches http_loader. Sharpened by this
+run: videoplayback GETs DO reach the engine (22 hits, 403
+responses — YouTube bot-checking the sandbox IP),
+fonts.gstatic 333, googleads 9. **The player POST is the
+ONLY request type that never arrives.** guide/log_event
+POSTs arrive; videoplayback/fonts GETs arrive. The R28
+errcap's new FETCH-ERR outcome logging is the decisive probe
+for whether the player fetch rejects (e.g. AbortError) or
+never settles.
+
+## Lead 2 — document-start errcap gate: WORKS, feed still stalled
+
+YouTube 300 s, Snowplow OFF, F-019 binary + R28 errcap, log
+`r28-gate-yt2.log`, shots `r28-yt2-105s/300s.jpg`. The
+document-start injection is proven working: the banner shows
+`R28-ERRCAP active. IO=function RIC=function SCH=undefined
+postTask=n/a SW=undefined VIS=visible`, `+5ms READY
+readyState=loading`, `+18ms RIC-CB: fired
+timeRemaining=49.779749 didTimeout=false` — injection lands
+before the app's bootstrap, and rIC fires promptly. The banner
+now captures the app's calls with outcomes from the start:
+`FETCH-OK: 200` lines for gstatic/fonts icon SVGs (a batch at
+~+136 s), `XHR-OK 200: /youtubei/v1/log_event?alt=json` as the
+latest line (+205 s). Yahoo 90 s (`r28-yahoo-90s.jpg`, log
+`r28-gate-yahoo.log`) likewise: banner shows FETCH/XHR lines
+with `signal.aborted=false` for the app's ad-tech POSTs
+(pbs.yahoo.com cookie_sync + openrtb2/auction,
+hbopenbid.pubmatic.com, udc.yahoo.com, trc.taboola.com
+FETCH-OK 200, securepubads.g.doubleclick.net FETCH-OK 200) —
+all succeeding; page renders styled with a real hero + Trending.
+
+**But the feed is still stalled on both sites.** YouTube at
+300 s: browse 0, player 0, guide 4, log_event 16, feedback 2
+(engine log). Feed area empty, skeleton tiles only. Yahoo:
+hero + Trending render; "For You" below the fold,
+unverifiable (harness can't scroll) — same as R26/R27.
+
+**New, sharp data point — the IO probe still fails on the
+real page:** the errcap's own IntersectionObserver probe (a
+fixed 50×50 div at top:100px, observed at install) logs
+`+5010ms IO-CB: NOT FIRED after 5s (observer delivery broken
+on this page)` on YouTube — even WITH F-019, which fixed the
+local case to 97 ms. So the real-page IO stall is a different
+mechanism from the false-initial-entry bug: on the real page
+the observer callback does not fire at all within 5 s (whether
+it fires later was not established — the banner's later lines
+could not be read: the Inspector snapshot wedged on YouTube's
+DOM, "Capturing page structure..." for 3+ min, frame stale).
+Candidates: rendering updates not running the IO steps while
+the page is still loading, layout never becoming available
+during the long parse, or the re-added reason not waking the
+update loop. This is the Round 29 lead.
+
+**What the app is waiting on is still unknown.** The
+document-start errcap proves the app's fetch/XHR layer works
+(guide/log_event/feedback + icons all 200) and that rIC fires
+promptly — so the stall is not a missing idle API and not a
+dead fetch layer. The app simply never attempts `browse` in
+300 s, and in this run no player POST attempt appeared in the
+banner's visible window (the R28-pre run DID show one while
+the engine log showed player 0 — whether it was attempted in
+this run is NOT established, because the banner keeps only the
+last 40 lines and the full banner could not be read).
+
+## Lead 1 — F-018 WARN re-gate (F-019 binary): FIRED, but on videoplayback, not the player POST
+
+The 300 s YouTube run produced **6 network errors**, all
+naming `https://rr5---sn-hgn7rnll.googlevideo.com/videoplayback?...&itag=18&...`:
+4× `SendRequest, hyper::Error(Io, Kind(ConnectionReset))` and
+2× `SendRequest, ... UnexpectedEof, "peer closed connection
+without sending TLS close_notify"` (14:41:49–14:42:41Z).
+**This REFUTES the R26 hypothesis as the player-POST
+mechanism** — the dying requests are videoplayback GETs
+(itag 18, the progressive MP4 the app fetches), not the player
+POST, which never reaches http_loader at all and therefore
+cannot be dying there. The videoplayback deaths are a real,
+separate connection problem (YouTube's googlevideo servers
+resetting connections from the sandbox IP, or a reuse bug at
+the hyper/rustls layer) — worth a Round 29 look at
+connection reuse / retry for media GETs, but it is NOT the
+feed cause: the feed needs `browse`, which the app never
+attempts. The 105 s checkpoint had 0 network errors; the
+pre-build 300 s run (R27 binary) also had 0 — the WARN is
+intermittent, as R26's 8 WARNs were.
+
+## Regression (F-019 binary, all PASS)
+
+- R18 probe: **ALL PASS** (29/29, incl. F-015 steer lines).
+- R19 probe: **ALL PASS** (buffered [0.00–10.00], playing,
+  currentTime 1.50, decoded frame).
+- R20 real DASH ("Me at the zoo"): **ALL PASS** (buffered
+  [0.00–18.93]/[0.00–19.06], playing, currentTime 0.00→2.56,
+  decoded frame).
+- youtube.com: document `got 200`, **0 SendRequest on the
+  document request** (the 6 SendRequest errors are all
+  videoplayback subresources — see Lead 1).
+- Local H.264 to end: PositionChanged 0.50→5.00 +
+  EndOfStream, controls 00:05/00:05.
+- Plain WebM: **ALL PASS** (duration 3.049, currentTime
+  0.00→3.01).
+- Homepage/banner: example.org + "Frost sample extension is
+  live".
+- Palette (Ctrl+K): all commands listed; "Split view" chosen
+  from it.
+- Split view: two panes, both example.org.
+- Menu: Settings / Print / Open file / Inspector / Command
+  palette / Close split view / Freeze / Archived / Exit.
+- Freeze: archive `example-domain-20261118-1459.html`
+  (2,947 B) + index.json correct (title "Example Domain",
+  correct URL/filename — the R24 stale-title wart did not
+  recur); status "Frozen: Example Domain".
+- Settings persist: Snowplow toggled Off, "Settings saved.",
+  settings.json confirms `"snowplow": false`.
+- Inspector (F12): example.org, **35 nodes** (R25: 35,
+  R26: 33 — page-load variance; tree complete).
+
+Tests: **89/89** (frost bin 54, frozen 18, extensions 9,
+inspector 8) + servo-config 3/3. No panics in any gate log
+(YouTube 300 s, Yahoo 90 s, all regression runs). No
+`.deb`, no push in this round (per brief).
+
+Incidents: the VM rebooted mid-round (~14:16 UTC), killing
+a rebuild mid-link and Xvfb + the test servers; harness was
+rebuilt (Xvfb:97 + 18080/18099/18101, all serving r13-test)
+and the build resumed incrementally. The servers needed
+restarting with a subshell `(cd ... && ...)` — a bare `cd X
+&& cmd1 & cmd2 &` leaves cmd2 in the old cwd (18101 served
+/home/hatch and 404'd until fixed). The Inspector snapshot
+wedged on YouTube's DOM ("Capturing page structure..." 3+
+min, stale frame) — it cannot read the full errcap banner on
+a large page.
+
+## Leads for Round 29 (not diagnosed in this round)
+
+1. **IO delivery on the real page still doesn't fire within
+   5 s despite F-019** — the errcap probe proves it on
+   YouTube. Find why `update_the_rendering` doesn't deliver
+   the observer steps while the page loads (is the reason
+   re-add waking the loop? does layout stay unavailable for
+   the whole parse? do rendering updates even run during the
+   heavy bootstrap?). Instrument the IO steps (log when they
+   run per document, and what `maybe_compute_intersection_output`
+   returns) rather than guessing.
+2. **What triggers `browse` is still unknown.** The
+   document-start errcap proves fetch/XHR + rIC all work, so
+   the app is waiting on something else that never resolves.
+   Next: audit the app bundle for `typeof` guards the way
+   postTask was audited, and log the bootstrap promise chain
+   (which fetches the app makes in its first 30 s, in order —
+   the errcap's 40-line cap loses early lines, so raise the
+   cap or log to the engine).
+3. **videoplayback GETs die with ConnectionReset / TLS-EOF**
+   (6× in 300 s) — a real connection problem at the
+   hyper/rustls layer, separate from the feed. If it is
+   connection reuse, a retry-on-reset for idempotent media
+   GETs is the fix; if it is YouTube resetting the sandbox
+   IP, it may not reproduce on Joel's box.
+4. **The R24 watch-page stall and metadata flake** are
+   unchanged by this round (no fix was attempted for them
+   here) and still await the backtrace on Joel's box.
