@@ -470,3 +470,305 @@ navigation; the fixed build does not crash on the same path.
    by this round (no fix was attempted for them here) and still
    await the backtrace on Joel's box.
 
+
+# Round 27 — chase the browse trigger: URL in the network-error WARN (F-018) + what triggers `browse`
+
+Joel chose this round 2026-11-18 ("Onto round 27?"). Both Round 26
+leads were worked, in order. Headline: **the feed is STILL stalled
+— `youtubei/v1/browse` fires 0× in every run, and the trigger is
+still not found.** But both leads produced firm, checkable results:
+the WARN now names the URL (verified live), `scheduler.postTask`
+is ruled out by YouTube's own code, and the one remaining anomaly
+is that IntersectionObserver delivery is *slow* (seconds, not
+milliseconds) on every page — though 105 s of waiting still does
+not produce a feed, so latency alone is not the cause.
+
+## What shipped
+
+- **F-018 (freezer, one line + comment):**
+  `freezer/components/net/http_loader.rs:732`, inside
+  `obtain_response()` — the WARN `warn!("network error:
+  {error:?}")` now reads `warn!("network error for {}:
+  {error:?}", url.as_str())`. The URL was in scope (`url:
+  &ServoUrl` param) and is now in the log line. No behaviour
+  change.
+- **R27 errcap (frost-side, `extensions/r25-errcap/`, v0.2.0,
+  no rebuild needed — the extension loads from disk):** the
+  banner's first line now reports the Round 26 lead-2 candidates
+  live on the page — `IO=`, `RIC=`, `SCH=<typeof scheduler>`,
+  `postTask=`, `SW=<typeof navigator.serviceWorker>`,
+  `VIS=<document.visibilityState>`; it wraps
+  `navigator.serviceWorker.register` to log `SWREG` attempts;
+  it runs a live IO delivery probe (a fixed in-viewport
+  sentinel, logs `IO-CB: fired …` or `IO-CB: NOT FIRED after
+  5s`) and a live rIC delivery probe (logs `RIC-CB: fired
+  timeRemaining=…` or `RIC-CB: NOT FIRED after 10s`); it logs
+  `READY readyState=…` at install. New local probe
+  `r13-test/r25-feed/p10-io-latency.html` (timestamps IO
+  callback delivery; also re-tests after moving the sentinel
+  out of viewport).
+
+## Lead 1 — the WARN URL, and are the player POSTs dying?
+
+**The WARN works, verified live.** Navigating the R27 binary to
+`https://nonexistent.invalid/` produced, in `r27-gate-yt.log`:
+`[WARN net::http_loader] network error for
+https://nonexistent.invalid/: hyper_util::client::legacy::Error
+(SendRequest, hyper::Error(Io, Custom { kind: UnexpectedEof,
+error: "peer closed connection without sending TLS
+close_notify: ..." }))`. The URL is in the line. The binary
+carries the format string (verified: `strings` count 1 for
+`"network error for "`; binary mtime 2026-11-18 10:37 UTC,
+fresh from the R27 build).
+
+**But the YouTube re-gate could not re-test the TLS-EOF
+hypothesis: this run had ZERO network errors.** The 105 s
+post-build YouTube gate (`r27-gate-yt.log`, Snowplow OFF,
+R27 errcap) shows 0 `network error`, 0 `close_notify`, 0
+`SendRequest` errors — the R26 run's 8 transient TLS-EOF WARNs
+did not recur. The TLS-EOF is transient per run, not a
+per-run constant, so the "player POSTs die on reused
+connections" hypothesis is **untested, not refuted** — it needs
+a run in which the WARN actually fires with a player URL in it.
+No fix was attempted at the connection-reuse / retry layer:
+there is no evidence in this round pointing at it, and the
+fix would be a guess.
+
+Side observation from the WARN probe: the error for a
+nonexistent host is a TLS UnexpectedEof on a *fresh*
+connection, not a DNS failure — the sandbox's network path
+returns TLS-EOF for unreachable hosts generally. That weakens
+the R26 "reused connections" reading of the TLS-EOFs (they may
+just be this sandbox's generic unreachable-host failure), but
+it does not decide it: the R26 YouTube TLS-EOFs happened on
+requests to a host that *does* answer (youtube.com), so a
+per-request cause is still open. Recorded here so Round 28
+does not re-litigate it from scratch.
+
+## Lead 2 — what triggers `browse`?
+
+**`scheduler.postTask` is RULED OUT, by YouTube's own code.**
+Live-fetched YouTube JS (2026-11-18, ~13 MB total, files in
+`/tmp/r27-yt-*.js` + `r27-yt-home.html`): 0 occurrences of
+"postTask" in all 5 bootstrap scripts (scheduler.js 8,197 B —
+it uses `requestIdleCallback` 3×, `requestAnimationFrame` 2×,
+`setTimeout` 7×, `MessageChannel` 0, `queueMicrotask` 0,
+`IntersectionObserver` 0), in player base.js (2,684,806 B —
+its "scheduler" hits are all YouTube's own
+`yt.scheduler.instance.addJob` / `a.scheduler.ak(...)`, not
+the browser API), and in the main app bundle kevlar_base +
+kevlar_main (9,792,592 B). The HTML's "scheduler" hits are
+feature flags (`transport_use_scheduler`,
+`mweb_watch_stop_scheduler_on_player_response`,
+`kevlar_tuner_scheduler_soft_state_timer_ms`). YouTube's own
+scheduler is built on rIC / rAF / setTimeout — all present in
+Freezer. **Do NOT implement `scheduler.postTask` for this.**
+(Caveat: the check covered ~13 MB of fetched JS; no other
+chunk was found unexamined.)
+
+**`serviceWorker` is effectively ruled out for the feed.**
+Runtime: `SW=undefined` on both YouTube and Yahoo (pref
+`dom_serviceworker_enabled` defaults false, `prefs.rs:479`).
+No `SWREG` lines in any gate. YouTube desktop web does not
+register a service worker for feed loading.
+
+**`visibilityState` is ruled out.** Runtime: `VIS=visible`
+on both sites.
+
+**IntersectionObserver and requestIdleCallback both fire on
+the real pages — slowly.** Post-build YouTube 105 s gate
+(`r27-yt-105s.jpg`): banner `IO=function RIC=function
+SCH=undefined postTask=n/a SW=undefined VIS=visible`;
+`RIC-CB: fired timeRemaining=47.306497 didTimeout=false`;
+`IO-CB: fired entries=1 isIntersecting=true ratio=1`. Yahoo
+90 s gate (`r27-yahoo-90s.jpg`): same first line;
+`RIC-CB: fired timeRemaining=47.865036 didTimeout=false`;
+`IO-CB: NOT FIRED after 5s` **then** `IO-CB: fired entries=1
+isIntersecting=true ratio=1` — it fired, but after the 5 s
+probe deadline. Pre-build YouTube gate showed the same
+pattern (NOT FIRED at 5 s, then fired). Local probe p10
+(`r27-p10-latency.jpg`): IO callback fired **2,069 ms**
+after observe() on a local page (read from document.title;
+the probe page's sentinel/status divs never painted — stale
+frame, DOM updated, compositor did not repaint; the title
+is chrome, not page content, so the 2069 ms number stands).
+**IO delivery is slow everywhere (2 s local, >5 s on real
+pages under load) — the one observed anomaly — but 105 s is
+far longer than the latency, so latency alone does not
+explain the stall. Something else upstream of `browse` is
+still missing or broken.**
+
+**The app is alive and talking — it just never asks for the
+feed.** Post-build YouTube engine log: `youtubei` appears
+8×, all `log_event` (3 POSTs, all 200) and `guide` (1 POST,
+200); `browse` 0, `player` 0. googleads XHRs go out. The
+page finishes everything it will do and sits on skeleton
+tiles. Yahoo: the app makes real fetch calls the errcap sees
+(`signal-service.pbs.yahoo.com/v1/signal/refresh`,
+`s.yimg.com` prebid configs, `api.rlcdn.com` identity
+envelope, `match.adsrvr.org` tracker, `rp.liadm.com`) and
+renders styled + hero + Trending; its "For You" area is
+below the fold and unverifiable (the harness cannot scroll).
+No page JS errors on either site (errcap, 105 s / 90 s).
+No panics in either gate log.
+
+**A discrepancy to note for Round 28:** this run's YouTube
+errcap banner shows NO fetch/XHR lines at all, while the
+engine log shows guide + log_event POSTs going out — so the
+app's network calls are not going through the window fetch /
+XHR the errcap wraps, or they fire before the errcap injects
+(at DocumentIdle / LoadFinished). In R26 the banner DID show
+player POST attempts. The errcap's fetch view is therefore
+timing-dependent and is not a complete record of the app's
+network activity; the engine log is the ground truth for what
+reaches the network. The R26 "player POSTs attempted but never
+reach the engine" finding stands as an R26 observation, not
+reproduced in this round's gates (this round's engine log
+shows no player attempts at all — the app never got that far,
+or never tried).
+
+## The feed is still stalled — what is still unknown
+
+- What actually triggers `youtubei/v1/browse` in YouTube's
+  bootstrap chain. All four R25/R26 candidate APIs are now
+  either present and firing (IO, rIC) or ruled out
+  (scheduler.postTask, serviceWorker, visibilityState). The
+  trigger is something else: a promise in the bootstrap chain
+  that never resolves, another missing API, or a fetch the app
+  makes through a path the engine drops silently.
+- Whether the player POSTs die with TLS EOF when they do get
+  attempted (needs a run where the F-018 WARN fires with a
+  player URL).
+- The R24 watch-page stall and metadata flake are unchanged
+  by this round (out of scope) and still await the backtrace
+  on Joel's box.
+
+## Build incident — stale servo-script bindings (fixed)
+
+The first full R27 build failed: `could not compile
+servo-script (lib) due to 5 previous errors` — `E0432:
+unresolved import IdleDeadlineBinding` (document.rs:102,
+idledeadline.rs:19, window.rs:121) + `E0407:
+RequestIdleCallback` / `CancelIdleCallback` not members of
+trait `WindowMethods`. Root cause, found firsthand: the
+generated bindings OUT_DIR
+(`target/debug/build/servo-script-bindings-fa3fc5b7e27907ff/
+out/`, timestamped 2026-11-18 09:28:08 UTC) contained 490
+Bindings files but NO `IdleDeadlineBinding.rs`, and
+`InterfaceObjectMapData.json` had 0 IdleDeadline mentions —
+yet a manual codegen run produces `IdleDeadlineBinding.rs`.
+The R26 tree is fine (codegen globs all `webidls/*.webidl`).
+The stale OUT_DIR was clobbered during the shared-target-dir
+period, when the PornBrowser builder's cargo regenerated
+script bindings from its R24 tree (which has no
+`IdleDeadline.webidl`) into Frost's shared target dir, and
+cargo then reused the stale OUT_DIR instead of rerunning the
+build script. **Fix: `cargo clean -p servo-script-bindings`**
+(removed 3,079 files, 8.0 GiB). Build 2 succeeded
+(`Finished dev profile in 16m 56s`, log `r27-build2.log`).
+The regenerated OUT_DIR now contains `IdleDeadlineBinding.rs`.
+
+## Test-suite incident — stripped test binary hangs at startup
+
+The full suite is **88/88** (frost bin 54/54, frozen 18/18,
+extensions 8/8, inspector 8/8) + servo-config 3/3 — but getting
+there took a detour, and the detour is worth recording because
+it will bite again if the round build keeps using
+`-C link-arg=-Wl,--strip-debug` for test binaries.
+
+- The build-2 test binary `frost-20b78d5bb5f965eb` (522 MB,
+  stripped) **hangs at startup**: `--list` never prints in 60 s,
+  a single-threaded run prints zero test lines in 180 s, and a
+  600 s run (killed at ~6 min) also printed nothing. It burns
+  CPU the whole time (futex spin; strace shows ~90% of time in
+  `futex`, plus `epoll_wait`/`ppoll`/`madvise` churn, and the
+  only stacks sampled are library constructors — libglib
+  `g_once_init`, libstdc++ locale init, lavapipe libLLVM pass
+  registration — i.e. it never gets past early startup). The
+  R26 test binary `frost-1cc4e912b267895d` (1.5 GB, unstripped)
+  lists 54 tests in 0.09 s under the same env and the same
+  PornBrowser contention, so the hang is specific to the
+  stripped build-2 test binary, not the source and not the
+  machine. The stripped *gate* binary (`target/debug/frost`,
+  same flag) starts and paints fine and ran every gate in this
+  round — the hang is specific to the test-harness binary.
+- The frozen (18/18), extensions (8/8), and inspector (8/8)
+  test binaries from build 2 ran fine (log `r27-test.log`),
+  as did servo-config 3/3 (`r27-test-config.log`).
+- The frost-bin 54/54 was verified on a **plain (unstripped)
+  rebuild** of the test binary: `cargo test -p frost --bins
+  --no-run` (log `r27-test-norun2.log`, `NORUN2-EXIT=0`,
+  finished in 4m 58s once the machine was idle), then
+  `./frost-1cc4e912b267895d` → `test result: ok. 54 passed;
+  0 failed; finished in 0.95s` (log `r27-test-frost.log`).
+  The frost crate source is identical to R26 (no frost-crate
+  change in this round), so the rebuilt binary has the same
+  hash as R26's.
+- A runtime restart mid-round killed the first plain rebuild
+  (`cargo test --workspace --lib --bins --no-run`, started
+  10:53, killed ~12:06 with its rust-lld at 21:53 CPU time
+  and a 1.5 GB `.tmp` link output lost); the targeted
+  `-p frost --bins` rebuild above is the one that completed.
+  The PornBrowser cargo was also gone after the restart, which
+  is why the targeted rebuild finished in under 5 minutes.
+- **Lesson for future rounds: do not apply
+  `-C link-arg=-Wl,--strip-debug` to test binaries.** The flag
+  is for the gate binary only (where it is needed — the plain
+  2 GB link OOM-kills). Build test binaries plainly
+  (`cargo test --no-run` without the link arg) and run them
+  directly.
+
+## Regression (post-build binary, Snowplow OFF)
+
+- R18 probe: all visible checks PASS, "probe done", no FAIL
+  (incl. `isTypeSupported webm is false (F-015 steer)` and
+  `av01 is false (F-015 steer)` — the steer is intact).
+- R19: buffered [0.00–10.00], readyState 4, position to 10.07.
+- R20 real DASH ("Me at the zoo"): buffered [0.00–18.93] /
+  [0.00–19.06], position to 19.06.
+- youtube.com: page loads, 0 PROTOCOL_ERROR / 0 "error loading
+  page" (0 network errors of any kind this run — see Lead 1).
+- Local H.264 to end: PositionChanged 5.00 + EndOfStream.
+- Plain WebM (`test.webm`): MetadataUpdated 320x240
+  format=Matroska, DurationChanged 3.049s, PositionChanged to
+  3.04.
+- example.org renders (dark theme, all languages); command
+  palette (Ctrl+K) renders its full list; hamburger menu renders
+  all rows; split view shows two panes both rendering
+  example.org; Freeze wrote
+  `example-domain-20261118-1147.html` (2,639 B) + index.json
+  (correct title "Example Domain" / URL this time — the R24
+  stale-title wart did not recur); Settings shows Snowplow: Off
+  and Save persists (`settings.json` still `snowplow: false`
+  after Save, "Settings saved." shown); Inspector (F12)
+  captured example.org, **33 nodes** (same as R26).
+
+## Leads for Round 28 (not diagnosed in this round)
+
+1. **Re-gate YouTube until the F-018 WARN fires with a player
+   URL** — the TLS-EOF / player-POST question is still open;
+   if the WARN names a player URL, the fix belongs at the
+   connection-reuse / retry layer.
+2. **Find the `browse` trigger by instrumenting the bootstrap
+   chain, not by adding APIs.** The next step is to watch what
+   the app does between `guide` (which fires) and `browse`
+   (which never fires): log every fetch/XHR the app makes
+   from *inside* the engine (http_loader already logs POSTs
+   at info level — the gap is page-side calls that never reach
+   it), and instrument the errcap to run at document-start so
+   it wraps fetch/XHR before the app's bootstrap caches its
+   own references. Candidates to check next: `fetch` called
+   via a cached reference, `sendBeacon`, `navigator.sendBeacon`,
+   or a `Promise` in the bootstrap that never resolves because
+   of a missing API not yet catalogued (audit the app bundle
+   for `typeof` guards on browser APIs the way postTask was
+   audited).
+3. **IO delivery latency** (2 s local, >5 s on real pages) is
+   worth one focused look: find where the 2 s goes (observer
+   steps run from `script_thread.rs:1252` / `document.rs:3648`
+   — check the scheduling interval). It is probably not the
+   feed cause, but a 2 s observer delay is a real engine
+   defect on its own.
+4. **The R24 watch-page stall and metadata flake** are unchanged
+   by this round (no fix was attempted for them here) and still
+   await the backtrace on Joel's box.

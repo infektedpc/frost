@@ -3308,3 +3308,73 @@ end, plain WebM, homepage, palette, split view, menu, Freeze
 archive + index.json, Settings shows Snowplow: Off and Save
 persists, Inspector F12 33 nodes). Next: Round 27 — the browse
 trigger (see DIAGNOSIS.md).
+
+## Round 27 — chase the browse trigger: URL in the network-error WARN (F-018) + what triggers `browse`
+
+Joel chose this round 2026-11-18 ("Onto round 27?"). Both Round 26
+leads were worked, in order. Headline: **the feed is STILL stalled —
+`youtubei/v1/browse` fires 0x in every run, and the trigger is still
+not found.** Full detail in `DIAGNOSIS.md` (Round 27 section).
+
+Shipped (F-018, Freezer): the http_loader network-error WARN now
+names the request URL (`warn!("network error for {}: {error:?}",
+url.as_str())` in `freezer/components/net/http_loader.rs:732`) —
+verified live: navigating to `https://nonexistent.invalid/`
+produced `network error for https://nonexistent.invalid/:
+hyper_util::client::legacy::Error(SendRequest, ... TLS
+close_notify ...)`. Shipped (frost-side, no rebuild needed):
+the R27 errcap extension v0.2.0 (`extensions/r25-errcap/`) —
+its banner now reports `IO= RIC= SCH= postTask= SW= VIS=`
+live on the page, wraps `serviceWorker.register` (`SWREG`),
+and runs live IO + rIC delivery probes on the real page; new
+local probe `r13-test/r25-feed/p10-io-latency.html`.
+
+Lead 1: the YouTube re-gate (105 s, Snowplow OFF) had ZERO
+network errors, so the "player POSTs die with TLS EOF on reused
+connections" hypothesis is **untested, not refuted** — it needs
+a run in which the F-018 WARN fires with a player URL in it.
+No connection-reuse fix was attempted (no evidence pointing
+at it). Side note: a nonexistent host fails with TLS-EOF on a
+*fresh* connection here, so the sandbox's TLS-EOFs may just be
+its generic unreachable-host failure.
+
+Lead 2: `scheduler.postTask` is **ruled out** — 0 occurrences
+of "postTask" in ~13 MB of live-fetched YouTube JS (bootstrap
+scripts, player base.js, kevlar_base + kevlar_main); YouTube's
+own scheduler is built on rIC/rAF/setTimeout, all present.
+`serviceWorker` is undefined on both sites (no `SWREG`),
+`visibilityState` is `visible` — both ruled out. IO and rIC
+both fire on the real pages, but slowly: rIC `timeRemaining`
+~47.3–47.9, IO fired after the 5 s probe deadline on both
+sites (local p10: 2,069 ms after observe()). IO delivery is
+slow everywhere (2 s local, >5 s on real pages) — the one
+observed anomaly — but 105 s >> latency, so it does not
+explain the stall. The app is alive (guide + log_event POSTs,
+all 200; Yahoo makes real ad/data fetches; no page JS errors,
+no panics) — it just never asks for the feed.
+
+Build incidents: the first full build failed on stale
+servo-script bindings (the shared-target-dir period let the
+PornBrowser builder's cargo regenerate them from its R24
+tree, which has no `IdleDeadline.webidl`); fixed with
+`cargo clean -p servo-script-bindings` (3,079 files, 8.0 GiB);
+build 2 succeeded in 16m 56s. The stripped test binary
+(`frost-20b78d5bb5f965eb`, 522 MB) hangs at startup (futex
+spin, zero test lines in 180 s); the suite was verified on
+plain-built binaries instead — **lesson: never apply
+`-C link-arg=-Wl,--strip-debug` to test binaries** (gate
+binary only). A runtime restart killed the first plain
+rebuild mid-link; the targeted `-p frost --bins` rebuild
+finished in 4m 58s once the machine was idle.
+
+Full test suite 88/88 (frost bin 54 / frozen 18 / extensions 8 /
+inspector 8) plus servo-config 3/3. All regression gates pass
+(R18 probe 29/29, R19 to 10.07, R20 real DASH to 19.06,
+youtube.com 0 PROTOCOL_ERROR, local H.264 to the end, plain
+WebM to 3.04, homepage, palette, split view, menu, Freeze
+archive + index.json with the correct title/URL, Settings
+shows Snowplow: Off and Save persists, Inspector F12 33
+nodes). Next: Round 28 — re-gate until the F-018 WARN fires
+with a player URL, and instrument the bootstrap chain
+(document-start errcap) to find what triggers `browse`
+(see DIAGNOSIS.md).
