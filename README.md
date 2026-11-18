@@ -3249,3 +3249,62 @@ SendRequest, local H.264 to the end, plain WebM ALL PASS,
 homepage/banner, palette, split view, menu, Freeze archive +
 index.json, Settings shows Snowplow: Off, Inspector F12 35
 nodes). Next: Round 26 feed fix (see DIAGNOSIS.md).
+
+## Round 26 — fix the missing feed APIs (F-017)
+
+Joel chose this fix round 2026-11-18 ("Round 26: fix the missing
+feed APIs"). All four Round 25 fix-plan items shipped; the feed is
+STILL stalled, and the round says so plainly. Full detail in
+`DIAGNOSIS.md` (Round 26 section).
+
+Shipped (F-017, Freezer): (1) IntersectionObserver exposed to page
+JS — a one-line pref flip (`dom_intersection_observer_enabled:
+false → true` in `freezer/components/config/prefs.rs`); the
+`.webidl`, bindings, and Rust impl already existed, only the pref
+gate blocked it. (2) `requestIdleCallback` / `cancelIdleCallback`
+implemented for real — new `IdleDeadline.webidl`, new DOM type
+`components/script/dom/idledeadline/`, Document storage mirroring
+rAF, and a script-thread idle runner at the end of
+`handle_messages` (50 ms idle-period budget;
+`timeRemaining()` sane). (3) ResizeObserver delivery — NO engine
+change needed: the R25 "never fires" observation does not
+reproduce; the probe's callback fires on initial observation and
+on resize with no code change. (4) Defensive fix at
+`windowproxy.rs:950`: the assertion becomes a graceful `None`
+return, matching the sibling `frame_element()` branch.
+
+Gates, one API at a time (Snowplow OFF): p2 IO probe FIRED
+(`isIntersecting=true ratio=1`); p7b RO FIRED; p7c RO fired on
+initial observation and on resize; p3 rIC probe FIRED
+(`timeRemaining=49.67`); p8 POST fetch RESOLVED as working (POST
+arrives, HTTP 501 response); new p9 probe: all four fetch POST
+shapes (plain JSON, innertube headers, `credentials:include`,
+abort signal) reach the network. YouTube with IO only: banner
+`IO=function RIC=undefined`, browse 0×. YouTube with IO + rIC:
+banner `IO=function RIC=function`, browse STILL 0×, feed still
+empty — the R25 hypothesis (observer/idle APIs gate the browse)
+is refuted as the sole cause. Yahoo renders styled with a real
+hero story in both runs; "For You" stays below the fold and
+unverifiable from the harness (it can't scroll).
+
+Found during the round: the first Phase B build panicked on
+YouTube (`script_thread.rs:3743`, `RefCell already borrowed` in
+`fn load`) — the idle runner held the documents borrow across
+page JS. Fixed by collecting rooted documents first (mirroring
+`update_the_rendering`); rebuilt and re-gated with
+`RUST_BACKTRACE=1`: p3 still fires, YouTube 105 s shows 0
+panics, p8 re-run shows no crash. New leads for Round 27: the
+app never even attempts `browse` (the trigger, not the fetch, is
+the question — candidates: `scheduler.postTask`,
+`navigator.serviceWorker`, visibility/idle signals); the player
+POSTs are attempted but never reach the network, and the yt3 log
+has 8 transient TLS-EOF WARNs on reused connections that don't
+name their URL — log the URL in that WARN and re-gate. Full test
+suite 88/88 (frost bin 54 / frozen 18 / extensions 8 / inspector
+8) plus servo-config 3/3 including the new
+observer_apis_enabled_by_default test. All regression gates pass (R18 probe, R19, R20 real
+DASH to 19.03, youtube.com 0 PROTOCOL_ERROR, local H.264 to the
+end, plain WebM, homepage, palette, split view, menu, Freeze
+archive + index.json, Settings shows Snowplow: Off and Save
+persists, Inspector F12 33 nodes). Next: Round 27 — the browse
+trigger (see DIAGNOSIS.md).
