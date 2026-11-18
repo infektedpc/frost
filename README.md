@@ -3190,3 +3190,62 @@ buffer, no `MetadataUpdated`, readyState 0) was found
 alongside it. No fix shipped; the fix needs a media-thread
 backtrace during the stall (no gdb in the sandbox). Next:
 Frostbite hibernation.
+
+## Round 25 — diagnose the shared feed gap (YouTube + Yahoo)
+
+Joel chose this diagnosis round 2026-11-17 ("Round 25: diagnose
+the shared feed gap"). DIAGNOSIS ONLY — no behaviour fix ships.
+Full detail in `DIAGNOSIS.md`.
+
+The finding: the feed request is never even attempted. YouTube's
+`youtubei/v1/browse` POST fires 0 times in every sandbox run
+(Snowplow ON and OFF); `curl` shows the feed is not in the initial
+HTML (`videoRenderer` 0), so the app must fetch it and never does.
+Yahoo's "For You" area stays empty the same way. The apps are
+alive — fetch/XHR work (a `v1/player` POST and a googleads XHR
+were captured live on YouTube), timers and rAF run, and the new
+R25 Error Capture extension (`extensions/r25-errcap/`, injected
+into youtube.com/yahoo.com, surfaces page JS errors, rejections,
+console output and every fetch/XHR URL in an on-page banner)
+captured ZERO page errors in 180 s on YouTube and 60 s on Yahoo.
+The starvation hypothesis (R24's event-delivery block) is refuted
+for the feed: local timers/rAF pass (298 frames/5 s) and Yahoo's
+script thread idles, never saturates. Snowplow is ruled out for
+YouTube (OFF run byte-identical) and the `?themeRefresh=1` reload
+fires once, not a loop.
+
+Prime suspect: missing/broken observer + idle APIs. Local probes:
+`IntersectionObserver` is UNDEFINED (the Rust code exists in
+Freezer but is not exposed to page JS), `requestIdleCallback` is
+UNDEFINED and does not exist anywhere in Freezer, and
+`ResizeObserver` is defined but its callback NEVER fires.
+YouTube ships an `intersection-observer.min.js` polyfill — at 120 s
+the banner read `IO=function` (polyfill installed) yet browse
+still never fired, so either the polyfill's callbacks never fire
+in this engine or the browse is scheduled via the absent
+`requestIdleCallback`. `MutationObserver` fires, `customElements`
+and shadow DOM work, fetch/XHR/Promise all work.
+
+Second defect, separate: the `windowproxy.rs:950` script-thread
+panic (`parent_proxy.currently_active().is_some()`) hit Joel's box
+THREE times on Yahoo (Script#112, #145, #97); the third followed
+a rustls TLS rejection for `cs.openwebmedia.org` (cert valid only
+for `*.ascendeummedia.com` — the ad network's misconfiguration,
+not a Frost bug; a failing ad iframe torn down mid-init is the
+plausible trigger). It did NOT reproduce in the sandbox: Yahoo
+Snowplow-ON 240 s (21 "Load cancelled"), 25+50 nested-teardown
+cycles and 30+50 nav-away attempts, fixed and jittered timing —
+0 panics. The feed stall reproduces without any panic, so the
+panic is not required for the feed gap; cause vs consequence is
+undetermined (the constellation disconnects came around his stop).
+Round 26 must fix it defensively anyway (assertion → graceful
+`None`, matching the sibling branch at line 934) and must expose
+IntersectionObserver, implement requestIdleCallback, and fix
+ResizeObserver delivery, then re-gate both homepages. No F-017:
+the errcap extension gave the needed visibility without an engine
+rebuild. Full test suite 88/88; all regression gates pass (R18
+probe, R19, R20 real DASH segments to the end, youtube.com 0
+SendRequest, local H.264 to the end, plain WebM ALL PASS,
+homepage/banner, palette, split view, menu, Freeze archive +
+index.json, Settings shows Snowplow: Off, Inspector F12 35
+nodes). Next: Round 26 feed fix (see DIAGNOSIS.md).
