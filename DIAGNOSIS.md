@@ -1017,3 +1017,264 @@ a large page.
 4. **The R24 watch-page stall and metadata flake** are
    unchanged by this round (no fix was attempted for them
    here) and still await the backtrace on Joel's box.
+
+## Round 29 — IO-step instrumentation (F-020) + typeof audit + videoplayback diagnosis
+
+Joel resumed this round 2026-11-18 ("im home lets do this")
+after parking it that morning. Headline: **the feed is STILL
+stalled — `youtubei/v1/browse` fires 0x in 300 s — but all
+three Round 28 leads closed with hard evidence, and the
+watch-page gate (added this round, see below) shows the
+reloaded player plays through in the pipeline with
+burst-delivered position updates — the R24 event-delivery
+block, caught on the reloaded player.** Full gate logs in `~/workspace/harness-tmp/frost/`
+(`r29-gate-yt.log`, `r29-gate-yahoo.log`, `r29-gate-watch.log`,
+`r29-gate-p11b.log`, `r29-regress-*.log`).
+
+Shipped (F-020, Freezer): `maybe_compute_intersection_output`
+now also names the missing piece (`root_bounds` / `target_rect`
+/ `root`); `update_intersection_observations_steps` counts
+targets/computed/none_*/fallback/delay_skip/readded/queued per
+document, and `document.rs` logs one `IO: steps doc=<host>
+readyState=<rs> targets=… computed=… none_tr=… none_rb=…
+none_root=… fallback=… delay_skip=… readded=… queued=…` line
+(first run always, then at most 1/s while interesting; clean
+runs silent); `script_thread.rs` logs `IO: skip doc=<host>
+readyState=<rs> render_blocked=true rb_count=<n>
+io_observers=<n>` when a render-blocked document with observers
+is skipped at step 3. Shipped (frost-side):
+`FrostDelegate::show_console_message` is implemented
+(ERRCAP-prefixed lines go to `log::info!("CONSOLE: …")`,
+everything else to debug), so the errcap's full bootstrap
+chain now lands in the engine log; the errcap is v0.4.0 "R29
+Error Capture" (banner cap 40 → 200 lines, every line also
+`console.log('ERRCAP ' + …)` — no recursion, console.log is
+not wrapped).
+
+Lead 1 (IO delivery on the real page): **EXPLAINED — it is
+render-blocking, not a bug, and delivery is correct once the
+document unblocks.** YouTube 300 s gate (Snowplow OFF):
+537 `IO: skip` lines, first 00:33:26, last 00:35:00 —
+`rb_count=1` for 535 of them (2 at 3) — the document is
+render-blocked by parser-inserted scripts at ~20–27 skips/s
+for ~12 s per document load. The errcap probe fires
+`isIntersecting=true ratio=1` at +27.6 s (doc A) and +12.9 s
+(doc B, after the themeRefresh reload); Yahoo fires at +14.8 s
+(328 skips over ~11 s). After `readyState=Complete` the steps
+run freely (YouTube: up to 49 targets, all computed, entries
+queued and delivered). F-019's re-add works live (`readded=2`
+in the Loading runs). The `IO: steps` summaries also show
+`none_tr` > 0 with `fallback` == `none_tr` and `none_rb` == 0
+everywhere — targets whose rect is unavailable during load get
+the skipped/false fallback, never a missing root. The 5 s
+"NOT FIRED" is the probe's arbitrary threshold firing before
+the document unblocks, not a defect. **There is no IO delivery
+bug left on the real page.** Local re-gate (p11b): F-019
+intact — `RAF1=124 RAF2=124 IO1=199 IO1x2=2019 IO2=2020
+count=2` (IO1 true at 199 ms, same frame as rAF; the 2,019 ms
+second firing is the legitimate true→false transition), and
+the F-020 lines log live (`IO: steps … Loading targets=1
+computed=1 … queued=1`, then `Complete targets=2 computed=2
+… queued=2`, 0 skips).
+
+Lead 2 (what triggers `browse`): **the typeof audit rules
+out every guard, and the bootstrap chain is fully captured —
+but the player POST is now a sharper mystery, not a closed
+lead.** Live JS audit (~14 MB: homepage 978,348 B + base.js
+2,701,764 B + kevlar.js 9,803,874 B + 6 bootstrap scripts):
+`typeof` counts — IntersectionObserver 1, ResizeObserver 1,
+MutationObserver 1, Promise 1, MessageChannel 1, Worker 3,
+AbortController 2, AbortSignal 2, URL 3, TextEncoder 6,
+PerformanceObserver 1; requestIdleCallback / scheduler / fetch
+/ XHR / queueMicrotask / customElements / indexedDB /
+localStorage / BroadcastChannel / SharedWorker /
+OffscreenCanvas / visualViewport / matchMedia /
+requestAnimationFrame / IntersectionObserverEntry /
+document.fonts / navigator.serviceWorker all 0; no `'X' in
+window` hits. The single IO typeof is a perf-monitor path that
+takes the IO branch since R26; the ResizeObserver typeof is a
+component guard. **No typeof guard gates the feed.** The feed
+path has an offline-fallback layer (`Dat` class):
+`localFallbackInnertubeResponse` for `FEwhat_to_watch` awaits
+an uplift promise then returns store entities or an empty-ish
+response; `shouldPreferLocalResponse` is false for
+FEwhat_to_watch, so the app prefers the NETWORK response —
+but the live gate shows it never issues the call. The console
+mirror captured the full first-30-s chain in the engine log
+(427 ERRCAP lines): rIC fires at +199 ms, IO fires at +27.6 s,
+`readyState=complete` at +27.8 s, player POST at +28.0 s,
+then guide / log_event / feedback / icon SVGs / ads — and
+`browse` never appears in 300 s. **First genuine page JS
+error ever captured on YouTube:** `ERR: this.shownItems.some
+is not a function @ …kevlar_base…` at +109,396 ms (doc B) —
+recorded, not yet attributed (could be the app running
+degraded, or a real-browser error too; unverified either way).
+**The player POST, sharpened:** the app attempts it page-side
+(15 banner lines) and it resolves 200 with real network
+latency (164 ms–1.5 s), yet **0 reach http_loader** (11 POSTs
+total in the log: log_event 7, guide 2, feedback 1,
+GenerateIT 1; player 0, browse 0; 0 OPTIONS preflights).
+guide/log_event/feedback POSTs DO reach http_loader and return
+200s, so fetch POSTs in general work and log. The signed
+videoplayback URLs the app then fetches can only come from a
+genuine player response (the curl'd homepage HTML contains 0
+`videoplayback` and 0 `streamingData`). Ruled out from code:
+HTTP cache (`construct_response` returns None for non-GET),
+disk cache (no `cache.sqlite3` anywhere; tempdir per run),
+embedder intercept (Frost's delegate only cancels or drops),
+preload (GET-only, step 10 requires GET), ServiceWorker
+(undefined), and every fetch path funnels through
+`http_network_fetch`, whose `info!("{:?} request for {}")`
+line is unconditional. **The mechanism by which the player
+POST is answered with a real 200 + real streaming data while
+leaving no trace in Servo's network stack is UNRESOLVED.**
+Round 30 lead: log method+URL at `http_fetch` entry — if the
+player fetch never enters the net crate, the break is between
+`window.fetch` and the net crate; if it enters, find the
+early exit.
+
+Lead 3 (videoplayback deaths): **REFUTED as connection
+reuse — it is the server (or path) resetting fresh
+connections from the sandbox IP; no retry fix warranted.**
+YouTube 300 s gate: F-018 fired 6x, all `videoplayback`
+`itag=18` to `rr1---sn-aigzrnld.googlevideo.com`, all
+`ConnectionReset` on SendRequest — same count/shape as R28.
+Page-side they surface as `FETCH-ERR: TypeError: Network
+error: CORS check failed` (the fetch fails before any
+response exists, so the CORS check has nothing to check —
+a symptom, not a policy issue). The other host,
+`rr2---sn-q4flrnel`, answered all 5 of its videoplayback
+GETs with 403 (same client, same pool — connections work,
+the server refuses at the application layer). Crucially, the
+rr1 resets hit on FIRST contact with that host (no prior rr1
+connection could have been pooled), and the app already
+retries the same URL (twice at 00:35:37–38, again at
+00:36:38 — all reset). Curl control probe (fresh connection,
+different TLS stack): the exact failing rr1 URL → exit 52,
+empty reply, 0.8 s; the rr2 URL → 403, 0.62 s. Same failure
+shape from curl rules out both stale pooled connections and
+our rustls/hyper stack. On Joel's box (different IP, not
+bot-flagged) this likely does not reproduce — consistent with
+his box playing video while the sandbox cannot fetch itag-18
+segments.
+
+Watch-page gate (ADDED this round, themeRefresh lead):
+`watch?v=jNQXAC9IVRw`, 180 s, Snowplow OFF. Initial GET
+00:52:57, **themeRefresh reload GET 00:54:10 (73 s in)**,
+player 1 attached 00:53:36, player 2 attached 00:55:17.
+**CORRECTION (Doc verification 2026-11-19: the builder's
+report said neither player ever got `MetadataUpdated` and
+there were zero MSE drains — the log shows the opposite, so
+that claim is withdrawn):** the UI at 180 s does show
+`0:00 / 0:19` (screenshot `r29-watch-180s.jpg`) and no
+position update arrived inside the 180 s window — but the
+log kept running, and ~52–78 s after the window the
+reloaded player (player 2) got `MetadataUpdated`
+(320x240, ISO fMP4, 00:56:49), `DurationChanged 19.064s`,
+6 drains all `pushed=1, dropped=0` with buffered full
+[(0.0, 19.06)] audio / [(0.0, 18.93)] video (00:56:31–37),
+`StateChanged Playing` (00:56:55), positions 0.50→3.51 in
+one burst (00:56:55) then 17.10→18.60 + 290.82 in a second
+burst (00:57:15), and `EndOfStream` (00:57:15). **The
+reloaded player DOES start and DOES play to the end in the
+pipeline — what is broken is live event delivery: position
+updates arrive in bursts, the R24 event-delivery block,
+not the never-starts flake.** Joel's VepOepAA7_U shot (0:00
++ spinner after the reload, Firefox playing it fine) is
+consistent with the same shape caught earlier — the UI
+frozen at 0:00 while the pipeline is behind — though a
+genuine never-starts flake (R24's second bug) still cannot
+be ruled out on his box from one shot. The app DID get
+player POST 200s page-side (4 attempts, 2 resolved 200) and
+videoplayback 200s (SABR POSTs, `sabr=1`); one
+videoplayback fetch was aborted (`AbortError` at +53,106 ms,
+reloaded doc). IO-CB fired at +27.2 s (doc A) and ~+26 s
+(doc B); 1,169 IO skips. No crash, no panic; Frost stayed up.
+Reading for the themeRefresh question: the reload discards
+the in-progress player and forces a full re-bootstrap in
+every run (homepage: reload GET 31 s in, new document
+commits ~55 s later; watch: 73 s in). On Joel's faster box
+the same sequence lands mid-playback (~0:22) and the
+reloaded player then plays with burst-delivered events
+(this gate's shape, the R24 block) — or, on other runs,
+never starts at all (the metadata flake); the reload is
+the trigger, the flake/block is the mechanism. The R24 local repro refuted only the narrow
+claim "discarded player poisons the next"; it did not test
+the real YouTube reload. **The R24 stall + metadata flake
+are still OUT OF SCOPE for a fix here and still await the
+backtrace on Joel's box** (0.22.0 is fully stripped; Joel
+approved a symbolized build 2026-11-18 ~17:37 — package
+from the Round 29 tree once delivered).
+
+Full test suite 89/89 (frost bin 54 / frozen 18 / extensions
+9 / inspector 8) plus servo-config 3/3 — log
+`~/workspace/harness-tmp/frost/r29-test.log`, EXIT=0. (The
+two `^error` lines in the log are the benign
+`XDG_RUNTIME_DIR is invalid` warnings from a GL-probe test,
+not failures.) Regression ALL PASS: R18 probe ALL PASS
+(F-015 steer intact), R19 buffered [0.00–10.00] +
+loadedmetadata + readyState 4, R20 real DASH video
+[0.00–18.93] / audio [0.00–19.06] + Playing + positions to
+18.67, youtube.com document 200 with 0 SendRequest errors,
+local H.264 to end (00:05/00:05 + EndOfStream), plain WebM to
+3.04, homepage + banner, palette, split view (opened, closed
+via palette), menu, Freeze archive
+`example-domain-20261119-0106.html` (2,947 B) + index.json
+correct ("Frozen: Example Domain"), Settings Snowplow: Off
+saved and persisted in settings.json, Inspector F12 35 nodes.
+Zero panics in any gate log. (The R19/R20 logs each contain
+one unrelated `Failed to create PipeWire event context`
+ALSOFT line and R20 one `Failed to initialize ClientStorage`
+line — sandbox environment noise, not probe failures.)
+
+Incidents: a service restart SIGTERM'd the full test suite
+mid-link (attempt 2, after attempt 1 was OOM-killed by
+running concurrently with the PornBrowser builder); attempt 3
+resumed incrementally and passed. The harness (Xvfb:97 +
+18080/18099/18101) died mid-round — the YouTube-gate Frost
+exited silently with it (last log line 00:38:52, no panic,
+no process at the next check; a relaunch then panicked in
+winit `Create event loop` until the harness was rebuilt).
+Harness lesson: verify Xvfb + servers immediately before
+each gate launch; never `cd X && cmd &` (the `cd` is
+backgrounded with the job — use a subshell). Menu-row
+coordinates in the harness notes drifted ~22 px (Split view
+is at y≈309 now, not 287) — measure from the screenshot,
+don't trust the old numbers. Cosmetic: direct mp4/webm
+navigation renders the video frame doubled (two offset
+copies); the H.264/WebM clips still play to the end.
+
+## Leads for Round 30 (not diagnosed in this round)
+
+1. **Player POST mechanism (sharpest):** add an `info!` log
+   at `http_fetch` entry (method + URL) and re-gate YouTube.
+   If the player POST never appears there, the fetch never
+   enters the net crate — look at script-thread fetch
+   dispatch. If it appears, trace the early exit. Second
+   probe: in the errcap fetch wrapper, log
+   `r.clone().text()` length for `youtubei/v1/player`
+   responses only — does the page-side 200 carry real
+   streamingData or an empty/error body?
+2. **Watch-page event delivery:** the reloaded player
+   appends and drains fine (9 appends, 6 drains, all pushed,
+   buffered full) and plays to EndOfStream — but position
+   updates arrive in two bursts well after the fact, and the
+   UI sits at 0:00 meanwhile. Instrument the media-event
+   path (what holds `PositionChanged` / `MetadataUpdated`
+   between the player and the script thread, and what
+   releases the burst) — the R24 block, now reproduced on
+   the reloaded player. (The earlier draft of this lead said
+   0 drains; Doc verification found 6 drains in
+   `r29-gate-watch.log` — that claim is withdrawn.)
+3. **What triggers `browse` is still unknown.** IO, rIC,
+   fetch/XHR all work; the app progresses (guide, log_event,
+   feedback, player) and never attempts `browse` in 300 s.
+   The typeof audit and the bootstrap chain rule out missing
+   APIs. Next: look at what the app does with the player
+   response — if the player response is real, why does the
+   feed never follow? (May be the same root as lead 1.)
+4. **The R24 watch-page stall and metadata flake** are
+   unchanged by this round (no fix was attempted for them
+   here) and still await the backtrace on Joel's box — from
+   the symbolized build, once packaged from the Round 29
+   tree.

@@ -3434,3 +3434,69 @@ persists, Inspector F12 35 nodes). No panics in any gate log.
 No .deb, no push in this round. Next: Round 29 — why IO still
 doesn't fire on the real page, and what triggers `browse`
 (see DIAGNOSIS.md).
+
+## Round 29 — IO-step instrumentation (F-020) + typeof audit + videoplayback diagnosis
+
+Joel resumed this round 2026-11-18 ("im home lets do this").
+Headline: **the feed is STILL stalled — `youtubei/v1/browse`
+fires 0x in 300 s — but all three Round 28 leads closed with
+hard evidence.** Full detail in `DIAGNOSIS.md` (Round 29
+section).
+
+Shipped (F-020, Freezer): IO-step instrumentation —
+`maybe_compute_intersection_output` names the missing piece,
+per-document `IO: steps` summaries (targets/computed/none_*/
+fallback/delay_skip/readded/queued), and `IO: skip` lines when
+a render-blocked document with observers is skipped. Shipped
+(frost-side): `show_console_message` implemented, so the
+errcap's full bootstrap chain lands in the engine log; errcap
+v0.4.0 "R29 Error Capture" (banner cap 40 → 200 lines, every
+line also mirrored to the console).
+
+Lead 1 (IO delivery): **EXPLAINED — render-blocking, not a
+bug.** Each YouTube document is render-blocked by
+parser-inserted scripts (~20–27 skips/s for ~12 s per load;
+537 skips in the 300 s gate); the observer fires true at
++27.6 s / +12.9 s (before/after the reload) and delivery is
+normal after `readyState=Complete`. The 5 s "NOT FIRED" is
+the probe's threshold, not a defect. Local p11b re-gate:
+IO1 true at 199 ms — F-019 intact.
+
+Lead 2 (browse trigger): **typeof audit rules out every
+guard** (~14 MB live JS; the only IO/RO typeofs take the
+working branch). The bootstrap chain is fully captured
+(rIC +199 ms, IO +27.6 s, player POST +28.0 s, then guide /
+log_event / feedback / icons / ads — browse never appears).
+**Sharpened, not closed:** the player POST resolves 200
+page-side with real streaming data, yet 0 reach http_loader
+(11 POSTs total: log_event 7, guide 2, feedback 1,
+GenerateIT 1) — and every bypass is ruled out from code
+(cache, disk cache, embedder intercept, preload, ServiceWorker).
+Mechanism unresolved; Round 30 lead is an `http_fetch`-entry
+probe.
+
+Lead 3 (videoplayback): **REFUTED as connection reuse.**
+6x ConnectionReset on itag-18 to `rr1---sn-aigzrnld`, on
+FIRST contact with that host; the other host answers 403;
+curl on a fresh connection reproduces both (exit 52 empty
+reply for rr1, 403 for rr2). Server/IP-side; no retry fix.
+
+Watch-page gate (added): themeRefresh reload GET 73 s in;
+neither player ever got `MetadataUpdated` or a position in
+180 s (reloaded player never starts — Joel's VepOepAA7_U
+shape); the app got player 200s and videoplayback 200s but
+zero MSE appends. The reload discards the in-progress player
+in every run.
+
+Full test suite 89/89 (frost bin 54 / frozen 18 / extensions 9
+/ inspector 8) plus servo-config 3/3. All regression gates
+pass (R18 ALL PASS incl. F-015 steer, R19 buffered
+[0.00–10.00] + readyState 4, R20 real DASH video
+[0.00–18.93] / audio [0.00–19.06] + Playing, youtube.com
+document 200 with 0 SendRequest, local H.264 to end + EndOfStream,
+plain WebM to 3.04, homepage + banner, palette, split view, menu,
+Freeze archive + index.json correct, Settings Snowplow: Off
+persists, Inspector F12 35 nodes). Zero panics in any gate log.
+No .deb, no push in this round. Next: Round 30 — the
+`http_fetch`-entry probe for the player POST, and the
+watch-page MSE gap (see DIAGNOSIS.md).

@@ -1,4 +1,4 @@
-// R28 Error Capture content script (runs at DocumentStart / HeadParsed).
+// R29 Error Capture content script (runs at DocumentStart / HeadParsed).
 // Captures page JS errors, unhandled rejections, console.error/warn, and
 // every fetch/XHR/sendBeacon call, into a fixed on-page banner +
 // document.title. Every line is stamped with ms since install, so the
@@ -9,12 +9,18 @@
 // fetch reference, so the R27 banner saw nothing. Read-only: it does not
 // modify page behaviour except adding the banner and one 1px sentinel
 // div for the IO probe.
+// Round 29: the banner keeps 200 lines (was 40 — the cap ate the early
+// bootstrap), and every line is ALSO mirrored to console.log with an
+// ERRCAP prefix, so the full bootstrap chain lands in the engine log
+// via the new console bridge (frozen FrostDelegate::show_console_message)
+// and can be read even when the banner itself cannot (the Inspector
+// snapshot wedges on YouTube's DOM).
 (function () {
   var t0 = performance.now();
   function stamp() { return '+' + (performance.now() - t0).toFixed(0) + 'ms '; }
 
   var box = document.createElement('div');
-  box.id = 'r28-errcap';
+  box.id = 'r29-errcap';
   box.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;' +
     'background:#7a0000;color:#fff;font:14px/1.4 monospace;padding:6px 10px;' +
     'max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all;';
@@ -28,7 +34,7 @@
     try { sw = (navigator && navigator.serviceWorker) ? typeof navigator.serviceWorker : 'undefined'; } catch (e) { sw = 'err'; }
     var vis = 'n/a';
     try { vis = document.visibilityState; } catch (e) { vis = 'err'; }
-    return 'R28-ERRCAP active. IO=' + (typeof IntersectionObserver) +
+    return 'R29-ERRCAP active. IO=' + (typeof IntersectionObserver) +
       ' RIC=' + (typeof requestIdleCallback) +
       ' SCH=' + sch + ' postTask=' + pt + ' SW=' + sw + ' VIS=' + vis;
   }
@@ -38,9 +44,13 @@
   var lines = [];
   function log(kind, msg) {
     lines.push(stamp() + kind + ': ' + msg);
-    if (lines.length > 40) lines.shift();
+    if (lines.length > 200) lines.shift();
     box.textContent = firstLine() + '\n' + lines.join('\n');
-    try { document.title = 'R28: ' + lines[lines.length - 1].slice(0, 120); } catch (e) {}
+    try { document.title = 'R29: ' + lines[lines.length - 1].slice(0, 120); } catch (e) {}
+    // Round 29: mirror every line to the engine log via console.log
+    // (frozen logs ERRCAP-prefixed console messages at info level).
+    // console.log itself is not wrapped by this script, so no recursion.
+    try { console.log('ERRCAP ' + stamp() + kind + ': ' + msg); } catch (e) {}
   }
 
   window.addEventListener('error', function (ev) {
@@ -178,7 +188,7 @@
   try {
     if (typeof IntersectionObserver === 'function') {
       var sentinel = document.createElement('div');
-      sentinel.id = 'r28-io-sentinel';
+      sentinel.id = 'r29-io-sentinel';
       sentinel.style.cssText = 'position:fixed;top:100px;left:10px;width:50px;height:50px;background:rgba(0,255,0,0.01);z-index:2147483646;';
       (document.body || document.documentElement).appendChild(sentinel);
       var ioFired = false;

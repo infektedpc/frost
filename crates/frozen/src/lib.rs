@@ -35,12 +35,12 @@ use std::sync::{mpsc, Arc};
 
 use dpi::PhysicalSize;
 use servo::{
-    Code, DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePoint, EventLoopWaker,
-    HardwareRenderingContext, InputEvent, JSValue, JavaScriptEvaluationError, Key, KeyState,
-    KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseMoveEvent, PrefValue, RenderingContext, Servo, ServoBuilder,
-    SoftwareRenderingContext, Theme, WebView, WebViewBuilder, WebViewDelegate, WheelDelta,
-    WheelEvent, WheelMode,
+    Code, ConsoleLogLevel, DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePoint,
+    EventLoopWaker, HardwareRenderingContext, InputEvent, JSValue, JavaScriptEvaluationError,
+    Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, PrefValue, RenderingContext, Servo,
+    ServoBuilder, SoftwareRenderingContext, Theme, WebView, WebViewBuilder, WebViewDelegate,
+    WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 
@@ -324,6 +324,22 @@ impl WebViewDelegate for FrostDelegate {
 
     fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
         let _ = self.tx.send(EngineEvent::Crashed(webview.id(), reason));
+    }
+
+    /// Round 29: page `console.log`/`warn`/`error` calls arrive here
+    /// as `ShowConsoleApiMessage`; previously they were dropped by the
+    /// default no-op. The R29 errcap mirrors its banner lines into
+    /// `console.log` with an `ERRCAP` prefix, so those lines are logged
+    /// at info level and the app's bootstrap chain lands in the gate
+    /// log without needing to read the banner. All other page console
+    /// output goes to debug level, so a chatty app cannot flood the
+    /// engine log.
+    fn show_console_message(&self, _webview: WebView, _level: ConsoleLogLevel, message: String) {
+        if message.starts_with("ERRCAP") {
+            log::info!("CONSOLE: {message}");
+        } else {
+            log::debug!("CONSOLE: {message}");
+        }
     }
 
     /// Round 13 (Snowplow): every HTTP fetch reaches the embedder
