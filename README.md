@@ -3500,3 +3500,49 @@ persists, Inspector F12 35 nodes). Zero panics in any gate log.
 No .deb, no push in this round. Next: Round 30 — the
 `http_fetch`-entry probe for the player POST, and the
 watch-page MSE gap (see DIAGNOSIS.md).
+
+## Round 30 — CSS Grid / aspect-ratio (F-021)
+
+Joel re-sequenced this himself 2026-11-19 ~08:58: grid jumps
+ahead of the YouTube work (he is not home to help with the
+YouTube on-box testing). The YouTube feed work (Round 29
+leads in `DIAGNOSIS.md`) resumes after grid.
+
+Headline: **CSS Grid itself already worked — the real gap
+was `aspect-ratio` on non-replaced (flow) boxes.** The survey
+proved it before any fix: explicit tracks, gap,
+auto-placement, explicit placement, template areas, nested
+grids, and grid items with `aspect-ratio` all laid out
+correctly (Taffy 0.15.1 does the grid). What collapsed was
+any flow-laid-out box whose height came only from
+`aspect-ratio` — the PornBrowser home page (grid tiles whose
+`.thumb` spans get their height only from the ratio) rendered
+blank, and an isolated `width:200px; aspect-ratio:16/10` div
+was invisible.
+
+Shipped (F-021, Freezer, 7 files): the ratio now reaches
+non-replaced boxes (`IndependentFormattingContext::
+preferred_aspect_ratio` no longer returns `None` for them —
+that TODO stub was the root cause), and the css-sizing-4
+§2.2 transfer (auto block size from the used inline size
+through the ratio) is applied at the final block-size
+resolution for in-flow blocks, same-formatting-context
+blocks, floats, absolutely positioned boxes, flex items,
+and grid-item leaves — plus a placement fix: a first
+in-flow child whose margins collapse through it no longer
+has its following sibling placed on top of it (the
+collapsed-through early return now still advances the block
+position by the fragment's size). Full detail in
+`DIAGNOSIS.md` (Round 30 section).
+
+Gates, all screenshot-verified: the PornBrowser home page
+now renders its 20 grey tiles (5 per row, 4 rows); flow,
+flex (stretch and `flex-start`), float, abs-pos, and
+grid-item aspect-ratio boxes all size correctly; content
+taller than the ratio height overflows instead of stretching
+the box. Regression all pass (R18 ALL PASS, R19, R20 real
+DASH, youtube.com 0 PROTOCOL_ERROR, H.264 to end, plain
+WebM, example.org, palette, menu, split view, Freeze +
+index.json, Settings Snowplow persists, Inspector F12 35
+nodes). Tests: 89/89 + servo-config 3/3. No .deb, no push in this round. Next:
+the YouTube feed work resumes (Round 29 leads).

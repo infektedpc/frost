@@ -1244,7 +1244,7 @@ don't trust the old numbers. Cosmetic: direct mp4/webm
 navigation renders the video frame doubled (two offset
 copies); the H.264/WebM clips still play to the end.
 
-## Leads for Round 30 (not diagnosed in this round)
+## Leads for the next YouTube round (were Round 30's leads; grid jumped ahead 2026-11-19, Joel)
 
 1. **Player POST mechanism (sharpest):** add an `info!` log
    at `http_fetch` entry (method + URL) and re-gate YouTube.
@@ -1278,3 +1278,192 @@ copies); the H.264/WebM clips still play to the end.
    here) and still await the backtrace on Joel's box — from
    the symbolized build, once packaged from the Round 29
    tree.
+
+## Round 30 — CSS Grid / aspect-ratio (F-021)
+
+Joel re-sequenced this himself 2026-11-19 ~08:58: grid jumps
+ahead of the YouTube work (he is not home to help with the
+YouTube on-box testing). The YouTube leads from Round 29
+carry over to the next YouTube round, after grid.
+
+Headline: **CSS Grid itself already worked — the real gap
+was `aspect-ratio` on non-replaced (flow) boxes.** The survey
+proved it with screenshot-verified probes on the Round 29
+binary, before any fix:
+
+- P2 explicit tracks (`200px 1fr 100px`, rows 80/120, gap
+  10px, auto-placement): PERFECT. P3 explicit placement
+  (`grid-column: 1/3`, `grid-row: 2`) + nested grid: CORRECT.
+  P4 `grid-template-areas`: CORRECT. P6 grid items with
+  `aspect-ratio: 16/10`: WORKS (~293x183 boxes) — Taffy
+  0.15.1 applies the ratio to grid items. P7 = P1 with
+  `aspect-ratio` replaced by `height:112px`: PERFECT (20 grey
+  tiles, 5 per row, 4 rows).
+- P1 (verbatim PornBrowser Round 5 home page: grid +
+  `.thumb { aspect-ratio:16/10 }` inside each tile): BLANK —
+  reproduces the 2026-11-19 ~00:13 on-box report exactly.
+  P5 isolated: red div (`width:200px; aspect-ratio:16/10`)
+  INVISIBLE; green control (`height:125px`) renders 200x125.
+  P8 flex items (`width:100px; aspect-ratio:1/1`): BLANK.
+
+So the brief's premise ("the old flow layout has no grid
+support at all") was wrong: Freezer's layout crate uses
+Taffy 0.15.1 for grid (`taffy::compute_grid_layout`,
+`GridContainerStyle`/`GridItemStyle` in
+`components/layout/taffy/`), and the PornBrowser side chat's
+"no grid support" reading came from grepping `flow/mod.rs`
+only. The collapse was `aspect-ratio` on flow-laid-out
+boxes: `tentative_block_content_size_with_dependency`
+(`formatting_contexts.rs`) returns `Some` only for
+`Replaced` contents, so an auto-height flow box with a
+definite width and `aspect-ratio` resolved its block size
+from content (zero for empty boxes).
+
+## What shipped (F-021, freezer)
+
+Three parts, all in `freezer/components/layout/`:
+
+1. **The ratio never reached non-replaced boxes
+   (root cause).** `IndependentFormattingContext::
+   preferred_aspect_ratio` returned `None` for everything
+   except replaced elements (`// TODO: support preferred
+   aspect ratios on non-replaced boxes`). It now returns
+   the style's ratio (`style.preferred_aspect_ratio(None,
+   ...)` — non-replaced boxes have no natural ratio),
+   mirroring the broken-image arm of the replaced path.
+   The tentative block content size still ignores the ratio
+   for flow boxes, so this does not feed a stretch-derived
+   size into intrinsic sizing.
+2. **The transfer itself.** New helper
+   `block_size_with_aspect_ratio` (`style_ext.rs`):
+   css-sizing-4 §2.2 — when a box has a preferred aspect
+   ratio and its block size is automatic, the block size is
+   calculated from the used inline size through the ratio,
+   handed to the sizing machinery as the content-size
+   fallback so min/max block sizes still clamp it. Applied
+   at the final block-size resolution in: flow in-flow
+   blocks (both branches of
+   `layout_in_flow_block_level_sequentially` + the
+   independent BFC-root layout + the float/atomic layout),
+   same-formatting-context blocks (ratio resolved from the
+   style directly — these have no
+   `IndependentFormattingContext`), absolutely positioned
+   boxes (`positioned.rs`), flex items (hypothetical cross
+   size + used cross size), and the Taffy grid-item leaf's
+   PerformLayout fallback.
+3. **A placement bug the transfer exposed.**
+   `PlacementState::place_fragment` returns early for a
+   first in-flow child whose margins collapse through it,
+   assuming such a fragment is ~zero height — but an
+   aspect-ratio box has a nonzero height with zero content,
+   so the following sibling was placed on top of it (the
+   P5 red div was laid out at 125 px yet painted invisible
+   under the green div). The early return now still
+   advances the block position by the fragment's size.
+   The `collapsed_through` flag itself is left alone: per
+   CSS 2.1 §8.3.1 the margins of a computed-`auto`-height
+   box do collapse through it; only the position advance
+   was missing.
+
+Known deviation, kept deliberately: intrinsic keywords in
+the block sizing properties (`min-content`, `max-content`,
+`fit-content`) also resolve through the ratio-derived size.
+That matches the long-standing replaced-element behaviour
+(the ratio-derived size is the tentative block content size
+there); the strict spec reading applies the transfer to
+automatic sizes only.
+
+## Gates (Round 30 binary, screenshot-verified firsthand)
+
+All 12 grid/aspect probes pass (pages in
+`r13-test/r30-grid/`, shots `r30-p*-fix*.jpg`):
+
+- P1 PornBrowser home page: 20 grey tiles, 5 per row, 4
+  rows — the exact page that was blank on Joel's box.
+- P2 explicit tracks, P3 explicit placement + nested grid,
+  P4 template areas: still correct (unchanged from survey).
+- P5 flow aspect-ratio: red 200x125 renders above the green
+  control (verified also by JS: `offsetHeight=125`,
+  `getBoundingClientRect` 200x125).
+- P6 grid-item aspect-ratio, P7 grid + explicit height:
+  still correct.
+- P8 flex items (stretch), P9 flex items
+  (`align-items:flex-start`): three 100x100 squares each.
+- P10 floated aspect-ratio box: 200x125 float, text beside
+  it. P11 aspect-ratio box with 300 px-tall content: outer
+  keeps the ratio height, content overflows. P12
+  absolutely positioned aspect-ratio box: 200x125.
+
+Regression (same binary): R18 MSE probe ALL PASS (30/30
+checks); R19 buffered [0.00-10.00]; R20 real YouTube DASH
+segments buffered [0.00-18.93] video / [0.00-19.06] audio;
+youtube.com loads with 0 PROTOCOL_ERROR (document 200,
+skeleton — the feed gap is unchanged, as expected);
+local H.264 plays to end (PositionChanged 5.00 +
+EndOfStream); plain WebM ALL PASS (duration 3.049, 0.00 to
+3.01); example.org renders; command palette opens with the
+full command list; hamburger menu opens; split view shows
+two panes; Freeze writes `example-domain-20261119-1722.html`
++ index.json correct ("Example Domain"); Settings Snowplow
+toggles Off (persists `snowplow: false`) and back On
+(persists `true`); Inspector F12 shows 35 nodes on
+example.org. Zero panics in any gate log.
+
+Tests: **89/89** (frost bin 54, frozen 18, extensions 9,
+inspector 8) + Freezer servo-config **3/3** — full suite run
+to completion by the finisher (the first builder's detached
+run survived its end; the frost test-binary link took ~23 min
+in the sandbox, `rust-lld` at ~32% CPU the whole way — slow,
+not stuck).
+
+## What remains (grid / aspect-ratio)
+
+- `repeat(auto-fill/auto-fit)`, `minmax()`, `subgrid`,
+  and `auto` track-sizing edge cases were not probed —
+  Taffy owns them; only explicit tracks, gap,
+  auto-placement, explicit placement, areas, and nesting
+  were verified.
+- Inline content sizes of an aspect-ratio box with text
+  content do not yet account for the ratio (the ratio is
+  not fed into `ConstraintSpace` for same-formatting-
+  context blocks); definite-width and stretch cases are
+  unaffected.
+- Percentage-height children of an aspect-ratio box still
+  resolve against an indefinite tentative block size (the
+  tentative size is ratio-unaware); the box's own height is
+  correct, the children's `%` heights are not.
+- Column-flex aspect-ratio transfer (cross = inline size
+  from definite main/block size) is not implemented; row
+  flex is.
+- Buttons with `aspect-ratio` are not covered (the button-
+  centering resolve at `flow/mod.rs` was left alone).
+- The Taffy leaf's ComputeSize (measurement) path was
+  deliberately left to Taffy — P6 proves it applies the
+  ratio there; only the PerformLayout fallback was patched.
+
+## Build incidents this round
+
+- `rustfmt` run without `--check` reformatted 12 extra
+  files (it follows `mod` declarations from `flow/mod.rs`);
+  the tree was restored with `git checkout` and the F-021
+  edits re-applied cleanly. Lesson: never run bare
+  `rustfmt` on a file in this tree; the installed rustfmt
+  also disagrees with the tree's pinned style (135
+  pre-existing diffs on the pristine tree).
+- First F-021 build gated P1/P5/P8 as still failing: the
+  resolve-site patches were no-ops because the ratio was
+  `None` at every site (the `preferred_aspect_ratio` TODO
+  stub). The flex sites worked first (they read the ratio
+  through the fixed method), which is what localized the
+  stub. A second miss: plain in-flow divs go through
+  `SameFormattingContextBlock::layout_in_flow_non_replaced_
+  block_level`, not the `IndependentFormattingContext`
+  path — that site was added after the flex result pointed
+  at it. A third miss: the collapsed-through placement
+  early return, found by pixel-sampling (0 red pixels) plus
+  a JS `offsetHeight` probe (125) proving layout was right
+  and painting/placement was wrong.
+- The full test suite's first run was SIGTERM'd after
+  ~20 min with no output (piped through `tail`); the
+  re-run writes to `r30-cargo-test.log` via a detached
+  `setsid nohup` so progress survives.
