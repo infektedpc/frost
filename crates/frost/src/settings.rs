@@ -171,11 +171,17 @@ impl Default for Settings {
 impl Settings {
     /// The settings file path: `$XDG_CONFIG_HOME/frost/settings.json`,
     /// else `~/.config/frost/settings.json`.
+    ///
+    /// Round 34: resolved by the `dirs` crate instead of hand-rolled
+    /// env-var chains. Same paths in every normal case (`$XDG_CONFIG_HOME`
+    /// when set and absolute, else `$HOME/.config`). Two degenerate
+    /// cases differ, both in the spec-correct direction: a *relative*
+    /// `XDG_CONFIG_HOME` is ignored (the XDG spec says relative values
+    /// are invalid; the old code used it verbatim), and with `HOME`
+    /// unset `dirs` falls back to the passwd entry instead of a
+    /// relative `.config` in the working directory.
     pub fn config_path() -> PathBuf {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .unwrap_or_else(|| PathBuf::from(".config"));
+        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
         base.join("frost").join("settings.json")
     }
 
@@ -304,5 +310,60 @@ mod tests {
         assert_ne!(dark.text, light.text);
         assert_eq!(dark.background, [0x2b, 0x2a, 0x33]);
         assert_eq!(light.background, [0xf2, 0xf2, 0xf5]);
+    }
+
+    #[test]
+    fn config_path_prefers_xdg_config_home() {
+        crate::with_env(
+            &[("XDG_CONFIG_HOME", Some("/tmp/frost-xdg-config")), ("HOME", Some("/tmp/frost-home"))],
+            || {
+                assert_eq!(
+                    Settings::config_path(),
+                    PathBuf::from("/tmp/frost-xdg-config/frost/settings.json")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn config_path_falls_back_to_home_dot_config() {
+        crate::with_env(
+            &[("XDG_CONFIG_HOME", None), ("HOME", Some("/tmp/frost-home"))],
+            || {
+                assert_eq!(
+                    Settings::config_path(),
+                    PathBuf::from("/tmp/frost-home/.config/frost/settings.json")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn config_path_ignores_relative_xdg_config_home() {
+        // The XDG spec says a relative XDG_CONFIG_HOME is invalid;
+        // `dirs` ignores it and falls back to $HOME/.config, where
+        // the old hand-rolled code used it verbatim.
+        crate::with_env(
+            &[("XDG_CONFIG_HOME", Some("relative/xdg")), ("HOME", Some("/tmp/frost-home"))],
+            || {
+                assert_eq!(
+                    Settings::config_path(),
+                    PathBuf::from("/tmp/frost-home/.config/frost/settings.json")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn config_path_without_home_is_absolute() {
+        // With HOME unset, `dirs` falls back to the passwd entry
+        // instead of the old code's relative `.config` in the
+        // working directory: the resolved path is absolute and
+        // still ends in `.config/frost/settings.json`.
+        crate::with_env(&[("XDG_CONFIG_HOME", None), ("HOME", None)], || {
+            let path = Settings::config_path();
+            assert!(path.is_absolute());
+            assert!(path.ends_with(".config/frost/settings.json"));
+        });
     }
 }

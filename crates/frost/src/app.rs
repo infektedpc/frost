@@ -20,6 +20,8 @@ use frost_extensions::{ExtensionHost, ExtensionManifest, RunAt, StubHost};
 use frost_inspector::{snapshot_from_json, DOM_WALK_SCRIPT};
 use url::Url;
 
+use nucleo_matcher::{Config, Matcher, Utf32Str};
+
 use crate::archive;
 use crate::file_browser;
 use crate::keymap::{map_button, map_code, map_key_with_text, map_location, map_modifiers};
@@ -310,18 +312,64 @@ fn reload_stop_button(loading: bool) -> (&'static str, Message) {
     }
 }
 
-/// Subsequence match, case-insensitive (Round 9): every character
-/// of the query appears in the label, in order. An empty query
-/// matches everything, so the palette opens on the full list.
+/// Scored fuzzy match (Round 34): nucleo-matcher's fzf-style
+/// matcher scores how well `query` matches `label` — prefix and
+/// contiguous matches score higher than scattered ones — so the
+/// palette can rank best match first. `None` means no match. An
+/// empty query matches everything with score 0, so the palette
+/// opens on the full list (same as the old hand-written
+/// subsequence matcher). `Config::DEFAULT` is case-insensitive.
+///
+/// The query is lowercased first — a nucleo-matcher 0.3.1 quirk,
+/// verified firsthand: with `ignore_case: true` its ASCII
+/// prefilter only folds case for LOWERCASE needle chars (an
+/// uppercase needle char must match an uppercase haystack char
+/// exactly), while its scorer compares the case-folded haystack
+/// against the RAW needle. A mixed-case needle that passes the
+/// prefilter therefore PANICS the scorer ("should have been
+/// caught by prefilter", `fuzzy_optimal.rs:37`). Lowercasing the
+/// query gives true case-insensitive matching (the Round 9
+/// semantics) and closes the panic hole; the haystack is folded
+/// by the matcher itself.
+fn fuzzy_score(query: &str, label: &str) -> Option<u16> {
+    let query = query.to_lowercase();
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut haystack_buf = Vec::new();
+    let mut needle_buf = Vec::new();
+    matcher.fuzzy_match(
+        Utf32Str::new(label, &mut haystack_buf),
+        Utf32Str::new(&query, &mut needle_buf),
+    )
+}
+
+/// Subsequence match, case-insensitive (Round 9, now backed by
+/// nucleo-matcher in Round 34): every character of the query appears
+/// in the label, in order. An empty query matches everything.
+/// Kept as the boolean match API — the Round 9 subsequence test
+/// exercises it; the palette itself ranks via `fuzzy_score`.
+#[allow(dead_code)]
 fn fuzzy_match(query: &str, label: &str) -> bool {
+    fuzzy_score(query, label).is_some()
+}
+
+/// Rank commands for a palette query (Round 34): best fuzzy score
+/// first, table order on ties (the sort is stable); an empty query
+/// returns the table unchanged. Pure, so the ranking is
+/// unit-testable; `palette_filtered` just feeds it the live table.
+fn rank_palette_commands(
+    query: &str,
+    commands: Vec<(&'static str, Message)>,
+) -> Vec<(&'static str, Message)> {
     if query.is_empty() {
-        return true;
+        return commands;
     }
-    let mut rest = label.chars();
-    query.chars().all(|qc| {
-        let qc = qc.to_ascii_lowercase();
-        rest.by_ref().any(|lc| lc.to_ascii_lowercase() == qc)
-    })
+    let mut scored: Vec<(u16, usize, (&'static str, Message))> = commands
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, (label, msg))| fuzzy_score(query, label).map(|score| (score, i, (label, msg))))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, cmd)| cmd).collect()
 }
 
 /// The palette's commands (Round 9): only actions that can act
@@ -845,20 +893,21 @@ impl Frost {
     }
 
     /// The palette's command list right now (Round 9): the
-    /// available commands, filtered by the current query in
-    /// table order. The filtered list is derived on demand, so
-    /// the view and the run path can never disagree about it.
+    /// available commands, filtered by the current query and ranked
+    /// best match first (Round 34). The filtered list is derived on
+    /// demand, so the view and the run path can never disagree
+    /// about it.
     fn palette_filtered(&self) -> Vec<(&'static str, Message)> {
-        palette_commands_for(
-            self.active_pane().can_back,
-            self.active_pane().can_forward,
-            self.active_pane().loading,
-            self.split,
-            self.active_pane().webview.url().is_some(),
+        rank_palette_commands(
+            &self.palette_query,
+            palette_commands_for(
+                self.active_pane().can_back,
+                self.active_pane().can_forward,
+                self.active_pane().loading,
+                self.split,
+                self.active_pane().webview.url().is_some(),
+            ),
         )
-            .into_iter()
-            .filter(|(label, _)| fuzzy_match(&self.palette_query, label))
-            .collect()
     }
 
     /// The command-palette panel (Round 9): a centered overlay
@@ -2884,6 +2933,58 @@ mod tests {
         assert!(!fuzzy_match("gfb", "Go back"));
         assert!(!fuzzy_match("gfb", "Go forward"));
         assert!(!fuzzy_match("settings open", "Open Settings"));
+    }
+
+    #[test]
+    fn fuzzy_score_ranks_prefix_above_scattered() {
+        // "re" is a contiguous prefix of "Reload" but a scattered
+        // mid-string match in "Freeze this page" — the prefix must
+        // score higher.
+        let reload = fuzzy_score("re", "Reload").unwrap();
+        let freeze = fuzzy_score("re", "Freeze this page").unwrap();
+        assert!(reload > freeze, "Reload {reload} should beat Freeze {freeze}");
+        // Same shape: "op" is a prefix of "Open Settings" but
+        // mid-string in "Stop loading".
+        let open = fuzzy_score("op", "Open Settings").unwrap();
+        let stop = fuzzy_score("op", "Stop loading").unwrap();
+        assert!(open > stop, "Open {open} should beat Stop {stop}");
+        // Contiguous beats scattered: "set" is contiguous in
+        // "Open Settings" and matches nothing in "Split view".
+        assert!(fuzzy_score("set", "Open Settings").is_some());
+        assert!(fuzzy_score("set", "Split view").is_none());
+        // An empty query matches everything with score 0.
+        assert_eq!(fuzzy_score("", "Open Settings"), Some(0));
+    }
+
+    #[test]
+    fn palette_ranking_puts_best_match_first() {
+        // The always-available table (nothing to go back/forward
+        // to, nothing loading, no page loaded).
+        let table = palette_commands_for(false, false, false, false, false);
+        // Empty query: the table unchanged, in table order.
+        let ranked = rank_palette_commands("", table.clone());
+        assert_eq!(
+            ranked.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            table.iter().map(|(l, _)| *l).collect::<Vec<_>>()
+        );
+        // "re": "Reload" is the contiguous prefix match, so it
+        // ranks first; the scattered matches follow.
+        let ranked = rank_palette_commands("re", palette_commands_for(false, false, false, false, false));
+        let labels: Vec<&str> = ranked.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels[0], "Reload");
+        assert_eq!(labels.len(), 4);
+        assert!(labels.contains(&"Print page…"));
+        assert!(labels.contains(&"Archived pages…"));
+        assert!(labels.contains(&"Focus address bar"));
+        // "set": "Open Settings" first (contiguous SET at 5-7);
+        // "Open Inspector" also matches as a scattered subsequence
+        // (s…e…t), so it follows — the palette lists all matches.
+        let ranked = rank_palette_commands("set", palette_commands_for(false, false, false, false, false));
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].0, "Open Settings");
+        assert_eq!(ranked[1].0, "Open Inspector");
+        // No match at all: empty list, never a stale row.
+        assert!(rank_palette_commands("zzz", palette_commands_for(false, false, false, false, false)).is_empty());
     }
 
     #[test]

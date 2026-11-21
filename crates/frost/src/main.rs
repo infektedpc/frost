@@ -96,6 +96,9 @@
 mod archive;
 
 #[cfg(feature = "ui-libcosmic")]
+mod cache;
+
+#[cfg(feature = "ui-libcosmic")]
 mod file_browser;
 
 #[cfg(feature = "ui-libcosmic")]
@@ -107,6 +110,50 @@ mod settings;
 #[cfg(feature = "ui-libcosmic")]
 #[cfg(feature = "ui-libcosmic")]
 mod app;
+
+/// Test-only: serialize tests that mutate process env vars (the
+/// XDG-path tests in `settings` and `archive`). Env vars are
+/// process-global and the test runner runs tests on multiple threads
+/// in one process, so two env-mutating tests must never overlap.
+/// The lock is poison-tolerant: a test that panics mid-mutation must
+/// not wedge the rest of the suite.
+#[cfg(all(test, feature = "ui-libcosmic"))]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only: run `f` with the given env vars set (or removed, for
+/// `None`), restoring the previous values afterwards — even if `f`
+/// panics. Holds `ENV_LOCK` for the whole call, including the
+/// restore.
+#[cfg(all(test, feature = "ui-libcosmic"))]
+pub(crate) fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    struct Restore<'a> {
+        saved: Vec<(&'a str, Option<std::ffi::OsString>)>,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+    let saved: Vec<(&str, Option<std::ffi::OsString>)> = vars
+        .iter()
+        .map(|(k, _)| (*k, std::env::var_os(k)))
+        .collect();
+    let restore = Restore { saved };
+    for (k, v) in vars {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    f();
+    drop(restore);
+}
 
 #[cfg(feature = "ui-libcosmic")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -34,6 +34,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache::DiskCache;
+
 /// The capture script (Round 15): runs in the page via
 /// `WebView::evaluate_javascript_string` and returns the frozen
 /// document's `outerHTML` as a string. It works on a clone of
@@ -103,13 +105,17 @@ impl ArchiveEntry {
 
 /// The archives directory: `$XDG_DATA_HOME/frost/archives/`, else
 /// `~/.local/share/frost/archives/`.
+///
+/// Round 34: resolved by the `dirs` crate instead of hand-rolled
+/// env-var chains. Same paths in every normal case (`$XDG_DATA_HOME`
+/// when set and absolute, else `$HOME/.local/share`). Two degenerate
+/// cases differ, both in the spec-correct direction: a *relative*
+/// `XDG_DATA_HOME` is ignored (the XDG spec says relative values
+/// are invalid; the old code used it verbatim), and with `HOME`
+/// unset `dirs` falls back to the passwd entry instead of a relative
+/// `.local/share` in the working directory.
 pub fn archives_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".local").join("share"));
+    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".local").join("share"));
     base.join("frost").join("archives")
 }
 
@@ -215,24 +221,55 @@ pub fn build_archive_html(url: &str, captured_outer_html: &str, frozen_at_unix: 
     )
 }
 
-/// Load the index (missing or unparseable means empty — never an
-/// error page, never a crash; a corrupt index just re-derives
-/// from the directory scan in `list_archives`).
+/// The parsed archive-index cache (Round 34): `list_archives`
+/// runs on every Archives-window open, and the index file does not
+/// change between Frost-side writes — so the parsed index is cached
+/// per directory (bounded, 60 s TTL) instead of being re-read and
+/// re-parsed every time. The directory scan in `list_archives`
+/// still runs every time (orphan recovery + stale pruning), so the
+/// list stays honest if files are moved by hand; only the JSON
+/// read/parse is cached. Frost-side writes go through `save_index`,
+/// which writes the cache through, so the cache never disagrees
+/// with what Frost wrote. An external edit to `index.json`
+/// surfaces within the TTL (60 s) or on restart.
+fn index_cache() -> &'static DiskCache<PathBuf, Vec<ArchiveEntry>> {
+    static CACHE: std::sync::OnceLock<DiskCache<PathBuf, Vec<ArchiveEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| DiskCache::new(64))
+}
+
+/// Load the index, through the cache: a miss reads and parses the
+/// file once, a hit serves the parsed entries with no disk read.
+/// (Missing or unparseable means empty — never an error page, never
+/// a crash; a corrupt index just re-derives from the directory scan
+/// in `list_archives`.)
 fn load_index(dir: &Path) -> Vec<ArchiveEntry> {
+    index_cache()
+        .get_or_load(dir.to_path_buf(), || load_index_from_disk(dir))
+        .as_ref()
+        .clone()
+}
+
+/// The actual disk read behind `load_index`.
+fn load_index_from_disk(dir: &Path) -> Vec<ArchiveEntry> {
     match std::fs::read_to_string(index_path(dir)) {
         Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }
 
-/// Save the index (creating the directory first).
+/// Save the index (creating the directory first), writing the cache
+/// through: the file now contains exactly `entries`, so the cached
+/// parse is the same list.
 fn save_index(dir: &Path, entries: &[ArchiveEntry]) -> Result<(), String> {
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let json = serde_json::to_string_pretty(entries)
         .map_err(|e| format!("cannot serialize archive index: {e}"))?;
     std::fs::write(index_path(dir), json)
-        .map_err(|e| format!("cannot write {}: {e}", index_path(dir).display()))
+        .map_err(|e| format!("cannot write {}: {e}", index_path(dir).display()))?;
+    index_cache().insert(dir.to_path_buf(), entries.to_vec());
+    Ok(())
 }
 
 /// Save a frozen page to `dir` (creating it first) and record it in
@@ -511,6 +548,105 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].title, "New");
         assert_eq!(listed[1].title, "Old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archives_dir_prefers_xdg_data_home() {
+        crate::with_env(
+            &[("XDG_DATA_HOME", Some("/tmp/frost-xdg-data")), ("HOME", Some("/tmp/frost-home"))],
+            || {
+                assert_eq!(
+                    archives_dir(),
+                    PathBuf::from("/tmp/frost-xdg-data/frost/archives")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn archives_dir_falls_back_to_home_dot_local_share() {
+        crate::with_env(
+            &[("XDG_DATA_HOME", None), ("HOME", Some("/tmp/frost-home"))],
+            || {
+                assert_eq!(
+                    archives_dir(),
+                    PathBuf::from("/tmp/frost-home/.local/share/frost/archives")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn archives_dir_ignores_relative_xdg_data_home() {
+        // The XDG spec says a relative XDG_DATA_HOME is invalid;
+        // `dirs` ignores it and falls back to $HOME/.local/share,
+        // where the old hand-rolled code used it verbatim.
+        crate::with_env(
+            &[("XDG_DATA_HOME", Some("relative/xdg")), ("HOME", Some("/tmp/frost-home"))],
+            || {
+                assert_eq!(
+                    archives_dir(),
+                    PathBuf::from("/tmp/frost-home/.local/share/frost/archives")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn archives_dir_without_home_is_absolute() {
+        // With HOME unset, `dirs` falls back to the passwd entry
+        // instead of the old code's relative `.local/share` in the
+        // working directory: the resolved path is absolute and
+        // still ends in `.local/share/frost/archives`.
+        crate::with_env(&[("XDG_DATA_HOME", None), ("HOME", None)], || {
+            let path = archives_dir();
+            assert!(path.is_absolute());
+            assert!(path.ends_with(".local/share/frost/archives"));
+        });
+    }
+
+    #[test]
+    fn archive_index_is_cached_between_lists() {
+        // Proof the cache is consulted: after the first list, the
+        // index file is deleted from disk. A re-read would recover
+        // the archive as an orphan titled by its file stem; the
+        // cached index still titles it "Example".
+        let dir = temp_dir("cache-hit");
+        save_archive(&dir, "Example", "https://example.org/", "<html/>", 1794862200).unwrap();
+        let listed = list_archives(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Example");
+        std::fs::remove_file(dir.join("index.json")).unwrap();
+        let listed = list_archives(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Example");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_index_write_through_after_save() {
+        // A Frost-side write refreshes the cache, so a later list
+        // shows the new entry without a stale read.
+        let dir = temp_dir("cache-write");
+        save_archive(&dir, "First", "https://a.example/", "<html/>", 1794862200).unwrap();
+        save_archive(&dir, "Second", "https://b.example/", "<html/>", 1794862300).unwrap();
+        let listed = list_archives(&dir);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].title, "Second");
+        assert_eq!(listed[1].title, "First");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_index_write_through_after_delete() {
+        let dir = temp_dir("cache-delete");
+        let entry =
+            save_archive(&dir, "Example", "https://example.org/", "<html/>", 1794862200)
+                .unwrap();
+        assert_eq!(list_archives(&dir).len(), 1);
+        delete_archive(&dir, &entry).unwrap();
+        assert!(list_archives(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

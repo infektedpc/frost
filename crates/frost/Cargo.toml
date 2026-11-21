@@ -25,6 +25,13 @@ frost-extensions = { path = "../frost-extensions" }
 # Round 5: the inspector (DOM walker script + snapshot parsing).
 frost-inspector = { path = "../frost-inspector" }
 url = "2"
+# Round 34: nucleo-matcher 0.3 (ranked fuzzy matching for the command
+# palette), dirs 7 (XDG config/data/cache dirs — already in the
+# workspace lock via the Freezer, zero new dependencies), moka 0.12
+# (bounded in-memory cache; sync API, no async runtime needed).
+nucleo-matcher = "0.3"
+dirs = "7"
+moka = { version = "0.12", features = ["sync"] }
 # Round 16: the GL-default probe in main.rs asks wgpu itself whether
 # a GL adapter exists before setting `WGPU_BACKEND=gl` (wgpu 28 is
 # already in the tree via libcosmic, so this unifies to the same

@@ -3656,3 +3656,78 @@ Tests: 89/89 + servo-config 3/3. Full detail in
 `DIAGNOSIS.md` (Round 33 section); next lead: dump the
 document HTML Frost actually received and search it for
 the body bytes.
+
+## Round 34 — crates 1+4+10: nucleo-matcher + dirs + moka
+
+Joel's pick from the crates.io survey (2026-11-21): implement
+three of the top 10 together. No engine changes (Freezer
+untouched); no behaviour change intended anywhere except the
+palette now ranks. Tests: **108/108** (frost bin 73, frozen 18,
+extensions 9, inspector 8) + servo-config 3/3 — up from 89/89,
++19 new tests.
+
+- **nucleo-matcher 0.3.1** (`crates/frost/src/app.rs`):
+  the scoreless hand-written `fuzzy_match` is replaced by
+  `fuzzy_score` (nucleo `Matcher::new(Config::DEFAULT)`) and
+  a pure `rank_palette_commands` (best score first, stable
+  sort keeps table order on ties, empty query returns the
+  table unchanged). `palette_filtered` calls it, so the
+  palette now ranks best match first. Gate (screenshots
+  `r34-02-palette-re.jpg`, `r34-03-palette-set.jpg`): query
+  "re" lists Reload, Freeze this page, Focus address bar,
+  Archived pages…, Print page… — ranked, not table order;
+  "set" lists Open Settings first, then Open Inspector.
+  Upstream quirk found and worked around firsthand:
+  nucleo 0.3.1 with `ignore_case: true` only folds case for
+  LOWERCASE needle chars in its ASCII prefilter (an
+  uppercase needle char must match an uppercase haystack
+  char exactly), while its scorer compares the case-folded
+  haystack against the RAW needle — so "SET" does not match
+  "Open Settings" and a mixed-case needle that passes the
+  prefilter PANICS the scorer ("should have been caught by
+  prefilter", `fuzzy_optimal.rs:37`). `fuzzy_score`
+  lowercases the query first, restoring true
+  case-insensitive matching (the Round 9 semantics) and
+  closing the panic hole. Scores observed: "set"/"Open
+  Settings" 88, "re"/"Reload" 62, "re"/"Focus address bar"
+  36, "re"/"Archived pages…" 26, "re"/"Print page…" 23.
+- **dirs 7.0.0** (`settings.rs`, `archive.rs`): the
+  hand-rolled XDG env-var resolution is replaced by
+  `dirs::config_dir()` / `data_dir()`, same paths and same
+  fallbacks (`.config` / `.local/share`). Already in the
+  Freezer lockfile, so zero new dependencies. Gate: toggled
+  Snowplow off in Settings and saved — `settings.json`
+  landed at `$XDG_CONFIG_HOME/frost/settings.json` with
+  `"snowplow": false`; a Freeze landed at
+  `$XDG_DATA_HOME/frost/archives/example-domain-20261121-0906.html`
+  with `index.json` ("Example Domain"). Two documented
+  edge differences from the old code (spec-correct):
+  relative XDG vars are ignored, and an unset HOME falls
+  back to the passwd entry instead of a relative `.config`.
+- **moka 0.12.16** (new `crates/frost/src/cache.rs`):
+  a generic `DiskCache<K, V>` on `moka::sync::Cache`
+  (max entries + 60 s TTL, `get_or_load` / `insert` /
+  `invalidate` / `entry_count` / `run_maintenance`),
+  wired into the real path — the Deep Freeze archive
+  metadata: `archive.rs` keeps a `OnceLock`
+  `DiskCache<PathBuf, Vec<ArchiveEntry>>` (max 64) and
+  `load_index` routes through it; `save_index` /
+  `delete_archive` write through to it, so the cache is
+  never stale by more than the 60 s TTL. The directory
+  scan in `list_archives` still runs every time (orphan
+  recovery + stale pruning preserved). Gate, live
+  (`r34-08/09/10-archives-*.jpg`): froze example.org,
+  deleted `index.json` from disk, confirmed the Archived
+  pages window closed (0 windows), reopened it inside the
+  TTL — it still showed "Example Domain" with full
+  metadata instead of the orphan stem title. Unit tests
+  prove the same hit deterministically plus misses,
+  eviction (capacity 2 holds ≤ 2 after maintenance) and
+  TTL expiry (2 s test cache reloads after a 3 s sleep).
+  Moka note for future rounds: `entry_count()` only
+  reflects writes after `run_maintenance()` — it reads 0
+  on a fresh cache, by design.
+
+No .deb in this round. Not pushed to GitHub (Rounds 32–33
+are unpushed; Round 32's push was halted and Joel chose to
+leave it unpushed).
