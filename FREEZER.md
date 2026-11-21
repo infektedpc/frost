@@ -1,13 +1,18 @@
 # Freezer — Frost's engine
 
 Frost does not build against upstream Servo. It builds against Freezer,
-its own engine codebase, which lives at `freezer/` inside this repo (a
-**nested git repo** — it has its own `.git`, is gitignored by the frost
-repo, and is never committed into it). Freezer started life as a Servo
-fork so Frost could move on its own schedule; in Round 23 (2026-11-17)
-it was cut loose from Servo's git entirely — the upstream remote is
-gone, the history was squashed into a single commit, and Freezer is
-developed on its own from here. Engine fixes land as Freezer commits.
+its own engine codebase, which lives at `freezer/` inside this repo as
+a **git submodule** — its own repo, `infektedpc/freezer` on GitHub,
+pinned in the frost repo as a gitlink (commit `139915d2d`, F-023, as of
+2026-11-21). It is no longer gitignored and is committed into the frost
+repo as a submodule pointer. Freezer started life as a Servo fork so
+Frost could move on its own schedule; in Round 23 (2026-11-17) it was
+cut loose from Servo's git entirely — the upstream remote is gone, the
+history was squashed into a single commit, and Freezer is developed on
+its own from here. Engine fixes land as Freezer commits (Joel's rule,
+2026-11-21: commit Freezer work in the Freezer repo right away — no
+patches sitting anywhere), and reach GitHub by bundle → Joel's box →
+`git push` (the sandbox cannot push git; see below).
 
 > **Cargo gotcha (2026-11-12):** `freezer/` is also a nested *workspace*.
 > Cargo resolves a path dependency nested inside a workspace directory
@@ -20,15 +25,20 @@ developed on its own from here. Engine fixes land as Freezer commits.
 
 ## Getting Freezer
 
-Freezer travels with the frost repo on the build machine — it is NOT in
-the delivery zip and NOT in the GitHub snapshot (both exclude the nested
-repo). A machine that has only the zip or a snapshot checkout cannot
-build until a Freezer tree is placed at `./freezer/`. There is no
-recreation script any more: `clone-fork.sh` (shallow-clone upstream
-Servo v0.8.0 + apply the patches) was retired in Round 23 when the
-fork was cut loose. The 15 changes themselves are still recorded in
-`patches/` (see below) — re-applying them to a fresh Servo 0.8.0
-checkout by hand would be the recovery path if the tree were ever lost.
+Freezer is a submodule of the frost repo. A fresh clone gets it with
+`git clone --recurse-submodules https://github.com/infektedpc/frost.git`,
+or after a plain clone run `git submodule update --init` (the submodule
+points at `https://github.com/infektedpc/freezer.git`, branch main).
+Freezer is NOT in the delivery zip — a machine that has only the zip
+cannot build until a Freezer tree is placed at `./freezer/` (clone the
+freezer repo there, or copy one). There is no recreation script any
+more: `clone-fork.sh` (shallow-clone upstream Servo v0.8.0 + apply the
+patches) was retired in Round 23 when the fork was cut loose. The 15
+changes themselves are still recorded in `patches/` (see below) —
+re-applying them to a fresh Servo 0.8.0 checkout by hand would be the
+recovery path if the tree were ever lost. (The sandbox copy was the
+only current Freezer tree until 2026-11-21, when Joel pushed it to
+GitHub from a bundle.)
 
 ## Fork point
 
@@ -115,10 +125,15 @@ before it is needed. Each gets its own commit when built.
 | **F-007** | No way to force a layout reflow at an unchanged viewport (the real full-repaint trigger; F-005 only re-sends the viewport). Standing repro (finish pass 2026-11-13): the keytest page (`file://…/keytest.html`) never paints its body on load or reload — see ARCHITECTURE.md. **ROOT CAUSE FOUND 2026-11-14 (Round 4): not a reflow problem at all.** Instrumented paint-thread logging proved the display lists arrive complete (2046 bytes, viewport 1280×684) and WebRender renders the full frame once — then only dirty regions. The damage-rects patch had set `max_partial_present_rects: 1` (partial present), whose contract requires the embedder to keep its own full-frame backing buffers; Frost reads the GL back buffer wholesale and `Painter::render` clears it first, so every frame after the first is white except the dirty regions. **LANDED 2026-11-14 (Round 4, commit `f4886bf57`): `max_partial_present_rects: 0` — full present, the upstream default. No new reflow hook was needed; the Round 2 resize jiggle is RETIRED (Round 4 gate: keytest paints fully on load AND reload with no jiggle).** | Add a fork hook that forces the constellation to reflow the pipeline at the current viewport, so the jiggle can finally retire. |
 | **F-008** | A navigation stuck at the constellation cannot be aborted: F-001's `stop()` only reaches the CURRENT pipeline (`handle_stop_msg` → `ScriptThreadMessage::Stop`), and the embedder cannot name the pending pipeline to abort it (`handle_abort_load_url_msg` exists script-side only). **LANDED 2026-11-14 (Round 4, commit `f9462dbb7`): `handle_stop_msg` now also drains the webview's pending session-history changes for the top-level browsing context and closes their pipelines — Stop aborts both the current load AND any pending navigation. No new message type; the app calls the same `stop()`.** **App-side companion (Round 4, `crates/frost/src/main.rs`): the app now sets `loading = true` at the moment a navigation is requested (address-bar submit, Back, Forward, Reload, `load_loopback`) instead of waiting for `LoadStarted`. Servo only reports `LoadStatus::Started` when a new Document is initialized — which needs the first response bytes — so a server that never responds at all never fires `LoadStarted`, and without this the Stop button (live only while `loading`) was dead for exactly the hang Stop is meant to escape. Gated 2026-11-14 (see README).** | Fold the pending-change abort into `stop()` (done) rather than a new `EmbedderToConstellationMessage`. |
 
-## No upstream
+## No upstream (Servo) — but Freezer has its own remote now
 
-Freezer has no upstream remote and no tracking branch. There is nothing
-to fetch or rebase against — new engine work is committed straight into
-`freezer/`. If a future Servo release is ever worth looking at, that is
-a manual porting job, not a merge. Re-run the smoke test after engine
+Freezer has no upstream (Servo) remote and no tracking branch. There is
+nothing to fetch or rebase against from Servo — new engine work is
+committed straight into `freezer/`. Freezer's own remote is `origin`
+→ `https://github.com/infektedpc/freezer.git` (branch `main` on GitHub,
+`master` locally); pushing it happens from Joel's box, not the sandbox
+— the sandbox cannot push git (SSH blocked, no credential), so a round
+with Freezer changes ends with a fresh bundle sent to him to pull and
+push. If a future Servo release is ever worth looking at, that is a
+manual porting job, not a merge. Re-run the smoke test after engine
 changes (`cargo run -p frozen --example smoke`).
