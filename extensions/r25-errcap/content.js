@@ -1,4 +1,4 @@
-// R32 Error Capture content script (runs at DocumentStart / HeadParsed).
+// R33 Error Capture content script (runs at DocumentStart / HeadParsed).
 // Captures page JS errors, unhandled rejections, console.error/warn, and
 // every fetch/XHR/sendBeacon call, into a fixed on-page banner +
 // document.title. Every line is stamped with ms since install, so the
@@ -48,7 +48,7 @@
     try { sw = (navigator && navigator.serviceWorker) ? typeof navigator.serviceWorker : 'undefined'; } catch (e) { sw = 'err'; }
     var vis = 'n/a';
     try { vis = document.visibilityState; } catch (e) { vis = 'err'; }
-    return 'R32-ERRCAP active. IO=' + (typeof IntersectionObserver) +
+    return 'R33-ERRCAP active. IO=' + (typeof IntersectionObserver) +
       ' RIC=' + (typeof requestIdleCallback) +
       ' SCH=' + sch + ' postTask=' + pt + ' SW=' + sw + ' VIS=' + vis;
   }
@@ -60,7 +60,7 @@
     lines.push(stamp() + kind + ': ' + msg);
     if (lines.length > 200) lines.shift();
     box.textContent = firstLine() + '\n' + lines.join('\n');
-    try { document.title = 'R32: ' + lines[lines.length - 1].slice(0, 120); } catch (e) {}
+    try { document.title = 'R33: ' + lines[lines.length - 1].slice(0, 120); } catch (e) {}
     // Round 29: mirror every line to the engine log via console.log
     // (frozen logs ERRCAP-prefixed console messages at info level).
     // console.log itself is not wrapped by this script, so no recursion.
@@ -125,6 +125,17 @@
       try {
         var s = (init && init.signal) || (input && input.signal);
         if (s) sig = ' signal.aborted=' + s.aborted;
+      } catch (e) {}
+      // Round 33: for player calls only, log the fetch init — an unusual
+      // mode/credentials/cache/referrerPolicy could route differently.
+      try {
+        if (String(url).indexOf('youtubei/v1/player') !== -1) {
+          var im = (init && init.mode) || (input && input.mode) || 'n/a';
+          var ic = (init && init.credentials) || (input && input.credentials) || 'n/a';
+          var ica = (init && init.cache) || (input && input.cache) || 'n/a';
+          var ir = (init && init.referrerPolicy) || (input && input.referrerPolicy) || (input && input.referrer) || 'n/a';
+          log('FETCH-INIT', 'mode=' + im + ' credentials=' + ic + ' cache=' + ica + ' referrerPolicy=' + ir);
+        }
       } catch (e) {}
       log('FETCH', method + ' ' + String(url).slice(0, 160) + sig);
       var p;

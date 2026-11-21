@@ -3619,3 +3619,40 @@ re-examination. Tests: 89/89 + servo-config 3/3. Full
 detail in `DIAGNOSIS.md` (Round 32 section); next lead:
 bracket the break with logs at the script-thread fetch
 entry and the resource-thread `fetch()` entry.
+
+## Round 33 — the break bracketed: the player POST is answered by a data: URL fetch (F-023)
+
+Diagnosis round, no fix shipped — but the R25–R32 paradox is
+SOLVED. F-023 adds two `info!` logs: `script_fetch` at the
+`window.fetch` binding (`fetch::Fetch`, script thread) and
+`net_fetch` at the resource-thread `fetch()` entry
+(`components/net/fetch/methods.rs`), plus errcap v0.7.0
+(FETCH-INIT: mode/credentials/cache/referrerPolicy for
+player calls). 300 s YouTube gate, Snowplow OFF: 7 player
+POST attempts page-side, 6 resolve 200 — and **0** reach
+`script_fetch`, `net_fetch`, or `http_fetch`. The smoking
+gun: 7 `GET data:application/json;base64,...` fetches at
+`script_fetch`, one per attempt, whose decoded bodies match
+the PLAYER-BODY lens exactly (328/96 stubs + 61773/61792/
+262631 real `streamingData` responses). The data: fetches
+bypass the errcap wrapper entirely (0 `FETCH: GET data:`
+lines) but reach `methods::fetch` (20 `net_fetch GET data:`
+lines) and never reach `http_fetch` (0 — `scheme_fetch`
+routes data: to the data protocol). So YouTube's network
+layer — installed before the errcap, `toString`-transparently
+native — intercepts `fetch(POST youtubei/v1/player)` and
+serves it from a `data:` URL through its own captured
+native-fetch reference. There never was an https response
+to lose: the "player POST" never happens. R31's audit is
+resolved, not refuted. FETCH-INIT is ordinary throughout
+(`mode=same-origin credentials=same-origin cache=default
+referrerPolicy=about:client`) — the init plays no role.
+Feed still stalled (`browse` 0×; 105 s skeleton, 300 s page
+body fully black). Still open: where the wrapper gets the
+body (not the network, not the anonymous homepage HTML —
+videoId `tBfjQJdlHSK` is in neither), the wrapper's exact
+identity (Proxy vs bound function), and the feed trigger.
+Tests: 89/89 + servo-config 3/3. Full detail in
+`DIAGNOSIS.md` (Round 33 section); next lead: dump the
+document HTML Frost actually received and search it for
+the body bytes.

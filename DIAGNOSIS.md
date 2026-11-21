@@ -1832,3 +1832,156 @@ instrumented. That is the next bracket.
 4. **Watch-page event delivery (R24 block) and the
    metadata flake** are unchanged by this round and still
    await the backtrace on Joel's box.
+
+## Round 33 — the break bracketed: the player POST is answered by a data: URL fetch (F-023)
+
+Gate: 300 s YouTube homepage, Snowplow OFF, R33 F-023 binary
+(522,387,320 B, `-C link-arg=-Wl,--strip-debug`), errcap v0.7.0.
+Log: `r33-gate-yt.log` (45,456 lines). Screenshots:
+`r33-yt-105s.jpg`, `r33-yt-300s.jpg`. Tests: 89/89 +
+servo-config 3/3 (plain `cargo test --workspace` stops at the
+frost-bin GL probes, 52 passed / 2 failed without the launcher
+Mesa env — known env-sensitive probes; re-run directly with
+the launcher env: 54/54).
+
+### What shipped (F-023)
+
+- **(a) `script_fetch`:** one `info!` log at `fetch::Fetch`
+  entry in `components/script/fetch/fetch.rs` (the
+  `window.fetch` binding) — method + URL. Full handoff chain
+  mapped this round: `window.fetch` → `fetch::Fetch` →
+  `FetchGroup::fetch` → `fetch_async` (net_traits) →
+  `FetchThread` → `CoreResourceMsg::Fetch` →
+  `CoreResourceManager::fetch` (resource_thread.rs:788) →
+  `methods::fetch` → `main_fetch` → `scheme_fetch` →
+  `http_fetch`.
+- **(b) `net_fetch`:** one `info!` log at `fetch()` entry
+  in `components/net/fetch/methods.rs` — method + URL.
+  (Note: `components/net/fetch/mod.rs` does not exist; the
+  resource-thread `fetch()` lives in `methods.rs`.)
+- **Errcap v0.7.0 (`extensions/r25-errcap/`):** FETCH-INIT —
+  the fetch init's `mode` / `credentials` / `cache` /
+  `referrerPolicy` for `youtubei/v1/player` calls only.
+
+### Decisive result — the player POST never enters `fetch::Fetch`
+
+| layer | youtubei/v1/player | log_event | guide | feedback | browse |
+|---|---|---|---|---|---|
+| errcap FETCH attempts (page-side) | 7 POST | 8 (XHR) | 2 | 1 | 0 |
+| errcap FETCH-OK 200 | 6 | 8 | 2 | 1 | 0 |
+| `script_fetch` entries | **0** | — (XHR, not fetch) | 2 | 1 | 0 |
+| `net_fetch` entries | **0** | 8 | 2 | 1 | 0 |
+| `http_fetch` entries | **0** | 8 | 2 | 1 | 0 |
+
+(`log_event` goes through XHR, not `window.fetch`, so it
+correctly never appears at `script_fetch` — that absence
+is expected, not evidence. Totals at 300 s: `script_fetch`
+197 (194 GET + 3 POST), `net_fetch` 541 (509 GET https +
+12 POST https + 20 GET data:), `http_fetch` 521 (509 GET
+https + 12 POST https). The 20 `net_fetch` data: lines are
+the 7 player bodies + 13 other data: subresources; 0 data:
+lines reach `http_fetch` — `scheme_fetch` routes data: to
+the data protocol, not HTTP.)
+
+The smoking gun — 7 `GET data:application/json;base64,...`
+fetches at `script_fetch`, one per player attempt, whose
+decoded bodies match the PLAYER-BODY lens EXACTLY:
+
+```
+[2026-11-21T08:18:09Z INFO  script::fetch::fetch] script_fetch GET data:application/json;base64,eyJhZFBsYWNlbWVudHMiOnRydWUsInBsYXllckFkcyI6dHJ1ZSwicGxheWVyUmVzcG9uc2UiOnsiYWRQbGFjZW1lbnRzIjp0cnVlLCJwbGF5ZXJBZHMiOnRydWUsInBsYXllckNvbmZpZyI6IHsiYXVkaW9Db25maWciOiB7fSwgInN0cmVhbVNlbGVjdGlvbkNvbmZpZyI6IHt9LCAid2ViUGxheWVyQ29uZmlnIjogeyJ3ZWJQbGF5ZXJBY3Rpb25zUG9ydGluZyI6IHt9fX19LCJwbGF5ZXJDb25maWciOiB7ImF1ZGlvQ29uZmlnIjoge30sICJzdHJlYW1TZWxlY3Rpb25Db25maWciOiB7fSwgIndlYlBsYXllckNvbmZpZyI6IHsid2ViUGxheWVyQWN0aW9uc1BvcnRpbmciOiB7fX19fQ==
+```
+
+Decoded and compared programmatically: 7 data: bodies =
+[328, 96, 328, 96, 61773, 61792, 262631]; PLAYER-BODY
+lines (6 settled) = [328, 328, 96, 61773, 61792, 262631].
+The 7th data: fetch is the attempt whose promise never
+settled (the `themeRefresh` reload killed the document —
+same shape as R32). The big bodies are real player
+responses (`streamingData=true playabilityStatus=true`,
+videoId `tBfjQJdlHSK`, itag-18 formats inside).
+
+Three facts pin the mechanism:
+
+1. The data: fetches do NOT go through the errcap wrapper:
+   0 `FETCH: GET data:` lines in the errcap log, while
+   `script_fetch` logs all 7. They bypass `window.fetch` —
+   issued by code holding a direct reference to the native
+   fetch.
+2. The data: fetches DO reach `methods::fetch` (20
+   `net_fetch GET data:` lines) but 0 reach `http_fetch`.
+3. The app's promise resolves 200 with exactly the data:
+   body. The request that reaches `fetch::Fetch`
+   (`GET data:...`) is not the request the app made
+   (`POST youtubei/v1/player`) — the transformation happens
+   inside `ofetch`, between the errcap wrapper's log line
+   and the Rust binding.
+
+So: YouTube's network layer wraps `window.fetch` before
+the errcap installs (its `toString` is transparently
+native — a Proxy or bound function — which is why R32's
+FETCH-IDENT showed native). When the app calls
+`fetch(POST youtubei/v1/player)`, the wrapper does not
+forward the POST to the network; it fetches
+`data:application/json;base64,<the body>` through its own
+captured native-fetch reference and returns a 200 Response
+with the real body. R31's audit conclusion is RESOLVED,
+not refuted: there IS no path that returns a real https
+response without `http_fetch` — because there is no https
+response at all. The "player POST" never happens; the app
+is served a local data: URL. The engine was never the
+place the request died — the request was rewritten in
+page JS before the engine ever saw it.
+
+FETCH-INIT (7 lines, all identical):
+`mode=same-origin credentials=same-origin cache=default
+referrerPolicy=about:client` — a completely ordinary init.
+The init is exonerated; it plays no role.
+
+Feed still stalled: `browse` 0× in 300 s. Screenshots:
+105 s skeleton with native FETCH-IDENT lines visible in
+the banner; 300 s page body fully black. 0 FETCH-ERR,
+0 F-018 network errors. (Side note: videoplayback itag-18
+GETs now resolve FETCH-OK 403 in the gate, vs connection
+resets in R28/R29 — sandbox-IP-side, not pursued.)
+
+### What is still open
+
+- **Where the wrapper gets the body.** It is NOT from the
+  network (0 player fetches at any engine layer, 0 XHR /
+  beacon / WebSocket player traffic) and NOT from the
+  anonymous homepage HTML (curl'd homepage, 939,927 B,
+  contains neither the videoId `tBfjQJdlHSK` from the
+  262,631 body nor a distinctive JSON fragment of it).
+  Candidates: embedded `ytInitialPlayerResponse` in the
+  page variant Frost is served (different UA/cookies from
+  the curl), or synthesis from embedded page data.
+- **The wrapper's exact identity** (Proxy vs bound function
+  vs other). R32's FETCH-IDENT cannot distinguish them:
+  `Function.prototype.toString` is transparent for both.
+- **The feed trigger** (`browse` 0×, R25–R33) is still
+  unknown and now looks separate from the player
+  mechanism: the app HAS player data served locally, yet
+  it never asks for the feed. The browse trigger is the
+  remaining gap.
+- **Watch-page event delivery (R24 block) and the
+  metadata flake** unchanged, still await the backtrace on
+  Joel's box.
+
+## Leads for Round 34 (not diagnosed in this round)
+
+1. **Body provenance:** dump the document HTML the engine
+   actually received and search it for the 262,631 body
+   bytes / videoId `tBfjQJdlHSK` / a distinctive
+   `streamingData` fragment. If embedded, the wrapper is a
+   local cache over page data; if absent, it synthesizes or
+   fetches via a channel not yet seen.
+2. **Wrapper identity:** canary probes at errcap install —
+   call `ofetch` with a canary https URL and confirm it
+   reaches `script_fetch` (proves pass-through for
+   non-player URLs; already implied by guide/feedback
+   passing through), plus `name`/`length`/descriptor
+   checks, to pin down Proxy vs bound function.
+3. **Feed trigger:** `browse` still 0× — the player
+   mechanism is solved; the feed gap is now the sharpest
+   open question. Probe what gates the app's first browse
+   call (it never even attempts it).
