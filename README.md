@@ -3546,3 +3546,38 @@ WebM, example.org, palette, menu, split view, Freeze +
 index.json, Settings Snowplow persists, Inspector F12 35
 nodes). Tests: 89/89 + servo-config 3/3. No .deb, no push in this round. Next:
 the YouTube feed work resumes (Round 29 leads).
+
+## Round 31 — player POST, traced to the net-crate door (F-022) + PLAYER-BODY probe
+
+Diagnosis round, no fix shipped. Shipped: F-022, one `info!`
+log at `http_fetch` entry (method + URL) in the Freezer
+(`components/net/http_loader.rs`), so every fetch entering
+the net crate is visible; and errcap v0.5.0, which logs
+`r.clone().text()` length for `youtubei/v1/player`
+responses only.
+
+300 s YouTube gate, Snowplow OFF: the player POST never
+enters the net crate — 11 page-side attempts, all resolving
+200 with bodies (ad-stub 328/96 B early, full payloads
+61,773 / 61,792 / 262,568 B later, in exact duplicate
+pairs), but **0** `http_fetch` entries and **0**
+`http_network_fetch` entries, while other POSTs
+(`log_event`, `generate_204`, `stats/atr`, `GenerateIT`)
+reach the net crate fine. The F-022 log is proven live
+(315 entries; unique-URL sets identical to netfetch,
+156/156). A full audit of the fetch dispatch (preload is
+GET-only, embedder intercept is DoNotIntercept with
+Snowplow OFF, cache lives inside `http_fetch`, no custom
+https protocol, ServiceWorker undefined, no script-thread
+HTTP client) leaves no path that returns a real https
+response without `http_fetch` — so the request is answered
+upstream of the resource thread, in page-JS land. Leading
+hypothesis, unproven: YouTube's own network layer
+(`network.js`, loaded in `<head>` before the errcap
+installs) wraps `window.fetch` and serves player calls
+from its own state. The feed is still stalled (`browse`
+0× in 300 s; screenshots frozen skeleton at 105 s and
+300 s). Tests: 89/89 + servo-config 3/3. Full detail in
+`DIAGNOSIS.md` (Round 31 section); next lead: log
+`ofetch.toString()` from page JS to prove or kill the
+unified-fetch hypothesis.

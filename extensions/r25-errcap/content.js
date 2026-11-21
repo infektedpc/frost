@@ -1,4 +1,4 @@
-// R29 Error Capture content script (runs at DocumentStart / HeadParsed).
+// R31 Error Capture content script (runs at DocumentStart / HeadParsed).
 // Captures page JS errors, unhandled rejections, console.error/warn, and
 // every fetch/XHR/sendBeacon call, into a fixed on-page banner +
 // document.title. Every line is stamped with ms since install, so the
@@ -15,12 +15,17 @@
 // via the new console bridge (frozen FrostDelegate::show_console_message)
 // and can be read even when the banner itself cannot (the Inspector
 // snapshot wedges on YouTube's DOM).
+// Round 31: for youtubei/v1/player responses only, also log the body
+// length via r.clone().text() — the player POST resolves 200 page-side
+// with (allegedly) real streaming data while zero reach http_loader, so
+// the body length settles whether the 200 carries real streamingData or
+// an empty/error body.
 (function () {
   var t0 = performance.now();
   function stamp() { return '+' + (performance.now() - t0).toFixed(0) + 'ms '; }
 
   var box = document.createElement('div');
-  box.id = 'r29-errcap';
+  box.id = 'r31-errcap';
   box.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;' +
     'background:#7a0000;color:#fff;font:14px/1.4 monospace;padding:6px 10px;' +
     'max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all;';
@@ -34,7 +39,7 @@
     try { sw = (navigator && navigator.serviceWorker) ? typeof navigator.serviceWorker : 'undefined'; } catch (e) { sw = 'err'; }
     var vis = 'n/a';
     try { vis = document.visibilityState; } catch (e) { vis = 'err'; }
-    return 'R29-ERRCAP active. IO=' + (typeof IntersectionObserver) +
+    return 'R31-ERRCAP active. IO=' + (typeof IntersectionObserver) +
       ' RIC=' + (typeof requestIdleCallback) +
       ' SCH=' + sch + ' postTask=' + pt + ' SW=' + sw + ' VIS=' + vis;
   }
@@ -46,7 +51,7 @@
     lines.push(stamp() + kind + ': ' + msg);
     if (lines.length > 200) lines.shift();
     box.textContent = firstLine() + '\n' + lines.join('\n');
-    try { document.title = 'R29: ' + lines[lines.length - 1].slice(0, 120); } catch (e) {}
+    try { document.title = 'R31: ' + lines[lines.length - 1].slice(0, 120); } catch (e) {}
     // Round 29: mirror every line to the engine log via console.log
     // (frozen logs ERRCAP-prefixed console messages at info level).
     // console.log itself is not wrapped by this script, so no recursion.
@@ -109,6 +114,20 @@
         var shortUrl = String(url).slice(0, 80);
         p.then(function (r) {
           log('FETCH-OK', r.status + ' ' + shortUrl);
+          // Round 31: for player responses only, log the body length.
+          // The player POST resolves 200 page-side while zero reach
+          // http_loader — this settles whether the 200 carries real
+          // streamingData or an empty/error body. clone() keeps the
+          // app's own stream untouched.
+          try {
+            if (String(url).indexOf('youtubei/v1/player') !== -1) {
+              r.clone().text().then(function (t) {
+                log('PLAYER-BODY', 'len=' + t.length + ' ' + t.slice(0, 120));
+              }, function (e) {
+                log('PLAYER-BODY', 'text() failed: ' + String((e && e.message) || e).slice(0, 120));
+              });
+            }
+          } catch (e) {}
         }, function (e) {
           log('FETCH-ERR', (e && e.name ? e.name + ': ' : '') + String((e && e.message) || e).slice(0, 120) + ' ' + shortUrl);
         });
@@ -188,7 +207,7 @@
   try {
     if (typeof IntersectionObserver === 'function') {
       var sentinel = document.createElement('div');
-      sentinel.id = 'r29-io-sentinel';
+      sentinel.id = 'r31-io-sentinel';
       sentinel.style.cssText = 'position:fixed;top:100px;left:10px;width:50px;height:50px;background:rgba(0,255,0,0.01);z-index:2147483646;';
       (document.body || document.documentElement).appendChild(sentinel);
       var ioFired = false;

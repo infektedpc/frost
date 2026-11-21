@@ -1255,6 +1255,12 @@ copies); the H.264/WebM clips still play to the end.
    `r.clone().text()` length for `youtubei/v1/player`
    responses only — does the page-side 200 carry real
    streamingData or an empty/error body?
+   **DONE in Round 31 — see the Round 31 section:** the
+   player POST never appears at `http_fetch` (0 entries in
+   300 s while 11 page-side 200s carry bodies up to
+   262 KB); full dispatch audit leaves no in-crate path.
+   Next lead is the Round 32 probe (log `ofetch.toString()`
+   from page JS).
 2. **Watch-page event delivery:** the reloaded player
    appends and drains fine (9 appends, 6 drains, all pushed,
    buffered full) and plays to EndOfStream — but position
@@ -1467,3 +1473,229 @@ not stuck).
   ~20 min with no output (piped through `tail`); the
   re-run writes to `r30-cargo-test.log` via a detached
   `setsid nohup` so progress survives.
+
+## Round 31 — player POST, traced to the net-crate door (F-022) + PLAYER-BODY probe
+
+Gate: 300 s YouTube homepage, Snowplow OFF, R31 binary
+(522,385,544 B, `-C link-arg=-Wl,--strip-debug`), errcap v0.5.0.
+Log: `r31-gate-yt.log` (44,147 lines). Screenshots:
+`r31-yt-105s.jpg`, `r31-yt-300s.jpg`. Tests: 89/89 +
+servo-config 3/3 (see Build incidents: the plain `cargo test`
+run stops at the first failing package, so the frost-bin GL
+probes were re-run directly with the launcher Mesa env).
+
+### What shipped
+
+- **F-022 (freezer, `components/net/http_loader.rs:900-906`):**
+  one `info!` log at `http_fetch` entry —
+  `info!("http_fetch {:?} {}", request.method, request.current_url());`
+  — so every fetch that enters the net crate is visible, and
+  the decisive comparison is F-022 vs the existing
+  `http_network_fetch` log (`"{:?} request for {}"`,
+  line 2190): enters `http_fetch` but not
+  `http_network_fetch` = cache/preflight early exit inside
+  the net crate; never appears at `http_fetch` = never
+  enters the net crate at all.
+- **Errcap v0.5.0 (`extensions/r25-errcap/`, "R31 Error
+  Capture"):** all R29 markers → R31, plus the PLAYER-BODY
+  probe: in the fetch `.then` success handler, for URLs
+  containing `youtubei/v1/player`, `r.clone().text()` logs
+  `PLAYER-BODY len=<n> <first 120 chars>` (the clone keeps
+  the app's stream untouched).
+
+### The decisive result: the player POST never enters the net crate
+
+Page-side (errcap) vs engine-side (F-022 / netfetch), 300 s:
+
+| layer | youtubei/v1/player | youtubei/v1/log_event | browse |
+|---|---|---|---|
+| errcap FETCH/XHR attempts | 11 POST (fetch) | 17 (XHR) | 0 |
+| errcap FETCH-OK / XHR-OK 200 | 11 | — | 0 |
+| F-022 `http_fetch` entries | **0** | 5 POST | 0 |
+| `http_network_fetch` entries | **0** | 5 POST | 0 |
+
+Other POSTs reach the net crate fine (`generate_204` 6,
+`api/stats/atr` 6, `GenerateIT` 1 at `http_fetch`). Only the
+player POST is missing — under any method: `http_fetch GET
+youtubei` is also 0, and no `http_fetch` line contains
+`player` except `cplayer=UNIPLAYER` params and `/s/player/`
+static assets (`www-player.css`, `player_es6.../base.js`).
+
+The F-022 log itself is proven live by the gate: 315
+`http_fetch` entries, 260 `http_network_fetch` entries, and
+the unique-URL sets are IDENTICAL (156/156) — every fetch
+that entered `http_fetch` also reached `http_network_fetch`.
+The 315-vs-260 count gap is repeat requests for the same
+URLs, not an early exit. So there is no gap between
+`http_fetch` and `http_network_fetch` to hide in: the player
+POST is absent at the net crate's front door.
+
+PLAYER-BODY (11 lines, pairing 1:1 with the 11 FETCH-OKs;
+no FETCH-ERROR anywhere in 300 s; the app stops calling
+player after ~45 s):
+
+```
+[2026-11-21T07:16:06Z INFO  frozen] CONSOLE: ERRCAP +27592ms PLAYER-BODY: len=328 {"adPlacements":true,"playerAds":true,"playerResponse":{"adPlacements":true,"playerAds":true,"playerConfig": {"audioConf
+[2026-11-21T07:16:18Z INFO  frozen] CONSOLE: ERRCAP +19711ms PLAYER-BODY: len=96 [{"adPlacements":true,"playerAds":true,"playerResponse":{"adPlacements":true,"playerAds":true}}]
+[2026-11-21T07:16:41Z INFO  frozen] CONSOLE: ERRCAP +42523ms PLAYER-BODY: len=61773 {"responseContext":{"serviceTrackingParams":[{"service":"GFEEDBACK","params":[{"key":"kc","value":"66"},{"key":"cw","val
+[2026-11-21T07:16:43Z INFO  frozen] CONSOLE: ERRCAP +44134ms PLAYER-BODY: len=262568 {"responseContext":{"serviceTrackingParams":[{"service":"GFEEDBACK","params":[{"key":"ipcc","value":"0"},{"key":"is_view
+```
+
+The bodies are NOT empty/error bodies: 5 early ones are
+small ad-slot stubs (len 328 ×3, len 96 ×2), and 6 later ones
+are full-size payloads (len 61,773 ×2, 61,792 ×2, 262,568
+×2 — exact duplicates in pairs, the signature of request
+dedup). Only the first 120 chars were logged, so whether
+they contain `streamingData` / `playabilityStatus` is NOT
+established — that is a Round 32 probe (below). What IS
+established: the page-side 200s carry substantial bodies,
+while the engine never sees the requests.
+
+### Code audit: no path returns a real https response without http_fetch
+
+Every branch of the dispatch was read this round
+(`components/net/fetch/methods.rs`, `fetch_params.rs`,
+`request_interceptor.rs`, `resource_thread.rs`,
+`protocols/mod.rs`, `http_loader.rs`):
+
+- `fetch()` → `main_fetch()` step 12 is the only dispatch.
+  For an https CORS POST the branches are: preload
+  candidate (GET-only — `fetch()` step 10 gates the whole
+  preload lookup on `method == GET`, and
+  `consume_preloaded_resource` is keyed on
+  url/destination/mode/credentials, never consulted for a
+  POST); same-origin + Basic tainting → `scheme_fetch`;
+  `data:` / custom fetchable protocols → `scheme_fetch`;
+  Navigate/WebSocket → `scheme_fetch`; CORS preflight or
+  plain CORS → `http_fetch` (lines 632 / 648). And
+  `scheme_fetch` for http/https ALSO calls `http_fetch`.
+  No branch returns a real https response without it.
+- Embedder intercept (`request_interceptor.rs`,
+  `main_fetch` step 11): runs before step 12 and CAN
+  synthesize a response (Start + SendBodyData +
+  FinishLoad) — but Frost's `handle_load`
+  (`crates/frozen/src/snowplow.rs`) returns false
+  immediately with Snowplow OFF, dropping the load, which
+  the responder translates to DoNotIntercept; and
+  `FROST_BLOCK_URL_SUBSTRING` was unset in this gate.
+  Ruled out by the code and by the gate config.
+- HTTP cache / disk cache: consulted only inside
+  `http_network_or_cache_fetch`, whose only call sites are
+  in `http_loader.rs` (inside `http_fetch` /
+  `http_redirect_fetch`). A cache hit would still log at
+  F-022. Ruled out by call-site enumeration.
+- `res_init_` / `FetchRedirect` path
+  (`resource_thread.rs:865`): only for redirect replays,
+  not initial fetches. Ruled out.
+- Custom protocols: only `data`, `blob`, `file` are
+  registered; `http`/`https` are in FORBIDDEN_SCHEMES.
+  Ruled out.
+- ServiceWorker: undefined on the page (errcap banner:
+  `SW=undefined`). Ruled out (again).
+- The script thread has no HTTP client of its own (no
+  hyper/reqwest in `components/script`; the `http` crate
+  there is types only). Page JS can only reach the network
+  through the resource thread → net crate → `http_fetch`.
+
+Conclusion: **the player POST never reaches the net
+crate's `fetch()` — it is answered upstream of the
+resource thread, in page-JS / script-thread land.**
+The engine is exonerated as the place the request dies;
+the request never arrives.
+
+### Leading hypothesis (unproven): YouTube's own network layer serves it
+
+The errcap installs at HeadParsed (document-start), but
+YouTube's network libraries load as `<head>` scripts and
+run BEFORE that: `spf.js`, `scheduler.js`, and
+`network.js` all appear in the gate log as early GETs, and
+the page's own feature flags include `web_unified_fetch`,
+`kevlar_prefetch`, `web_prefetch_preload_video`. If
+`network.js` (YouTube's unified-fetch layer) wraps
+`window.fetch` before the errcap installs, then the
+errcap's `ofetch` is YouTube's wrapper, not the engine's
+fetch — and that wrapper can serve player calls from its
+own in-memory/dedup state while passing other endpoints
+(`generate_204`, `stats/atr`, `log_event`) through to the
+real engine fetch, which is exactly the split the gate
+shows. The paired duplicate bodies and the synthetic
+ad-stub bodies fit a client-side player-response cache;
+the 262 KB bodies do NOT match the embedded
+`ytInitialData` (116,848 bytes in a fresh curl of the
+homepage, and it contains no `videoRenderer` / `videoId` /
+`streamingData` — the server serves an empty feed to this
+client), so they are not the initial HTML either.
+
+This hypothesis is NOT proven: it needs the Round 32
+probe (below). What would falsify it: the player POST
+appearing at a script-thread / resource-thread entry log.
+
+### Feed: still stalled
+
+`youtubei/v1/browse` fires 0× in 300 s. Both screenshots
+show the same dark skeleton (grey boxes, no tiles) with the
+address bar at `?themeRefresh=1` (the reload happened
+again, ~20 s after nav; 3 errcap installs = initial doc +
+reload + one more document). Pixel-diff 105 s vs 300 s:
+page body below the banner 1.48% differing (frozen
+skeleton; the banner region is 29.8% different only
+because its log text scrolls). F-018 network errors: 0 in
+300 s (no videoplayback deaths this run). IO fired at
++7.4 s (doc A) after the usual render-blocking delay;
+rIC fired at +13 ms. `SCH=undefined postTask=n/a`,
+`SW=undefined`, `VIS=visible` on the banner — same as R27.
+
+No fix shipped this round: the cause is narrowed to
+upstream of the net crate, not nailed down.
+
+### Build incidents this round
+
+- `cargo rustc -p frost --bins -C link-arg=...` fails on
+  cargo 1.99.1 (`unexpected argument '-C'`): the rustc
+  flag needs `--` first —
+  `cargo rustc -p frost --bins -- -C link-arg=-Wl,--strip-debug`.
+  The round docs (DIAGNOSIS/plan notes) wrote the command
+  without `--`; the gate binary was built with the `--`
+  form (1m 42s, EXIT=0, 522,385,544 B).
+- `cargo test --workspace` aborts the whole workspace run
+  at the first failing package: the frost-bin GL probes
+  fail under plain `cargo test` (no Mesa env), so the log
+  held only the frost result (52 passed, 2 failed). The
+  remaining packages were verified by running the
+  cargo-built test binaries directly with the launcher Mesa
+  env (`T=~/workspace/harness-tmp`, `DISPLAY=:97`):
+  frost bin 54/54, frozen 18/18, extensions 9/9,
+  inspector 8/8, freezer servo-config 3/3 — **89/89 + 3/3**,
+  baseline preserved. (The 2 failures are the known
+  env-sensitive GL probes, not a regression.)
+
+## Leads for Round 32 (not diagnosed in this round)
+
+1. **Sharpest: prove or kill the unified-fetch hypothesis
+   from page JS, no engine rebuild.** In the errcap fetch
+   wrapper, log `Function.prototype.toString.call(ofetch)
+   .slice(0, 200)` once at install: a native engine fetch
+   prints `function fetch() { [native code] }`; YouTube's
+   wrapper prints minified JS. If it is YouTube's wrapper,
+   the player POST never was an engine fetch — and the
+   feed question becomes what YouTube's wrapper does with
+   player responses (and why `browse` is never attempted).
+   Second probe in the same errcap change: log more of the
+   PLAYER-BODY (first 500 chars + whether it contains
+   `streamingData` / `playabilityStatus` / `videoDetails`)
+   to settle whether the 262 KB bodies are real player
+   responses or browse-shaped payloads.
+2. **Belt-and-braces engine-side confirmation (only if
+   probe 1 is inconclusive):** add an `info!` log at the
+   resource-thread `fetch()` entry (`resource_thread.rs`)
+   and at the script-thread `Fetch` entry. If the player
+   POST appears at neither, it never reaches the engine;
+   if it appears at the script log but not the resource
+   log, it dies between script and resource thread.
+3. **Feed trigger still unknown** (lead 3 from the R29
+   list, unchanged): the app has the empty feed in
+   `ytInitialData` and never attempts `browse`. The
+   player-response question (lead 1) may be the same root.
+4. **Watch-page event delivery (R24 block) and the
+   metadata flake** are unchanged by this round and still
+   await the backtrace on Joel's box.
