@@ -1,4 +1,4 @@
-// R31 Error Capture content script (runs at DocumentStart / HeadParsed).
+// R32 Error Capture content script (runs at DocumentStart / HeadParsed).
 // Captures page JS errors, unhandled rejections, console.error/warn, and
 // every fetch/XHR/sendBeacon call, into a fixed on-page banner +
 // document.title. Every line is stamped with ms since install, so the
@@ -20,12 +20,21 @@
 // with (allegedly) real streaming data while zero reach http_loader, so
 // the body length settles whether the 200 carries real streamingData or
 // an empty/error body.
+// Round 32: (a) FETCH-IDENT — at install, BEFORE wrapping fetch, log
+// Function.prototype.toString of window.fetch, XHR open and XHR send.
+// R31 proved the player POST never enters the net crate while other
+// POSTs do; the leading hypothesis is YouTube's network.js (a <head>
+// script) wrapped fetch before this script installed and serves player
+// calls from its own state. Native fetch prints "[native code]", a
+// wrapper prints minified JS. (b) PLAYER-BODY now logs the first 500
+// chars (was 120) plus streamingData/playabilityStatus presence, to
+// settle whether the 262 KB bodies are real player responses.
 (function () {
   var t0 = performance.now();
   function stamp() { return '+' + (performance.now() - t0).toFixed(0) + 'ms '; }
 
   var box = document.createElement('div');
-  box.id = 'r31-errcap';
+  box.id = 'r32-errcap';
   box.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;' +
     'background:#7a0000;color:#fff;font:14px/1.4 monospace;padding:6px 10px;' +
     'max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all;';
@@ -39,7 +48,7 @@
     try { sw = (navigator && navigator.serviceWorker) ? typeof navigator.serviceWorker : 'undefined'; } catch (e) { sw = 'err'; }
     var vis = 'n/a';
     try { vis = document.visibilityState; } catch (e) { vis = 'err'; }
-    return 'R31-ERRCAP active. IO=' + (typeof IntersectionObserver) +
+    return 'R32-ERRCAP active. IO=' + (typeof IntersectionObserver) +
       ' RIC=' + (typeof requestIdleCallback) +
       ' SCH=' + sch + ' postTask=' + pt + ' SW=' + sw + ' VIS=' + vis;
   }
@@ -51,7 +60,7 @@
     lines.push(stamp() + kind + ': ' + msg);
     if (lines.length > 200) lines.shift();
     box.textContent = firstLine() + '\n' + lines.join('\n');
-    try { document.title = 'R31: ' + lines[lines.length - 1].slice(0, 120); } catch (e) {}
+    try { document.title = 'R32: ' + lines[lines.length - 1].slice(0, 120); } catch (e) {}
     // Round 29: mirror every line to the engine log via console.log
     // (frozen logs ERRCAP-prefixed console messages at info level).
     // console.log itself is not wrapped by this script, so no recursion.
@@ -86,6 +95,24 @@
   // Log every fetch/XHR/sendBeacon so we can see whether the feed request
   // is attempted, and WHEN relative to install.
   var ofetch = window.fetch;
+  // Round 32: identity probe — log what window.fetch actually IS at
+  // install time, BEFORE this script wraps it. If YouTube's network.js
+  // (a <head> script) already wrapped fetch, ofetch is its wrapper and
+  // toString prints minified JS; a native engine fetch prints
+  // "function fetch() { [native code] }". Same for XHR open/send:
+  // log_event uses XHR and DOES reach the net crate, so a native XHR
+  // next to a wrapped fetch fits the split exactly. Logged once, here,
+  // because ofetch is the reference this wrapper will call for the
+  // whole page lifetime — its identity is fixed at install.
+  function ident(fn) {
+    try { return Function.prototype.toString.call(fn).slice(0, 200); }
+    catch (e) { return 'ident error: ' + String((e && e.message) || e); }
+  }
+  try {
+    log('FETCH-IDENT', 'fetch=' + ident(ofetch));
+    log('FETCH-IDENT', 'xhr.open=' + ident(XMLHttpRequest.prototype.open));
+    log('FETCH-IDENT', 'xhr.send=' + ident(XMLHttpRequest.prototype.send));
+  } catch (e) {}
   if (ofetch) {
     window.fetch = function (input, init) {
       var url = (typeof input === 'string') ? input : (input && input.url) || String(input);
@@ -114,15 +141,17 @@
         var shortUrl = String(url).slice(0, 80);
         p.then(function (r) {
           log('FETCH-OK', r.status + ' ' + shortUrl);
-          // Round 31: for player responses only, log the body length.
-          // The player POST resolves 200 page-side while zero reach
-          // http_loader — this settles whether the 200 carries real
-          // streamingData or an empty/error body. clone() keeps the
-          // app's own stream untouched.
+          // Round 32: for player responses only, log the first 500
+          // chars (was 120) plus streamingData/playabilityStatus
+          // presence — settles whether the 262 KB bodies are real
+          // player responses. clone() keeps the app's stream untouched.
           try {
             if (String(url).indexOf('youtubei/v1/player') !== -1) {
               r.clone().text().then(function (t) {
-                log('PLAYER-BODY', 'len=' + t.length + ' ' + t.slice(0, 120));
+                log('PLAYER-BODY', 'len=' + t.length +
+                  ' streamingData=' + (t.indexOf('streamingData') !== -1) +
+                  ' playabilityStatus=' + (t.indexOf('playabilityStatus') !== -1) +
+                  ' ' + t.slice(0, 500));
               }, function (e) {
                 log('PLAYER-BODY', 'text() failed: ' + String((e && e.message) || e).slice(0, 120));
               });
@@ -207,7 +236,7 @@
   try {
     if (typeof IntersectionObserver === 'function') {
       var sentinel = document.createElement('div');
-      sentinel.id = 'r31-io-sentinel';
+      sentinel.id = 'r32-io-sentinel';
       sentinel.style.cssText = 'position:fixed;top:100px;left:10px;width:50px;height:50px;background:rgba(0,255,0,0.01);z-index:2147483646;';
       (document.body || document.documentElement).appendChild(sentinel);
       var ioFired = false;

@@ -3581,3 +3581,41 @@ from its own state. The feed is still stalled (`browse`
 `DIAGNOSIS.md` (Round 31 section); next lead: log
 `ofetch.toString()` from page JS to prove or kill the
 unified-fetch hypothesis.
+
+## Round 32 — fetch-wrapper probe: fetch is native at install (errcap v0.6.0), PLAYER-BODY settled
+
+Diagnosis round, no fix shipped. No Rust changed, no
+engine rebuild — R31 F-022 binary reused; only errcap
+v0.6.0 shipped. It logs `Function.prototype.toString` of
+`window.fetch`, XHR `open` and `send` once at install
+(FETCH-IDENT), and extends the PLAYER-BODY probe to the
+first 500 chars plus `streamingData` / `playabilityStatus`
+presence flags.
+
+300 s YouTube gate, Snowplow OFF, two documents (initial
++ `themeRefresh` reload): **fetch is native at install in
+both** — `function fetch() { [native code] }`, same for
+XHR `open`/`send`. The R31 hypothesis (YouTube's
+`network.js` wrapped fetch before the errcap installed)
+is dead. And the big bodies **are** real player
+responses: len 61,773 / 61,792 / 262,464, all
+`streamingData=true playabilityStatus=true` (the small
+len 328/96 bodies are ad-slot stubs, both flags false).
+
+The split reproduces exactly: 7 player POST attempts
+page-side, 6 resolve 200 (the 7th cut off by the reload),
+**0** at `http_fetch` and **0** at `http_network_fetch`,
+while `log_event` (8), `guide` (2), `feedback` (1) all
+reach the net crate fine; unique-URL sets identical
+263/263. Feed still stalled (`browse` 0×; 105 s skeleton,
+300 s page body fully black). The paradox sharpens: the
+app calls `window.fetch`, the wrapper calls `ofetch`
+which IS the native fetch, the promise resolves 200 with
+real `streamingData` — yet `http_fetch` sees nothing. The
+break sits between the native fetch invocation and
+`http_fetch` entry, and R31's audit ("no path returns a
+real https response without `http_fetch`") now needs
+re-examination. Tests: 89/89 + servo-config 3/3. Full
+detail in `DIAGNOSIS.md` (Round 32 section); next lead:
+bracket the break with logs at the script-thread fetch
+entry and the resource-thread `fetch()` entry.

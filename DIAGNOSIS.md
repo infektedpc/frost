@@ -1699,3 +1699,136 @@ upstream of the net crate, not nailed down.
 4. **Watch-page event delivery (R24 block) and the
    metadata flake** are unchanged by this round and still
    await the backtrace on Joel's box.
+
+## Round 32 — fetch-wrapper probe: fetch is native at install (errcap v0.6.0), PLAYER-BODY settled
+
+Gate: 300 s YouTube homepage, Snowplow OFF, **R31 F-022 binary
+REUSED** (522,385,544 B — no Rust changed this round, no engine
+rebuild, no freezer commit). Log: `r32-gate-yt.log` (44,472
+lines). Screenshots: `r32-yt-105s.jpg`, `r32-yt-300s.jpg`.
+Tests: 89/89 + servo-config 3/3 (test binaries run directly
+with the launcher Mesa env; no Rust changed, baseline holds).
+
+### What shipped (errcap v0.6.0, `extensions/r25-errcap/` only)
+
+- **FETCH-IDENT:** at install, BEFORE wrapping fetch, log
+  `Function.prototype.toString.call(fn).slice(0, 200)` for
+  `window.fetch`, `XMLHttpRequest.prototype.open`, and
+  `XMLHttpRequest.prototype.send` — one line each. The
+  identity of `ofetch` is fixed at install: it is the
+  reference this wrapper will call for the whole page
+  lifetime.
+- **PLAYER-BODY extended:** first 500 chars (was 120) plus
+  `streamingData=` / `playabilityStatus=` presence flags,
+  for `youtubei/v1/player` responses only.
+
+### Decisive result 1 — FETCH-IDENT kills the wrapper-before-install hypothesis
+
+Two documents installed the errcap (initial 07:40:45Z, and
+the `themeRefresh` reload 07:41:30Z). In BOTH, at +3–6 ms
+after install:
+
+```
+[2026-11-21T07:40:45Z INFO  frozen] CONSOLE: ERRCAP +5ms FETCH-IDENT: fetch=function fetch() {
+        [native code]
+    }
+```
+
+Same for `xhr.open` (`function open() { [native code] }`)
+and `xhr.send` (`function send() { [native code] }`), in
+both documents (6 FETCH-IDENT lines total). So
+`window.fetch` at errcap install **IS the native engine
+fetch** — YouTube's `network.js` had NOT wrapped it before
+the errcap installed. The R31 leading hypothesis is dead
+in the form stated.
+
+**Reading trap for future rounds:** SpiderMonkey prints a
+native function's `toString` across THREE physical log
+lines (`function fetch() {` / `    [native code]` / `}`),
+so a single-line grep looks truncated at the `{` — read
+the continuation lines before concluding anything about
+identity.
+
+### Decisive result 2 — PLAYER-BODY settles the bodies
+
+6 lines, pairing 1:1 with the 6 FETCH-OKs:
+
+```
+len=328 streamingData=false playabilityStatus=false   (x2)
+len=96  streamingData=false playabilityStatus=false
+len=61773  streamingData=true playabilityStatus=true
+len=61792  streamingData=true playabilityStatus=true
+len=262464 streamingData=true playabilityStatus=true
+```
+
+The 3 small bodies are ad-slot stubs (no streamingData,
+confirmed as stubs). The 3 big bodies **ARE real player
+responses containing `streamingData` and
+`playabilityStatus`**. (R31's 262,568 B vs R32's 262,464 B:
+different content, same shape.)
+
+### The split reproduces exactly (300 s)
+
+| layer | youtubei/v1/player | log_event | guide | feedback | browse |
+|---|---|---|---|---|---|
+| errcap FETCH/XHR attempts | 7 POST | 8 (XHR) | 2 | 1 | 0 |
+| errcap FETCH-OK / XHR-OK 200 | 6 | 8 | 2 | 1 | 0 |
+| F-022 `http_fetch` entries | **0** | 8 | 2 | 1 | 0 |
+| `http_network_fetch` entries | **0** | 8 | 2 | 1 | 0 |
+
+7th player attempt never settled: it fired at doc A
++43828 ms and the `themeRefresh` reload (~45 s) killed
+the document before it resolved — no hung fetch, fully
+reconciled. 0 FETCH-ERR, 0 FETCH-THROW, 0 F-018 network
+errors. `http_fetch` total 514, netfetch 282, unique-URL
+sets identical 263/263. `SW=undefined` (banner firstLine,
+both screenshots; 0 SWREG lines). Screenshots: 105 s
+skeleton with the native FETCH-IDENT lines visible in the
+banner; 300 s page body fully black — the skeleton
+placeholders disappear with no content arriving.
+
+### The paradox sharpens
+
+The app calls `window.fetch` — proven, the errcap wrapper
+logs the attempts. The wrapper calls `ofetch`, which IS
+the native fetch — proven, FETCH-IDENT. The promise
+resolves 200 with a real `streamingData` body — proven,
+FETCH-OK + PLAYER-BODY. Yet `http_fetch` sees nothing.
+So the break is NOT page-JS wrapping before install, and
+NOT the net crate's front door. It is somewhere between
+the native fetch invocation and `http_fetch` entry — or
+the response is produced without the network at all.
+R31's audit conclusion ("no path returns a real https
+response without passing `http_fetch`") is now in tension
+with the data and must be re-examined: the audit covered
+`fetch()` → `main_fetch()` step 12 → `http_fetch` and
+`scheme_fetch` routing, but the script-thread Fetch API
+implementation itself — where `window.fetch` builds the
+request and hands it to the resource thread — was NOT
+instrumented. That is the next bracket.
+
+## Leads for Round 33 (not diagnosed in this round)
+
+1. **Sharpest: bracket the break with logs at the two
+   remaining dispatch points.** (a) Script-thread fetch
+   entry — the `window.fetch` binding / FetchContext
+   creation in `components/script` (log method + URL when
+   a fetch is initiated from script). (b)
+   Resource-thread `fetch()` entry
+   (`components/net/fetch/mod.rs` — log method + URL).
+   If (a) shows the player POST but (b) doesn't, it dies
+   in the script→resource-thread handoff. If (b) shows it
+   but `http_fetch` doesn't, it dies in `scheme_fetch`
+   dispatch. This is the R32 leads item 2, now promoted.
+2. **Cheap errcap-side addition in the same round:** log
+   the fetch init's `mode` / `credentials` / `cache` /
+   `referrerPolicy` for player calls in the wrapper — an
+   unusual init could route differently. (Attempts all
+   show `signal.aborted=false`; the init is otherwise
+   unexamined.)
+3. **Feed trigger still unknown** (browse 0× in every
+   300 s gate, R25–R32). The player-response question may
+   share the root, or the feed trigger is separate.
+4. **Watch-page event delivery (R24 block) and the
+   metadata flake** are unchanged by this round and still
+   await the backtrace on Joel's box.
